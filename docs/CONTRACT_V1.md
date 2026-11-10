@@ -1,12 +1,13 @@
-# Acuven Stock Core V1 契约草案
+# Acuven Stock Core V1 契约
 
-> 版本：草案 0.2｜2026-11-10｜状态：**已按 Kelvin 当天对 OPEN_QUESTIONS 的逐条答复修订；仍待正式批准（设计闸门），不是已实现接口**。
+> 版本：0.2｜2026-11-10｜状态：**Kelvin 2026-11-10 批准（设计闸门通过）**，内容为当天按 OPEN_QUESTIONS 逐条答复修订后的稿。尚未实现。
+> 按模板规则：之后设计若有改动，这次批准即作废，改动部分须重新批准。
 > 依据：[REQUIREMENTS.md](../REQUIREMENTS.md)（Core V1 需求，2026-10-08）、`acuven_hub/DECISIONS.md` 的 C-01～C-19、S-01～S-10、I-02、I-04，
 > 以及 `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md`（Inventory 草案，只读参照）。
 > 网店现状见 [SHOP_STOCK_INVENTORY.md](SHOP_STOCK_INVENTORY.md)；问题与 Kelvin 的答复见 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)，本文用 **Q-xx** 引用。
 >
 > 本文只定**语义与边界**：名词、数量不变量、命令与状态、幂等、错误、鉴权、迁移和恢复约束。字段名、路径是建议写法，
-> 设计闸门通过后再落成 OpenAPI；技术栈已定（Q-23，见 TEMPLATE_BOOTSTRAP_PLAN.md）。
+> 实现时落成 OpenAPI，字段与路径的调整不改变本文语义；技术栈已定（Q-23，见 TEMPLATE_BOOTSTRAP_PLAN.md）。
 
 ---
 

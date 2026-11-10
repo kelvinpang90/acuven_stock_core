@@ -1,0 +1,44 @@
+# 生产栈（目前只部署 Demo Core 实例，CORE_ENV=demo）：只有 Core 的 API 一个容器，数据库用共享基建的 infra_mysql
+# 里的独立库，本项目不起数据库容器。
+#
+# 只在服务器上用，由 deploy/deploy.sh 驱动：它设置 CORE_API_IMAGE 为本次提交 SHA 标记的镜像。
+# 其余变量从服务器上本目录的 .env 读（模板见 .env.example），不进仓库。
+#
+# Core 不开公网入口（契约 §10 第 5 条）：不挂 proxy_net、不发布端口。
+# data_net 连共享数据库；stock_core_net 是只给 Core 与它的调用方（网店）用的内部网络，由 deploy/deploy.sh 确保存在。
+# 服务名带 core_ 前缀：compose 把服务名注册成网络上的 DNS 别名，data_net 是多个项目共用的。
+
+name: acuven_stock_core
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  core_api:
+    image: ${CORE_API_IMAGE:?set by deploy/deploy.sh to the commit-tagged image}
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 256m
+    environment:
+      CORE_ENV: ${CORE_ENV:?set CORE_ENV in .env (demo or production)}
+      CORE_DATABASE_URL: ${CORE_DATABASE_URL:?set CORE_DATABASE_URL in .env (see .env.example)}
+    networks: [data_net, stock_core_net]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/readyz', timeout=3).status==200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  data_net:
+    external: true
+  stock_core_net:
+    external: true

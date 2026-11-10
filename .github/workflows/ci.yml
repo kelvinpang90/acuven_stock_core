@@ -1,0 +1,107 @@
+# CI —— 每个 PR 与每次合并都跑。job 名（unit、integration）要与 .platform/project.yaml 的
+# required_status_checks 一致，并在 GitHub 分支保护里设为必需检查。
+#
+# OpenClaw 的 Worker 要等 PR 的 CI 全绿才把 run 交给人批准，所以这里是准入的依据：
+# - .platform/commands.yaml 里的每条检查，这里都以逐字相同的参数跑（Worker 沙箱里的 skipped 不算 passed，以这里为准）；
+# - Worker 沙箱里跑不了的检查（TestClient / 数据库测试、迁移、镜像构建、依赖 git 的检查）只放这里（integration job）。
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 与 pyproject 的 requires-python 下界、Dockerfile 的基础镜像一致。
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+
+      # 下面三条与 .platform/commands.yaml 的 lint.check / format.check / tests.unit 参数逐字相同。
+      - name: Lint (lint.check)
+        run: python -I -m ruff check .
+
+      - name: Format (format.check)
+        run: python -I -m ruff format --check .
+
+      - name: Unit tests (tests.unit)
+        run: python -I -m unittest discover -s tests/unit -t .
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 与共享 infra_mysql 同一个大版本的一次性库；账号密码只存在于这台 CI 机器上。
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci
+          MYSQL_DATABASE: ci
+          MYSQL_USER: ci
+          MYSQL_PASSWORD: ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uci -pci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+
+      # 与 .platform/commands.yaml 的 tests.integration 参数逐字相同。连接串只指向上面的 CI 服务容器。
+      - name: Integration tests (tests.integration)
+        env:
+          CORE_TEST_DATABASE_URL: mysql+pymysql://ci:ci@127.0.0.1:3306/ci
+        run: python -I -m pytest
+
+      # 对真 MySQL 跑迁移，再降到底、升回来，最后 alembic check 比对模型与迁移：
+      # 迁移在 MySQL 上不成立、downgrade 没写对、模型改了迁移漏写，都在合并前失败。
+      - name: Migrations round-trip on MySQL
+        env:
+          CORE_DATABASE_URL: mysql+pymysql://ci:ci@127.0.0.1:3306/ci
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+          alembic check
+
+      - name: Deploy scripts lint
+        run: shellcheck deploy/deploy.sh deploy/healthcheck.sh
+
+      # compose 文件可解析；这些值只为让必填变量有值，不是任何真实配置。
+      - name: Compose file resolves
+        env:
+          CORE_API_IMAGE: ci/acuven-stock-core-api:ci
+          CORE_ENV: demo
+          CORE_DATABASE_URL: mysql+pymysql://ci:ci@127.0.0.1:3306/ci
+        run: docker compose config --quiet
+
+      - name: Image builds
+        run: docker build --build-arg GIT_SHA=${{ github.sha }} .

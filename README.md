@@ -6,12 +6,12 @@
 
 项目名确定为 **Acuven Stock Core**，部署边界确定为**独立常驻服务及独立持久化库**。首版先接 Acuven 自用网店，支持单一库存池的真实经营；Inventory、ERP、POS 后续接入。生产上线前还需按需求验证独立故障域的持久化与恢复：已确认写入 RPO=0、RTO≤4 小时。不同套餐的装配方式见 [部署包装讨论](../acuven_hub/STOCK_CORE_DEPLOYMENT_PACKAGING_2026-10-08.md)；原方案比较见 [商品与库存关系](../acuven_hub/REVISED_PRODUCT_STOCK_ARCHITECTURE_2026-10-07.md)及[开发优先顺序](../acuven_hub/DEVELOPMENT_PRIORITY_2026-10-08.md)。
 
-## 阶段 1 设计文档（2026-11-10，待 Kelvin 过设计闸门）
+## 阶段 1 设计文档（2026-11-10，契约已由 Kelvin 批准）
 
 | 文档 | 内容 |
 | --- | --- |
 | [docs/SHOP_STOCK_INVENTORY.md](docs/SHOP_STOCK_INVENTORY.md) | 网店现有商品与库存代码盘点，及将来换成调用 Core 的每个调用点 |
-| [docs/CONTRACT_V1_DRAFT.md](docs/CONTRACT_V1_DRAFT.md) | Core V1 契约草案：商品身份、库存池、数量模型与流水、预留→确认→释放、幂等与审计、`/v1` API、`StockGateway`、迁移与回退样例、租户与鉴权、RPO=0/RTO≤4h 的设计约束 |
+| [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) | Core V1 契约（0.2，2026-11-10 批准）：商品身份、库存池、数量模型与流水、预留→确认→释放、幂等与审计、`/v1` API、`StockGateway`、迁移与回退样例、租户与鉴权、RPO=0/RTO≤4h 的设计约束 |
 | [docs/TEMPLATE_BOOTSTRAP_PLAN.md](docs/TEMPLATE_BOOTSTRAP_PLAN.md) | 从项目模板起步的方案（未执行） |
 | [docs/ESTIMATE_BREAKDOWN.md](docs/ESTIMATE_BREAKDOWN.md) | 工期重估（I-04）用的工作拆分，不是排期 |
 | [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | 待拍板的问题与文档冲突 |

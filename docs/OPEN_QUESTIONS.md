@@ -1,7 +1,7 @@
 # 设计问题清单与 Kelvin 的答复
 
 > 2026-11-10｜Core 阶段 1 设计闸门配套。Kelvin 当天逐条答复，结论记在第一节；第二节是仍未定的；第三节是答复后需要别的仓库/文档跟着改的。
-> 契约正文见 [CONTRACT_V1_DRAFT.md](CONTRACT_V1_DRAFT.md)，已按答复修订。标 **【DECISIONS】** 的条目与 `acuven_hub/DECISIONS.md` 原条款不同；
+> 契约正文见 [CONTRACT_V1.md](CONTRACT_V1.md)，已按答复修订。标 **【DECISIONS】** 的条目与 `acuven_hub/DECISIONS.md` 原条款不同；
 > 其中 C-12、C-13 已于 2026-11-10 经 Kelvin 同意改入 DECISIONS（见第三节）。
 
 ## 一、已答复（Kelvin，2026-11-10）

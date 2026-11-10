@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "acuven-stock-core"
+version = "0.1.0"
+description = "Acuven Stock Core — product identity catalog and base stock ledger service"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141",
+    "pydantic-settings>=2.6",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    # 纯 Python 的 MySQL 驱动；[rsa] 带上 cryptography：共享 infra_mysql 是 8.0，
+    # 新建账号默认 caching_sha2_password，不走 TLS 时首次认证要 RSA 交换密码（与 acuven-shop 相同）。
+    "pymysql[rsa]>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    # starlette 的 TestClient 用的 HTTP 传输（与 acuven-shop、ai_billing_hub 同一下界）。
+    "httpx2>=2.12",
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+# 必须用自动发现：只写 packages = ["app"] 会把子包漏出 wheel。
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# docs/ 下是获批设计原文，不许被工具改写。
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+# pytest 只跑集成测试（TestClient / 数据库），只在 CI 跑；单元测试用 unittest（见 CLAUDE.md）。
+testpaths = ["tests/integration"]
+pythonpath = ["."]

@@ -1,0 +1,71 @@
+# 控制契约 —— 项目事实与角色绑定（OpenClaw 读这份文件决定「这个仓库同不同意被调度」）
+#
+# 只描述「谁能做什么」，不描述业务。Worker 启动前读它；读不到、解析失败、身份对不上、
+# 或 execution 两行不是下面写的值，一律不调度（fail closed）。
+#
+# ⚠️ 公开仓库的约定同样适用于私有仓库：这里不写本机路径、主机名、IP、密钥。
+#    本机信息（可执行程序路径、凭据）只在 Worker 主机的本地配置里，不进仓库。
+
+# ── Worker 机读字段 ────────────────────────────────────────────────────────────
+# 必须是整数 1；别的值整份契约作废。
+schema_version: 1
+# 与控制面登记表里的 project_id 逐字相同：^[a-z][a-z0-9_]{1,30}$，全表唯一，运营者要手打它，短一点好。
+project_id: stock_core
+
+# 合并之后由谁来判「这次到底上没上生产」（OpenClaw 部署观察契约，ONBOARD-PROJECT.md 的 D1–D5）。
+#
+# 写的是 .github/workflows/ 下**工作流的文件名**（不是显示名；显示名改了不会有任何东西报警）。
+# 写了这一行 = 承诺那个工作流满足 D1–D5（见 .github/workflows/deploy.yml 顶部）。
+# 按规划执行（planning-v1）的项目必须有这一行：`开启` 的就绪闸门要求部署预检为 ok，没声明即 deploy_undeclared。
+#
+# ⚠️ OpenClaw 只读结论，不部署、不回滚、不重跑。控制面从 run 的 **base commit** 读这一行，
+#    所以一个 run 改不掉判自己的规则；这一行只能由运营者的 PR 改。
+deploy_workflow: deploy.yml
+
+execution:
+  # ⚠️ 下面两行是**业务仓库这一侧的同意**：本仓库同意被 OpenClaw 的 Windows Worker 调度。
+  #    两行必须恰好是这两个值，否则 Worker 拒绝加载任何任务。
+  #    同意本身不会让任何东西执行。真正跑起来还要：控制面登记表登记本项目并把 worker 从 none 改为
+  #    windows-native（单独复审的一次 PR）、Worker 主机本地配置就位、Worker 预检通过、Kelvin 独立批准。
+  #    出事时把 worker_enabled 改回 false 就是回滚：false 即不会有任何调度，不需要删文件、不需要改代码。
+  execution_worker: windows-native
+  worker_enabled: true
+  control_plane: openclaw
+
+# 可选：浏览器验收（ONBOARD-PROJECT.md「浏览器验收契约」）。缺省不做，不需要就保持注释。
+# 要做时列出浏览器唯一能访问的 1–4 个小写 DNS 主机名（只放行 443）；第一个是验收入口。
+# 主机只写在这里一处，验收脚本里不写死主机。另需 commands.yaml 里一条 network: true 的验收命令，
+# 以及任务上的 acceptance 块（见 tasks.yaml 注释）。
+# acceptance_hosts:
+#   - <acceptance_host>
+
+# ── 人读记录（Worker 不读，接入复审时核对）──────────────────────────────────────
+# 仓库事实：来自 git remote 与 GitHub 设置，不是实时读取的。GitHub 上改了保护规则要回来同步这里。
+repository:
+  host: github.com
+  slug: kelvinpang90/acuven_stock_core
+  default_branch: main
+  merge_method: squash
+  protected_branches:
+    - name: main
+      allow_direct_push: false
+      allow_force_push: false
+      require_pull_request: true
+      # 与 .github/workflows/ci.yml 的 job 名一一对应；在 GitHub 分支保护里设为必需检查。
+      required_status_checks:
+        - unit
+        - integration
+
+roles:
+  development_owner: claude_code
+  independent_reviewer: codex
+  merge_owner: kelvin
+
+# 默认拒绝：未在 commands.yaml / tasks.yaml 里列出的东西一律不可执行、不可调度。
+defaults:
+  command_policy: deny
+  task_policy: deny
+
+contract_files:
+  commands: .platform/commands.yaml
+  tasks: .platform/tasks.yaml

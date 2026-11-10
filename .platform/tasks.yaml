@@ -1,0 +1,130 @@
+# 控制契约 —— 可调度任务的 allowlist
+#
+# 默认 deny。未在 tasks 里列出的任务 id 一律拒绝，不做前缀匹配、不做模糊匹配，
+# 也不因为「格式看起来像本项目的编号」就放行 —— 格式合法只是进入校验的门槛，不是授权。
+#
+# 这份文件说「怎么做、能碰什么」；「做什么、先做什么」在 docs/TODO.md 的 planning-v1 块里。
+# 两边必须一致：每个 ready 任务都要出现在计划块里，计划块「当前计划」里的每一项都要在这里登记为 ready，
+# 否则整个项目 fail closed（自检与 Worker 用同一个解析器）。
+#
+# ⚠️ Worker 的 run 改不了 .platform/：run 自己的 PR 不能改这份文件。任务完成后，启用了自动收尾的项目
+#    （控制面登记表 auto_closeout: true，且 Worker 本机 merge_enabled 为真）由 OpenClaw 自动开收尾 PR，把 ready 改成 done、从 planning-v1 块的
+#    「当前计划」移出，CI 通过后自动合并、不触发部署；未启用或自动收尾失败时，由运营者手工开同样的收尾 PR。
+
+# 必须是整数 1。
+schema_version: 1
+# 与 .platform/project.yaml 的 project_id 相同。
+project_id: stock_core
+# 必须是 deny。
+default: deny
+
+# 每个任务的字段（标 * 的由 Worker 机器校验，不合规则整个任务加载失败）：
+#   id *                   符合控制面登记的 task_id_pattern（例如 ^<PREFIX>-TASK-[0-9]{3}$），全文件唯一
+#   title *                一句中文说明，单行，80 字符内；不用反引号、尖括号、「」『』【】〖〗、emoji、链接、路径
+#                          （OpenClaw 推荐行显示它；超长、反引号、尖括号、上述括号、不可见字符、泄漏形状会被控制面
+#                          拒绝而不显示，其余是填写约定）
+#   purpose *              为什么做、做到什么程度、明确不碰什么
+#   status *               ready = 已登记、可以在 Telegram 发「开启」；done = 已交付（合并并部署）；
+#                          blocked / superseded / cancelled = 不可开始（superseded 写明原因）。Worker 只接受 ready
+#   depends_on *           前置任务 id 列表；「当前计划」第一项的依赖必须全部为 done
+#   acceptance_criteria *  非空列表，每条一句可验证的标准
+#   allowed_change_paths * 本 run 允许改动的文件：仓库根相对的 POSIX 路径，**逐个精确匹配**，不是 glob、不是目录前缀；
+#                          不能是 .platform/ 下、.git、凭据形状的文件名（.env、*.pem、含 secret/token/key 的名字等）
+#   allowed_commands *     非空列表，只能引用 .platform/commands.yaml 里已有的 id；不写只在 CI 跑的检查
+#                          （测试客户端 / asyncio 的 pytest、node 检查），它们由 PR 的必需 CI 检查执行
+#   creates_branch *       必须是 true
+#   creates_pull_request * 必须是 true（Worker 以 Draft PR 交付，不合并、不直推）
+#   acceptance             可选，浏览器验收（见文件末尾注释与 CLAUDE.md 的「登记约定」）
+#
+# ⚠️ title / purpose / acceptance_criteria / allowed_change_paths / allowed_commands 会原样进 PR 正文并过泄漏规则：
+#    不写任何 xxx:// 形式的地址、主机名、邮箱地址、IP、绝对路径。被拒的文本会让 run 以 pr_policy_failed 结束。
+#
+# 例（取消注释并按项目实际改写）：
+#   - id: <PREFIX>-TASK-001
+#     title: <一句中文说明，80 字符内>
+#     purpose: >-
+#       <为什么做；做到什么程度；明确不碰什么>
+#     status: ready
+#     depends_on: []
+#     acceptance_criteria:
+#       - <一条可验证的标准>
+#       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖
+#       - allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+#       - <依赖只在 CI 跑的测试时：「测试由 PR 的必需 CI 检查 <job 名> 执行并通过」>
+#     allowed_change_paths:
+#       - <path/to/file>
+#     allowed_commands:
+#       - <沙箱里跑得动的 command.id，例如 lint.check；不写只在 CI 跑的检查>
+#     creates_branch: true
+#     creates_pull_request: true
+#
+# 浏览器验收块（只有有用户可见页面的前端任务才带；需要 project.yaml 的 acceptance_hosts
+# 与 commands.yaml 里一条 network: true 的验收命令，而且那条命令**不能**同时写在 allowed_commands 里）：
+#     acceptance:
+#       kind: browser
+#       command: <acceptance.command.id>
+#       writes: false
+#       steps:
+#         - <lowercase_step_name>
+#       timeout_seconds: 300
+tasks:
+  - id: CORE-TASK-001
+    title: 实现库存账面量不变量与流水类型的纯领域层
+    purpose: >-
+      按已批准契约 docs/CONTRACT_V1.md 的 4.1、4.3 与 6.1，把四个账面量（stock_balance、reserved、unavailable、
+      paid_pending_dispatch）、派生的可售量、不变量和每种流水类型对四个量的增减规则写成纯函数，作为之后数据库层与接口层的唯一规则来源。
+      只做 app/domain 下的纯 Python：不 import FastAPI、SQLAlchemy 或任何做 I/O 的库，不建表、不加接口。
+      SKU 合并的迁移流水与 CORRECTION 的依赖检查不在本任务（之后随合并与更正任务做）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 账面量是不可变值对象；可售量按契约 4.1 由 stock_balance 减 reserved 减 unavailable 派生，不作为可写字段
+      - 不变量按契约 4.1 校验：四个量为非负整数，且 reserved 加 unavailable 不超过 stock_balance；违反时抛出明确的领域异常，不返回半改的结果
+      - 契约 4.3 表中除 MERGE_TRANSFER 与 CORRECTION 外的每种流水类型都有对应规则，给定数量 q 返回新的账面量；q 必须是正整数，COUNT_ADJUSTMENT 接受非零的有符号差额
+      - DEMO_RESET 按契约 6.1 计算 new_balance 等于 target 与 reserved 加 unavailable 两者的较大值，只改 stock_balance，并返回增量
+      - 单元测试逐条复算契约 11.3 与 11.5 两张示例表的每一步结果，另覆盖每种流水类型的越界拒绝（例如释放超过预留、发货超过待发货量）
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖
+      - allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - PR 的必需 CI 检查 unit 与 integration 通过
+    allowed_change_paths:
+      - app/domain/quantities.py
+      - app/domain/ledger.py
+      - tests/unit/test_quantities.py
+      - tests/unit/test_ledger.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-002
+    title: 建立商品目录的数据库表与首个迁移
+    purpose: >-
+      按已批准契约 docs/CONTRACT_V1.md 的第 1 节与 2.1、2.2，建立租户、商品、规格 SKU 与 SKU 编码历史四张表的 SQLAlchemy 模型和首个
+      Alembic 迁移，为之后的目录接口打底。稳定 ID 是类型前缀加 ULID 的字符串（Q-04）；所有唯一约束都含 tenant_id；
+      租户内 sku_code 唯一，非空 barcode 唯一；参考价存整数最小货币单位加三位币种；商品与 SKU 带 version 与 active 或 inactive 状态；
+      SKU 带可空的 merged_into_sku_id；编码历史保证同租户的旧编码不重复（Q-06 永久保留）。只做数据库层：不加接口、不写业务服务、
+      不碰库存账表（另一个任务）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 模型放在新文件 app/models/catalog.py，并在 alembic/env.py 里 import 登记；迁移文件放 alembic/versions，upgrade 与 downgrade 都写全
+      - 唯一约束与检查约束按 purpose 所列在数据库层生效（含 version 不小于 1、参考价不为负、币种三位）；约束名遵循 app/db.py 的命名约定
+      - 集成测试在真 MySQL 上验证：同租户重复 sku_code 被拒、不同租户可用相同 sku_code、同租户两个非空相同 barcode 被拒、多个空 barcode 可以并存
+      - CI 的迁移往返（upgrade、downgrade 到底、再 upgrade）与 alembic check 通过
+      - 不存任何顾客个人资料字段
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖
+      - allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试与迁移检查由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/models/__init__.py
+      - app/models/catalog.py
+      - alembic/env.py
+      - alembic/versions/20261111_0001_catalog.py
+      - tests/integration/test_catalog_schema.py
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true

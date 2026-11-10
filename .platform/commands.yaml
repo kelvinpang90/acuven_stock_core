@@ -1,0 +1,146 @@
+# 控制契约 —— Worker 可执行命令的 allowlist
+#
+# 默认 deny：这里没有的命令一律不可执行。任务只能按 id 引用这里的命令，
+# 不能追加参数、不能改工作目录、不能注入环境变量。
+# 只列仓库里真实存在、CI 里也在跑的检查；不要往这里加仓库里没有的脚本。
+#
+# Worker 在 MXC 沙箱里跑这些命令，环境与普通终端不同：
+# - 环境变量清空，只按名放行最小集（PATH / SYSTEMROOT / TEMP / TMP 一类），凭据类变量一律拿不到；
+# - network: false 的命令在禁止出站网络的环境里跑；
+# - 沙箱里没有真实 Git：依赖 git 的检查只放 CI；
+# - 可执行程序在 Worker 主机上固定成绝对路径（不从 PATH 查找），路径属于本机信息，不写进仓库。
+#   所以 executable 只写程序名（如 python），接入后由 Worker 主机固定。
+#
+# ⚠️ node 检查（vitest、tsc、eslint 等）：在 MXC 里跑 node 只有控制面代码里的闭集条目授权
+#    （控制面 worker/config.py 的 NODE_WIN32K_CHECKS / NODE_DEPENDENCIES）。新增条目是放宽安全边界，
+#    要改控制面代码、受限评审、Kelvin 批准。在那之前**前端检查只放在 CI 里，不列在这里**——
+#    Worker 本来就要等 PR 的 CI 全绿才进入「等待批准」。自检（worker.contract_check）会把这类命令列为 WARN。
+#
+# ⚠️ Python 检查（2026-09-29 在 Worker 主机上实测）：沙箱里默认关闭 Win32k，并且禁止连本机回环。
+#    - 关闭 Win32k 时 _ssl / _hashlib / _ctypes 加载失败，ruff 以 0xC0000142 退出。Worker 主机可以给某条
+#      **逐字相同**的 Python 检查登记 check_win32k，前提是第一个参数是 -I、args 与这里一字不差。
+#      ruff 就要这样登记：照下面的例子写，接入时把 id 与完整 args 交给 Kelvin。
+#    - 启动 asyncio 事件循环的测试（FastAPI / Starlette 的 TestClient 等）即使放开 Win32k 也会挂住（回环被禁，不会放开）。
+#      这类 pytest 可以登记在这里给 CI 与人用，但**不得**写进任何任务的 allowed_commands；Worker 会等 PR 的必需 CI 检查全绿。
+#    自检（worker.contract_check）对带 ruff 的命令、以及被任务引用的 pytest 列为 WARN（python <id>）。
+#
+# ⚠️ Worker 里的 skipped 不是 passed：需要数据库、缓存等服务的测试在沙箱里拿不到服务会 skip，
+#    准入以 CI 为准。
+
+# 必须是整数 1。
+schema_version: 1
+# 与 .platform/project.yaml 的 project_id 相同。
+project_id: stock_core
+# 必须是 deny。
+default: deny
+
+# 每条命令的字段（全部写上；标 * 的由 Worker 机器校验，缺一条或类型不对整份契约作废）：
+#   id *             点分小写名，任务的 allowed_commands 按它引用，全文件唯一
+#   description      一句话说明（人读）
+#   executable *     程序名，不写路径（Worker 主机固定解析）
+#   args *           固定字面量字符串数组；不做模板替换、变量展开、通配符展开，不经 shell
+#   working_directory 只写 repository_root（Worker 永远在仓库根跑）
+#   risk             只写 low（其余动作走人工，不进 allowlist）
+#   timeout_seconds * 1–7200 的整数
+#   network *        布尔；false 在进程边界上强制无出站网络，不是元数据。只有浏览器验收命令是 true
+#   writes *         none = 不写工作区任何文件；cache = 只写已被 .gitignore 忽略的缓存。
+#                    没有第三种：会改动被跟踪文件的命令一条都不许有
+#
+# 例（按项目实际技术栈改写后取消注释；Python 用 -I 隔离模式，防止工作区里同名模块顶替真正的包）：
+#   - id: tests.unit
+#     description: 单元测试（不需要任何外部服务）
+#     executable: python
+#     args: ["-I", "-m", "unittest", "discover", "-s", "tests"]
+#     working_directory: repository_root
+#     risk: low
+#     timeout_seconds: 600
+#     network: false
+#     writes: cache
+#
+#   ruff（args 逐字照抄——Worker 主机的 check_win32k 登记按字符比对；接入时要主机登记后才能跑）：
+#   - id: lint.check
+#     description: ruff 静态检查
+#     executable: python
+#     args: ["-I", "-m", "ruff", "check", "."]
+#     working_directory: repository_root
+#     risk: low
+#     timeout_seconds: 300
+#     network: false
+#     writes: cache
+#   - id: format.check
+#     description: ruff 格式检查（只检查，不改文件）
+#     executable: python
+#     args: ["-I", "-m", "ruff", "format", "--check", "."]
+#     working_directory: repository_root
+#     risk: low
+#     timeout_seconds: 300
+#     network: false
+#     writes: cache
+#
+#   用测试客户端 / asyncio 的 pytest 可以登记（CI 与人用），但只在 CI 跑，不得写进任何任务的 allowed_commands：
+#   - id: tests.api
+#     description: 后端 API 测试（TestClient，只在 CI 跑）
+#     executable: python
+#     args: ["-I", "-m", "pytest", "-q"]
+#     working_directory: repository_root
+#     risk: low
+#     timeout_seconds: 900
+#     network: false
+#     writes: cache
+# 四条都与 .github/workflows/ci.yml 逐字相同地运行，都用 `-I` 隔离模式。
+# Worker 主机上固定的 python 要装好 pyproject.toml 里的运行依赖与 dev 依赖；沙箱里不装依赖。
+commands:
+  # 纯领域层的单元测试（标准库 unittest，不 import 框架、数据库），Worker 沙箱里能跑；任务可以引用。
+  - id: tests.unit
+    description: 纯领域单元测试（unittest，tests/unit；不需要数据库、缓存或网络）
+    executable: python
+    args: ["-I", "-m", "unittest", "discover", "-s", "tests/unit", "-t", "."]
+    working_directory: repository_root
+    risk: low
+    timeout_seconds: 600
+    network: false
+    writes: cache
+
+  # ruff 在沙箱里要 Worker 主机给这条逐字相同的命令登记 check_win32k。
+  - id: lint.check
+    description: ruff 静态检查（只报告不改写）
+    executable: python
+    args: ["-I", "-m", "ruff", "check", "."]
+    working_directory: repository_root
+    risk: low
+    timeout_seconds: 300
+    network: false
+    writes: cache
+
+  - id: format.check
+    description: ruff 格式检查（只检查，不改文件）
+    executable: python
+    args: ["-I", "-m", "ruff", "format", "--check", "."]
+    working_directory: repository_root
+    risk: low
+    timeout_seconds: 300
+    network: false
+    writes: cache
+
+  # 集成测试（TestClient 与真 MySQL）：只在 CI 的 integration job 跑，不得写进任何任务的 allowed_commands。
+  - id: tests.integration
+    description: 集成测试（pytest，tests/integration；TestClient 与 MySQL，只在 CI 跑）
+    executable: python
+    args: ["-I", "-m", "pytest"]
+    working_directory: repository_root
+    risk: low
+    timeout_seconds: 900
+    network: false
+    writes: cache
+
+# 下面这些**不是命令**，是明确不得混进 allowlist 的动作类别，由人或 CI/CD 做。
+never_low_risk:
+  - create_or_update_pull_request
+  - dependency_install
+  - external_notification
+  - deployment
+  - database_migration
+  - delete_or_truncate
+  - service_restart
+  - credential_access_or_rotation
+  - security_configuration_change

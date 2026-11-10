@@ -1,0 +1,165 @@
+# 部署 —— OpenClaw 部署观察契约（ONBOARD-PROJECT.md 的 D1–D5）。
+# 目前部署的是 Demo Core 实例（服务器 .env 里 CORE_ENV=demo）；生产实例等真实网店定了再加。
+#
+# .platform/project.yaml 写了 `deploy_workflow: deploy.yml`，就是承诺本工作流满足：
+#   D1 触发：由 push 到默认分支触发，每次合并都产生一次以合并提交为 headSha 的 push 运行。
+#            例外：只改 .platform/tasks.yaml 与 docs/TODO.md 的提交（自动收尾）被 paths-ignore 排除，不部署。
+#            workflow_dispatch 保留给手工重部署 / 回滚，不计入观察。
+#   D2 对象：部署的正是触发它的那个提交（DEPLOY_SHA）：镜像以它为标签构建，服务器上
+#            `git checkout --detach` 到它再跑它自己的 deploy/deploy.sh，不 `git pull` 分支最新。
+#   D3 结论：只有新版本已上线、且上线后健康检查报出 DEPLOY_SHA 才以 success 结束；迁移失败、
+#            不健康、回滚（无论回滚是否成功）、中断都以失败结束。没有 continue-on-error。
+#            Core 没有公网入口，健康检查经 SSH 在服务器上进容器取 /healthz（deploy/healthcheck.sh）。
+#   D4 并发：不取消进行中的部署（被取消的运行按失败处理）。
+#   D5 期限：两个 job 的 timeout-minutes 合计 22 分钟，30 分钟内给出结论；不用需要人工批准的 environment。
+# OpenClaw 只读结论：不部署、不回滚、不重跑，也不登录生产。
+#
+# 本文件不写主机名、IP、域名、路径、密钥：连接信息与部署目录放 GitHub secrets。
+name: Deploy
+
+# paths-ignore：只改这两个文件的提交（OpenClaw 自动收尾 PR 的 ready → done 与移出「当前计划」）不部署。
+# 项目启用自动收尾（控制面登记表 auto_closeout: true）后，Worker 合并收尾 PR 前逐项核对这里的形状，
+# 不符即拒绝合并（closeout_would_deploy）。只接受这一种形状：
+#   - 触发器键是字面的 on；on 下只有 push，可另有 workflow_dispatch；
+#   - push 是 mapping，有 paths-ignore 列表，逐字含 .platform/tasks.yaml 与规划文件路径，没有以 ! 开头的条目；
+#   - 没有 paths、没有 branches-ignore；branches 若有，必须含默认分支；
+#   - 不用锚点、别名、合并键、重复键。
+# 改这里之前先对照这条约束。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - .platform/tasks.yaml
+      - docs/TODO.md
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要部署的完整 40 位 commit SHA（回滚时填上一个好的那个）"
+        required: true
+
+permissions:
+  contents: read
+
+# D4：不允许并发部署，也不取消正在跑的那个——取消到一半会把线上停在中间状态。
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      image_repo: ${{ steps.resolve.outputs.image_repo }}
+    steps:
+      # D2：先定下要部署的确切提交，后面所有步骤只用这一步的输出。
+      # 手工输入只经 env 进 shell（不直接 ${{ }} 拼进脚本，防注入），且只放行 40 位小写十六进制。
+      - name: Resolve the commit to deploy
+        id: resolve
+        env:
+          REF: ${{ inputs.ref || github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          if [[ ! "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::ref must be a full 40-character lowercase commit SHA"
+            exit 1
+          fi
+          echo "sha=$REF" >> "$GITHUB_OUTPUT"
+          # 镜像仓库名必须小写，而账号或仓库名可能带大写。
+          echo "image_repo=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 镜像在这里构建，不在共享服务器上构建。GIT_SHA 进镜像，健康检查原样返回。
+      # acuven.project 标签让 deploy/deploy.sh 只清理本项目的旧镜像。
+      - name: Build and push the API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          build-args: GIT_SHA=${{ steps.resolve.outputs.sha }}
+          labels: acuven.project=stock_core
+          tags: ${{ steps.resolve.outputs.image_repo }}-api:${{ steps.resolve.outputs.sha }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      # 主机指纹没配就直接失败：ssh-action 的 fingerprint 留空时是静默跳过校验。
+      - name: Require the host fingerprint
+        env:
+          FINGERPRINT: ${{ secrets.VPS_FINGERPRINT }}
+        run: |
+          if [ -z "$FINGERPRINT" ]; then
+            echo "::error::VPS_FINGERPRINT is not set; refusing to SSH without verifying the host key"
+            exit 1
+          fi
+
+      # 所有值经 envs 传给远端脚本，不拼进脚本文本。
+      # 远端先检出 DEPLOY_SHA，再跑那个提交里的 deploy/deploy.sh（D2）；它失败即非零退出（D3）。
+      - name: Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_SHA: ${{ needs.build.outputs.sha }}
+          IMAGE_REPO: ${{ needs.build.outputs.image_repo }}
+          APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          fingerprint: ${{ secrets.VPS_FINGERPRINT }}
+          envs: DEPLOY_SHA,IMAGE_REPO,APP_DIR,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -euo pipefail
+            cd "$APP_DIR"
+            git fetch --quiet origin
+            git checkout --quiet --detach "$DEPLOY_SHA"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            trap 'docker logout ghcr.io >/dev/null 2>&1' EXIT
+            CORE_IMAGE_REPO="$IMAGE_REPO" bash deploy/deploy.sh "$DEPLOY_SHA"
+
+      # D3：上线后健康检查。Core 没有公网入口，经 SSH 在服务器上进容器取 /healthz，
+      # 要求返回体带着 DEPLOY_SHA——通过即同时证明上线的就是这个提交（D2）。
+      - name: Post-deploy health check
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_SHA: ${{ needs.build.outputs.sha }}
+          APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          fingerprint: ${{ secrets.VPS_FINGERPRINT }}
+          envs: DEPLOY_SHA,APP_DIR
+          script: |
+            set -euo pipefail
+            cd "$APP_DIR"
+            bash deploy/healthcheck.sh "$DEPLOY_SHA"

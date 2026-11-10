@@ -19,7 +19,7 @@
 ## 1. 需求分析与设计闸门
 
 - 需求说明已有：根目录 `REQUIREMENTS.md`（2026-10-08）。模板要求放在 `docs/` 下——建议复制模板后**移动**到 `docs/REQUIREMENTS.md`，根目录 README 改链接（或保留原位、在 `CLAUDE.md` 写明位置；二选一，影响很小）。
-- **几乎全部属于设计闸门范围**：Core 的核心就是账本、幂等、状态机和数据库结构，按 TEMPLATE-GUIDE 第 1 步“碰钱”同类处理（库存账虽不是钱，但同样是不可逆的账本与状态机）。本轮的 [CONTRACT_V1_DRAFT.md](CONTRACT_V1_DRAFT.md) 就是交给 Kelvin 的设计；**批准前不写这些部分的代码**，设计一变，批准作废。
+- **几乎全部属于设计闸门范围**：Core 的核心就是账本、幂等、状态机和数据库结构，按 TEMPLATE-GUIDE 第 1 步“碰钱”同类处理（库存账虽不是钱，但同样是不可逆的账本与状态机）。本轮的 [CONTRACT_V1.md](CONTRACT_V1.md) 就是交给 Kelvin 的设计；**批准前不写这些部分的代码**，设计一变，批准作废。
 - 碰个人数据：Core 设计上不收个人资料（契约第 10 节第 6 条）；这条本身要在设计批准时一并确认。
 - **停**：设计交 Kelvin 批准（本轮交付）。
 
@@ -65,7 +65,7 @@ tests/
   unit/              # 沙箱可跑
   integration/       # 需要 MySQL / TestClient，只在 CI
 docs/
-  REQUIREMENTS.md  CONTRACT_V1_DRAFT.md（批准后改名 CONTRACT_V1.md）  TODO.md …
+  REQUIREMENTS.md  CONTRACT_V1.md（2026-11-10 批准）  TODO.md …
 .platform/ project.yaml commands.yaml tasks.yaml
 .github/workflows/ ci.yml deploy.yml
 CLAUDE.md  AGENTS.md（两份一致）  .gitignore  .env.example
