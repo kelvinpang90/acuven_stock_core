@@ -75,7 +75,7 @@
 - 名称长度：商品与 SKU 的基本名称 `VARCHAR(200)`；`sku_code`、`barcode` `VARCHAR(64)`（与网店 `sku` 列同长）；币种 `CHAR(3)`，大写字母由接口层校验。
 - **数据库列约定**（目录各表通用，之后的表沿用）：
   - `tenant_id`：`VARCHAR(32) NOT NULL`。
-  - 时间：`DATETIME(6) NOT NULL`，一律 UTC；`created_at` 默认 `CURRENT_TIMESTAMP(6)`，`updated_at` 由应用在每次修改时写入。
+  - 时间：`DATETIME(6) NOT NULL`，一律 UTC（数据库连接把会话时区固定为 UTC，见 `app/db.py`）；`created_at` 默认 `CURRENT_TIMESTAMP(6)`，`updated_at` 由应用在每次修改时写入。
   - 状态：`VARCHAR(16) NOT NULL`，检查约束限定取值（目录为 `active`、`inactive`）；不用数据库 ENUM，方便以后加值。
   - 编码类列（`sku_code`、`barcode`、归属表的 `code`）：排序规则 `utf8mb4_0900_ai_ci`，**唯一性不区分大小写**（`abc` 与 `ABC` 视为同一编码）；
     检查约束要求非空串且首尾无空格（`TRIM(x) = x`），接口层先去首尾空格再写入。
@@ -87,7 +87,8 @@
 - 旧编码永久保留、不再分配给其他 SKU（Q-06），由另一张表 `sku_code_claims` 保证：每个用过的编码登记一次 `(tenant_id, code) → sku_id`。
   - **数据库保证的一半**：`sku_code_claims` 的主键是 `(tenant_id, code)`（一个编码只能归一个 SKU）；`(tenant_id, sku_id)` 复合外键指向 `skus`。
   - **服务层保证的一半**：在同一事务里完成。建 SKU 时**先插 SKU 行，再插归属行**（归属行的外键要求 SKU 已存在）；改编码时先查新编码：
-    已登记给别的 SKU 则 409 `SKU_CODE_RETIRED`，未登记则插入归属行，再更新 `skus.sku_code` 并写历史。
+    已登记给别的 SKU 则 409 `SKU_CODE_RETIRED`；已登记给它自己（改回旧编码，或只改大小写）则不再插入归属行；未登记则插入归属行；
+    然后更新 `skus.sku_code` 并写历史。
     `skus` 不反向外键到归属表（双向外键成环，MySQL 无法延迟检查）。
   - `sku_code_history` 是内部表，主键为自增 `BIGINT id`（不对外暴露，同一秒内的多条按 `id` 排序）。
 

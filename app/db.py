@@ -16,4 +16,9 @@ class Base(DeclarativeBase):
 
 
 def make_engine(database_url: str) -> Engine:
-    return create_engine(database_url, pool_pre_ping=True)
+    # 会话时区固定为 UTC：DATETIME 列的数据库默认值与 NOW() 都按 UTC 记（契约 2.2 数据库列约定）。
+    return create_engine(
+        database_url,
+        pool_pre_ping=True,
+        connect_args={"init_command": "SET time_zone = '+00:00'"},
+    )

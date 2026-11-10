@@ -41,7 +41,13 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     section = config.get_section(config.config_ini_section, {})
     section["sqlalchemy.url"] = _database_url()
-    connectable = engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool)
+    # 与 app/db.py 相同：会话时区固定为 UTC，迁移里的默认值与 NOW() 按 UTC 记。
+    connectable = engine_from_config(
+        section,
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+        connect_args={"init_command": "SET time_zone = '+00:00'"},
+    )
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
