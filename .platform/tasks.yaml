@@ -80,8 +80,8 @@ tasks:
     acceptance_criteria:
       - 账面量是不可变值对象；可售量按契约 4.1 由 stock_balance 减 reserved 减 unavailable 派生，不作为可写字段
       - 不变量按契约 4.1 校验：四个量为非负整数，且 reserved 加 unavailable 不超过 stock_balance；违反时抛出明确的领域异常，不返回半改的结果
-      - 契约 4.3 表中除 MERGE_TRANSFER 与 CORRECTION 外的每种流水类型都有对应规则，给定数量 q 返回新的账面量；q 必须是正整数，COUNT_ADJUSTMENT 接受非零的有符号差额
-      - DEMO_RESET 按契约 6.1 计算 new_balance 等于 target 与 reserved 加 unavailable 两者的较大值，只改 stock_balance，并返回增量
+      - 契约 4.3 表中除 MERGE_TRANSFER、CORRECTION、COUNT_ADJUSTMENT 外的每种流水类型都有对应规则，给定正整数 q 返回新的账面量
+      - COUNT_ADJUSTMENT 按契约第 6 节由在架件数与不可售件数算出新的 stock_balance 与 unavailable 及两项差额；会违反不变量时抛出带缺口数量的领域异常；DEMO_RESET 按 6.1 计算，target 为负时拒绝，增量可为 0
       - 单元测试逐条复算契约 11.3 与 11.5 两张示例表的每一步结果，另覆盖每种流水类型的越界拒绝（例如释放超过预留、发货超过待发货量）
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖
       - allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
@@ -102,18 +102,19 @@ tasks:
     title: 建立商品目录的数据库表与首个迁移
     purpose: >-
       按已批准契约 docs/CONTRACT_V1.md 的第 1 节与 2.1、2.2，建立租户、商品、规格 SKU 与 SKU 编码历史四张表的 SQLAlchemy 模型和首个
-      Alembic 迁移，为之后的目录接口打底。稳定 ID 是类型前缀加 ULID 的字符串（Q-04）；所有唯一约束都含 tenant_id；
-      租户内 sku_code 唯一，非空 barcode 唯一；参考价存整数最小货币单位加三位币种；商品与 SKU 带 version 与 active 或 inactive 状态；
-      SKU 带可空的 merged_into_sku_id；编码历史保证同租户的旧编码不重复（Q-06 永久保留）。只做数据库层：不加接口、不写业务服务、
-      不碰库存账表（另一个任务）。
+      Alembic 迁移，另加 2.2 的编码归属表 sku_code_claims，共五张表，为之后的目录接口打底。按契约 0.3（第 14 节）：稳定 ID 是
+      类型前缀加 ULID 的字符串，列宽 32；主键为单列 ID，业务唯一约束都含 tenant_id，表间引用用 tenant_id 加 ID 的复合外键；
+      租户内 sku_code 唯一，条码空值存 NULL、拒绝空串、非空唯一；编码归属表 tenant_id 加 code 唯一，历史表只追加；参考价只在 SKU 上，
+      整数最小货币单位加三位币种，可空但两者同有同无；商品与 SKU 带 version 与 active 或 inactive 状态；merged_into_sku_id 不能指向自身，
+      非空时 SKU 必须 inactive。只做数据库层：不加接口、不写业务服务、不碰库存账表（另一个任务）。
     status: ready
     depends_on: []
     acceptance_criteria:
-      - 模型放在新文件 app/models/catalog.py，并在 alembic/env.py 里 import 登记；迁移文件放 alembic/versions，upgrade 与 downgrade 都写全
-      - 唯一约束与检查约束按 purpose 所列在数据库层生效（含 version 不小于 1、参考价不为负、币种三位）；约束名遵循 app/db.py 的命名约定
-      - 集成测试在真 MySQL 上验证：同租户重复 sku_code 被拒、不同租户可用相同 sku_code、同租户两个非空相同 barcode 被拒、多个空 barcode 可以并存
+      - 模型放在新文件 app/models/catalog.py，并在 alembic/env.py 里 import 登记；迁移文件放 alembic/versions，upgrade 与 downgrade 都写全；不含任何顾客个人资料字段
+      - 唯一约束、复合外键与检查约束按 purpose 所列在数据库层生效（含 version 不小于 1、参考价不为负）；约束名遵循 app/db.py 的命名约定
+      - 集成测试在真 MySQL 上验证：同租户重复 sku_code 被拒、不同租户可用相同 sku_code、两个相同非空 barcode 被拒而多个 NULL 可并存、空串条码被拒、合并指向别的租户或自身被拒、已合并却 active 被拒
+      - 需要表结构的集成测试经 tests/integration/conftest.py 的共享夹具在开始时升级到 head、结束时降到 base，CI 之后的迁移往返照常从空库开始
       - CI 的迁移往返（upgrade、downgrade 到底、再 upgrade）与 alembic check 通过
-      - 不存任何顾客个人资料字段
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖
       - allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
       - 集成测试与迁移检查由 PR 的必需 CI 检查 integration 执行并通过
@@ -122,6 +123,7 @@ tasks:
       - app/models/catalog.py
       - alembic/env.py
       - alembic/versions/20261111_0001_catalog.py
+      - tests/integration/conftest.py
       - tests/integration/test_catalog_schema.py
     allowed_commands:
       - lint.check

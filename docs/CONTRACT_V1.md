@@ -1,7 +1,7 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.2｜2026-11-10｜状态：**Kelvin 2026-11-10 批准（设计闸门通过）**，内容为当天按 OPEN_QUESTIONS 逐条答复修订后的稿。尚未实现。
-> 按模板规则：之后设计若有改动，这次批准即作废，改动部分须重新批准。
+> 版本：0.3｜2026-11-10｜状态：0.2 已由 Kelvin 2026-11-10 批准；**0.3 的改动（见第 14 节，来自登记任务时的设计预审）待 Kelvin 批准**，批准前这些改动涉及的部分不写代码。尚未实现。
+> 按模板规则：设计有改动时，改动部分的批准作废、须重新批准。
 > 依据：[REQUIREMENTS.md](../REQUIREMENTS.md)（Core V1 需求，2026-10-08）、`acuven_hub/DECISIONS.md` 的 C-01～C-19、S-01～S-10、I-02、I-04，
 > 以及 `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md`（Inventory 草案，只读参照）。
 > 网店现状见 [SHOP_STOCK_INVENTORY.md](SHOP_STOCK_INVENTORY.md)；问题与 Kelvin 的答复见 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)，本文用 **Q-xx** 引用。
@@ -39,7 +39,7 @@
 | SKU 编码 | `sku_code` | 运营人员输入或导入 | 人看的编码，租户内唯一，可修改（保留旧值审计）；**不是**稳定身份，系统间关联一律用 `sku_id`。 |
 | 条码 | `barcode` | 运营人员 | 可空；非空时租户内唯一。 |
 
-**稳定 ID 格式（Q-04 已定）：**带类型前缀的不透明字符串，前缀＋ULID，例如 `prd_01JC…`、`sku_01JC…`、`pool_01JC…`。
+**稳定 ID 格式（Q-04 已定）：**带类型前缀的不透明字符串，前缀＋ULID，例如 `ten_01JC…`（租户）、`prd_01JC…`、`sku_01JC…`、`pool_01JC…`。数据库列统一 `VARCHAR(32)`。
 生成后永不复用、永不改变；调用方只做相等比较，不解析内容。跨租户可以出现相同 `sku_code`，但 `sku_id` 全局唯一。
 
 **调用方引用（网店生成，Core 只存不解释）：**`order_ref`、`line_ref`、`payment_ref`、`shipment_ref`、`refund_ref`、`return_ref`、
@@ -56,7 +56,7 @@
 | --- | --- |
 | `product_id`、`sku_id`、`sku_code`、`barcode` | 图片、分类、多语言展示名称与营销文案、SEO |
 | **基本名称**（商品一个、SKU 一个，英文，Q-05） | 规格展示文案（颜色/尺码的多语言标签） |
-| **参考售价** `reference_price`（整数最小货币单位＋币种，如 `{"amount_minor": 12900, "currency": "MYR"}`） | **渠道营业价**、促销价、节日活动价、会员价 |
+| **参考售价** `reference_price`（只在 SKU 上；整数最小货币单位＋币种，如 `{"amount_minor": 12900, "currency": "MYR"}`；可空，金额与币种同时有或同时无） | **渠道营业价**、促销价、节日活动价、会员价 |
 | 启停状态 `status`：`active / inactive` | 上下架、排序、陈列 |
 | 版本 `version`、创建/更新时间、变更审计 | 订单行里的商品与成交价**快照** |
 | SKU 合并关系 `merged_into_sku_id`、SKU 编码历史 | 网店侧的 `core_sku_id` 映射列 |
@@ -71,10 +71,12 @@
 
 ### 2.2 唯一性与版本
 
-- `(tenant_id, sku_code)` 唯一；`(tenant_id, barcode)` 在非空时唯一（部分唯一索引）。
+- `(tenant_id, sku_code)` 唯一；`(tenant_id, barcode)` 在非空时唯一：空条码一律存 `NULL`，不存空字符串（数据库检查约束拒绝空串）；MySQL 的唯一索引允许多个 `NULL`，因此不需要部分索引。
+- 名称长度：商品与 SKU 的基本名称 `VARCHAR(200)`；`sku_code`、`barcode` `VARCHAR(64)`（与网店 `sku` 列同长）；币种 `CHAR(3)`，大写字母由接口层校验。
 - 每个商品、SKU 有整数 `version`，每次修改 +1。修改请求必须带 `If-Match: <version>`（或正文 `expected_version`）；
   不一致返回 409 `VERSION_CONFLICT` 并附当前版本，**不静默覆盖**（CAT-03）。
-- 修改 `sku_code` 时把旧值写入 `sku_code_history`（旧值、新值、操作者、时间、原因）；旧编码永久保留，不再分配给其他 SKU（Q-06）。
+- 修改 `sku_code` 时把旧值写入 `sku_code_history`（旧值、新值、操作者、时间、原因；只追加、无唯一约束，同一 SKU 可以改回自己用过的编码）。
+- 旧编码永久保留、不再分配给其他 SKU（Q-06），由另一张表 `sku_code_claims` 在数据库层保证：每个用过的编码登记一次 `(tenant_id, code) → sku_id`，`(tenant_id, code)` 唯一；SKU 改用某编码时，该编码要么未登记、要么已登记给它自己。
 
 ### 2.3 批量导入（CAT-04、STK-03）
 
@@ -110,6 +112,7 @@ stateDiagram-v2
 - 来源 SKU 的未结预留、`paid_pending_dispatch` 与订单行累计量改挂到规范 SKU（`MERGE_TRANSFER_OUT/IN` 流水，成对出现）；
 - 规范 SKU 的 `stock_balance` 以盘点确认数为准（差额写 `COUNT_ADJUSTMENT` 流水并引用合并单）；来源 SKU 归零后设 `inactive`
   且 `merged_into_sku_id = 规范 SKU`；
+- 数据库约束：`merged_into_sku_id` 不能等于自身；非空时该 SKU 必须是 `inactive`。已合并的 SKU 不能重新启用（`reactivate` 返回 409 `SKU_MERGED`）。
 - **历史流水、订单快照里的原 `sku_id` 不改写**；之后任何带来源 `sku_id` 的查询返回 `merged_into_sku_id`，
   带来源 `sku_id` 的**新预留**返回 409 `SKU_MERGED`（附规范 ID），**已有订单行**的发货/退款回库/退货自动作用到规范 SKU。
 
@@ -182,7 +185,7 @@ Core 需求要求所有量非负、缺货时“暂停履约交管理员”（ORD
 | --- | --- | --- | --- | --- | --- |
 | `OPENING_BALANCE` | 期初（仅初始化模式） | +q | | | |
 | `RECEIPT` | 收货入库 | +q | | | |
-| `COUNT_ADJUSTMENT` | 盘点差异确认 / 合并定数 | ±d | | | |
+| `COUNT_ADJUSTMENT` | 盘点差异确认 / 合并定数（§6） | ±d | | ±u | |
 | `MARK_UNAVAILABLE` / `RESTORE_AVAILABLE` | 不可售 / 恢复可售 | | | +q / −q | |
 | `WRITE_OFF` | 报损（从不可售量） | −q | | −q | |
 | `RESERVE` | 订单预留 | | +q | | |
@@ -299,7 +302,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 | --- | --- |
 | 期初 `opening-balances` | 只在池处于 `initializing` 状态时可用；批量“校验预览 → 确认”，与 2.3 同形；**Demo 库存数不得作为期初**（STK-03）。池切到 `live` 后期初命令一律拒绝，只能走盘点更正或经审批的重建流程（Q-09）。 |
 | 收货 `receipts` | `receipt_ref` 唯一；同引用重试不重复入库（STK-02）。V1 无采购单，`receipt_ref` 由网店后台生成。 |
-| 盘点 `counts` | 两步：开盘点单（Core 记下每个 SKU 当时的 `stock_balance + paid_pending_dispatch` 与 `balance_version`）→ 提交实数并确认。确认时若账面已变化（期间有销售/发货），按**期间流水**重算差额，不用旧快照硬覆盖。差额写 `COUNT_ADJUSTMENT`，记账面量、实数、差额、原因（STK-02、STK-05）。 |
+| 盘点 `counts` | 两步：开盘点单（Core 记下每个 SKU 当时的四个账面量与 `balance_version`）→ 提交实数并确认。实数分两项录：**在架件数**（含已付款待发的件）与**不可售件数**。确认时以当时最新账面计算：新 `unavailable` = 不可售件数，新 `stock_balance` = 在架件数＋不可售件数−`paid_pending_dispatch`；期间有销售/发货时以最新账面为准，不用开单时的快照硬覆盖。写一条 `COUNT_ADJUSTMENT`（`stock_balance` 差 d、`unavailable` 差 u），记账面量、实数、差额、原因（STK-02、STK-05）。**若新值会违反 §4.1 不变量**（实物少于已预留＋不可售，或少于待发货量），整笔拒绝，返回 409 `COUNT_BELOW_COMMITMENTS` 并列出缺口，盘点单保持未确认：管理员先让相关预留释放或到期，对缺货的已付款订单走退款（退款回库把待发货量转回账面，随后的盘点再把实际短缺记掉，两步都有流水），再重新确认。Core 不记负数，也不替管理员决定先砍哪笔订单（Q-20 同一原则）。 |
 | 不可售 / 恢复 / 报损 | 见 4.3；`unavailable` 不得超过 `stock_balance − reserved`。 |
 
 确认盘点差异、更正、报损需要“库存管理员”角色；普通操作员只能录入、不能确认（STK-05）。角色由网店断言、Core 校验，见第 10 节。
@@ -321,6 +324,8 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
   3. 写一条 `DEMO_RESET` 流水，增量 = `new_balance − stock_balance`；
   4. `reserved`、`unavailable`、`paid_pending_dispatch` 都不动。
 - 结果：`available = max(target − reserved − unavailable, 0)`，与网店现在的规则“当日可用 = max(初始 − 待付预留, 0)”一致；未结订单的预留和待发货量照常保留。
+- `target` 必须是不小于 0 的整数（0 表示当天该 SKU 售罄），负数或非整数整批 422；同一请求里同一 SKU 重复出现也是 422。
+- 增量为 0 的 SKU 不写流水，但在该次重置的结果里列出（`delta = 0`）。
 - 请求里没列的 SKU 不动。
 - `(pool_id, business_date)` 唯一：同一天重复调用，返回第一次的结果。
 
@@ -500,7 +505,8 @@ Core 健康检查返回的环境标记（`demo` / `production`）必须与网店
 ## 10. 租户、身份与鉴权
 
 1. **租户来自凭据。**每个服务凭据绑定唯一 `tenant_id`、`channel_id`（如有）和一组 scope；请求里没有任何可以改变租户的字段。
-   所有表的主键/唯一约束都含 `tenant_id`；跨租户对象一律 404。V1 只有一个租户，但测试必须覆盖“第二租户不可见”。
+   每张业务表都带 `tenant_id`。主键是全局唯一的稳定 ID（单列）；所有业务唯一约束都含 `tenant_id`；表间引用用 `(tenant_id, 被引用 ID)` 复合外键，
+   数据库层保证引用不跨租户（例如 SKU 的 `merged_into_sku_id` 只能指向同租户的 SKU）。跨租户对象一律 404。V1 只有一个租户，但测试必须覆盖“第二租户不可见”。
 2. **一个网店服务身份（Q-11）：**每个网店环境一个 `shop` 凭据，持有网店需要的全部 scope（查可售、预留、确认销售、订单库存查询、
    目录读写、库存管理、发货、退款回库、退货验收、对账读取、合并）。凭据只在网店服务端环境变量里，不进浏览器、不进模型上下文。
    代价是网店前台进程被攻破时也能调库存管理命令；兜底靠网店自己的后台权限检查、Core 的角色校验（第 3 条）和流水审计。
@@ -638,3 +644,22 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 | 8 | DEVPRI 阶段 1 的 ERP 样例与套餐权限契约 | DEVPRI 阶段 1 | Q-18：分两步 |
 | 9 | 网店 Demo 现行规则要改：退款不回补、当日直接改库存、迟到付款自动退款、本地每日重置 | `acuven-shop/docs/DESIGN.md` 第 6、12 条与 Stripe 第 6 条 | 网店接 Core 的设计任务（网店设计闸门） |
 | 10 | REQUIREMENTS 要求运营在网店后台完成建商品、合并、期初、入库、盘点，网店现有后台没有这些页面 | REQUIREMENTS §1；网店盘点 | 计入工期（ESTIMATE_BREAKDOWN W6） |
+
+---
+
+## 14. 0.3 变更记录（2026-11-10，待 Kelvin 批准）
+
+来源：登记 CORE-TASK-001、002 时跑的设计预审（`worker.design_precheck`），两个任务都判 `NOT_READY`，共 8 条发现。逐条处理如下：
+
+| # | 预审发现 | 类型 | 0.3 的处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 1 | 盘点差异只改 `stock_balance`，实物短缺超过余量时（例如 17/0/2/3 盘到 4 件）新值违反不变量、无法入账 | 设计缺陷 | 盘点分“在架件数”“不可售件数”两项录；`COUNT_ADJUSTMENT` 同时改 `stock_balance` 与 `unavailable`；会违反不变量时整笔拒绝（409 `COUNT_BELOW_COMMITMENTS`），管理员先释放预留、对缺货订单退款再确认 | §4.3、§6 |
+| 2 | Demo 重置没说 `target` 能否为 0、负数怎么办、增量为 0 是否写流水 | 未决定 | `target` 为不小于 0 的整数，负数 422；增量为 0 不写流水但在结果里列出 | §6.1 |
+| 3 | 编码历史的“旧编码唯一”会拒绝合法操作（A→B→A→C），也拦不住别的 SKU 占用退役编码 | 设计缺陷 | 历史表只追加、无唯一约束；另设 `sku_code_claims` 表，`(tenant_id, code)` 唯一，编码永久归属第一次使用它的 SKU | §2.2 |
+| 4 | MySQL 没有部分唯一索引，空条码存 `NULL` 还是空串没定 | 未决定 | 一律存 `NULL`，检查约束拒绝空串；普通唯一索引允许多个 `NULL` | §2.2 |
+| 5 | 集成测试与 CI 的迁移往返共用一个库，测试怎么建、删表没说 | 未决定 | 由任务定义：需要表结构的集成测试用共享夹具在开始时 `alembic upgrade head`、结束时 `alembic downgrade base`，不影响之后的迁移往返 | `.platform/tasks.yaml` 的 CORE-TASK-002 |
+| 6 | 主键是否含 `tenant_id`、`merged_into_sku_id` 是否限同租户 | 未决定 | 主键是单列全局 ID；业务唯一约束含 `tenant_id`；表间引用用 `(tenant_id, ID)` 复合外键，保证不跨租户 | §10 第 1 条 |
+| 7 | 已合并 SKU 是否必须停用、能否自引用 | 未决定 | 不能自引用；已合并必须 `inactive`，且不能重新启用 | §2.4 |
+| 8 | 租户 ID 前缀、名称长度、参考价是否可空、放商品还是 SKU、币种检查 | 未决定 | 租户前缀 `ten_`、ID 列 `VARCHAR(32)`；名称 200、编码与条码 64；参考价只在 SKU、可空（金额与币种同有同无）；币种 `CHAR(3)`，大写由接口层校验 | §1、§2.1、§2.2 |
+
+其中只有第 1 条影响业务流程（盘点遇到实物少于已承诺数量时，要求先处理订单再确认），其余是数据库与校验细节。
