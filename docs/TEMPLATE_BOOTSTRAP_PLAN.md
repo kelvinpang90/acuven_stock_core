@@ -1,8 +1,10 @@
-# 从模板起步的方案（只写方案，未执行）
+# 从模板起步的方案
 
 > 2026-11-10｜依据 `acuven-project-template/TEMPLATE-GUIDE.md`（以控制面 `docs/ONBOARD-PROJECT.md` 为准）。
-> 本文**不执行**任何一步：没有建 GitHub 仓库、没有复制模板文件、没有写控制面登记表。标「停」的地方等 Kelvin 回复。
-> 本目录已 `git init`（只含需求与本轮设计文档，未推送、无远端）——这是任务授权范围内的唯一 git 动作。
+> **进度（2026-11-10）**：第 0–5 步与第 7 步已在本地完成——契约批准（0.4）、复制模板、骨架、CI、`deploy.yml`、`.platform/`、
+> 第一批任务 CORE-TASK-001/002，`contract_check` 为 `ready to register`，两个任务设计预审 `READY`。
+> **未做**：第 6 步（建 GitHub 远端、推送、分支保护、secrets，服务器上的库与 `.env`）与第 8 步（控制面登记，材料见
+> [REGISTRATION_HANDOFF.md](REGISTRATION_HANDOFF.md)）。下文保留原方案正文，个别细节以实际文件为准。
 
 ## 0. 身份（已定）
 
