@@ -1,12 +1,12 @@
 # Acuven Stock Core V1 契约草案
 
-> 版本：草案 0.1｜2026-11-10｜状态：**待 Kelvin 过设计闸门，未批准，不是已实现接口**。
+> 版本：草案 0.2｜2026-11-10｜状态：**已按 Kelvin 当天对 OPEN_QUESTIONS 的逐条答复修订；仍待正式批准（设计闸门），不是已实现接口**。
 > 依据：[REQUIREMENTS.md](../REQUIREMENTS.md)（Core V1 需求，2026-10-08）、`acuven_hub/DECISIONS.md` 的 C-01～C-19、S-01～S-10、I-02、I-04，
 > 以及 `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md`（Inventory 草案，只读参照）。
-> 网店现状见 [SHOP_STOCK_INVENTORY.md](SHOP_STOCK_INVENTORY.md)；待拍板的问题集中在 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)，本文用 **Q-xx** 引用。
+> 网店现状见 [SHOP_STOCK_INVENTORY.md](SHOP_STOCK_INVENTORY.md)；问题与 Kelvin 的答复见 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)，本文用 **Q-xx** 引用。
 >
 > 本文只定**语义与边界**：名词、数量不变量、命令与状态、幂等、错误、鉴权、迁移和恢复约束。字段名、路径是建议写法，
-> 设计闸门通过后再落成 OpenAPI；具体技术选型（语言、数据库拓扑）见第 12 节与 Q 清单，不在本文替 Kelvin 选。
+> 设计闸门通过后再落成 OpenAPI；技术栈已定（Q-23，见 TEMPLATE_BOOTSTRAP_PLAN.md）。
 
 ---
 
@@ -19,8 +19,9 @@
   余额只是流水的累计结果。
 - 每个写命令带**幂等键**和**稳定业务引用**；同一个事实最多生效一次，响应丢了可以按原键重试或按业务引用查询。
 - 网店业务代码只依赖 `StockGateway` 接口：V1 由 Core 适配器实现；将来加购 Inventory 并共卖一批货时换 Inventory 适配器。
-- 已确认成功的写入在整台主服务器永久损坏时也不能丢（RPO=0），4 小时内恢复（RTO≤4h）——这条约束决定了数据库拓扑、事务边界和
-  “Core 不可用时网店必须停卖”的故障策略（第 12 节）。
+- V1 的第一个接入方是**公开 Demo**：用一个独立的 Demo Core 实例，带 Demo 专用的每日重置（§6.1）。真实网店何时、怎么接待定（Q-24）。
+- 恢复目标：整台服务器永久损坏时，已确认写入最多丢 5 分钟（RPO≤5 分钟），4 小时内恢复（RTO≤4h）。原需求是 RPO=0，Kelvin 2026-11-10 放宽（Q-15，第 12 节）。
+- Core 不可用时，网店**继续收款**，但按故障前最后读到的可售量封顶；恢复后补交，有货补扣、没货交管理员（§5.5，Q-03）。
 
 ---
 
@@ -37,7 +38,7 @@
 | SKU 编码 | `sku_code` | 运营人员输入或导入 | 人看的编码，租户内唯一，可修改（保留旧值审计）；**不是**稳定身份，系统间关联一律用 `sku_id`。 |
 | 条码 | `barcode` | 运营人员 | 可空；非空时租户内唯一。 |
 
-**稳定 ID 格式（建议，Q-04）：**带类型前缀的不透明字符串，前缀＋ULID，例如 `prd_01JC…`、`sku_01JC…`、`pool_01JC…`。
+**稳定 ID 格式（Q-04 已定）：**带类型前缀的不透明字符串，前缀＋ULID，例如 `prd_01JC…`、`sku_01JC…`、`pool_01JC…`。
 生成后永不复用、永不改变；调用方只做相等比较，不解析内容。跨租户可以出现相同 `sku_code`，但 `sku_id` 全局唯一。
 
 **调用方引用（网店生成，Core 只存不解释）：**`order_ref`、`line_ref`、`payment_ref`、`shipment_ref`、`refund_ref`、`return_ref`、
@@ -53,7 +54,7 @@
 | 放在 Core 目录 | 放在网店（Core 不存、不覆盖） |
 | --- | --- |
 | `product_id`、`sku_id`、`sku_code`、`barcode` | 图片、分类、多语言展示名称与营销文案、SEO |
-| **基本名称**（商品一个、SKU 一个，单一语言，Q-05） | 规格展示文案（颜色/尺码的多语言标签） |
+| **基本名称**（商品一个、SKU 一个，英文，Q-05） | 规格展示文案（颜色/尺码的多语言标签） |
 | **参考售价** `reference_price`（整数最小货币单位＋币种，如 `{"amount_minor": 12900, "currency": "MYR"}`） | **渠道营业价**、促销价、节日活动价、会员价 |
 | 启停状态 `status`：`active / inactive` | 上下架、排序、陈列 |
 | 版本 `version`、创建/更新时间、变更审计 | 订单行里的商品与成交价**快照** |
@@ -72,7 +73,7 @@
 - `(tenant_id, sku_code)` 唯一；`(tenant_id, barcode)` 在非空时唯一（部分唯一索引）。
 - 每个商品、SKU 有整数 `version`，每次修改 +1。修改请求必须带 `If-Match: <version>`（或正文 `expected_version`）；
   不一致返回 409 `VERSION_CONFLICT` 并附当前版本，**不静默覆盖**（CAT-03）。
-- 修改 `sku_code` 时把旧值写入 `sku_code_history`（旧值、新值、操作者、时间、原因）；旧编码不能立刻被别的 SKU 占用（Q-06：冷却期或永久保留）。
+- 修改 `sku_code` 时把旧值写入 `sku_code_history`（旧值、新值、操作者、时间、原因）；旧编码永久保留，不再分配给其他 SKU（Q-06）。
 
 ### 2.3 批量导入（CAT-04、STK-03）
 
@@ -80,8 +81,9 @@
 
 1. `POST /v1/catalog-imports`：上传行（JSON 行数组，CSV 由网店后台解析后转 JSON）。Core 只校验、不写目录，返回 `import_id`、
    逐行结果（`ok / duplicate_sku_code / duplicate_barcode / invalid_format / conflicts_existing`）和汇总。
-2. `POST /v1/catalog-imports/{import_id}/confirm`：只在预览**没有错误行**时允许（建议；另一种是“只执行合格行”，见 Q-07），
-   整批在一个事务内生效；任一行失败整批回滚，不留下半成品商品。确认带幂等键；重复确认返回原结果。
+2. `POST /v1/catalog-imports/{import_id}/confirm`：**只执行预览合格的行**（Q-07），错误行跳过。每个商品连同它的 SKU 作为一组，
+   在一个事务内要么全建、要么不建，不留下半成品商品。结果逐行列出成功/跳过/失败原因，运营修正后用新的导入补齐。
+   确认带幂等键；重复确认返回原结果。
 3. 预览有有效期（建议 24 小时）；过期或期间目录有冲突修改须重新预览。
 
 ### 2.4 SKU 合并（CAT-05）
@@ -191,6 +193,7 @@ Core 需求要求所有量非负、缺货时“暂停履约交管理员”（ORD
 | `RETURN_SELLABLE` | 已交运退货，验收可售 | +q | | | |
 | `RETURN_UNSELLABLE` | 已交运退货，验收不可售 | +q | | +q | |
 | `MERGE_TRANSFER_OUT` / `IN` | SKU 合并迁移 | 按迁移量 | 按迁移量 | 按迁移量 | 按迁移量 |
+| `DEMO_RESET` | Demo 每日重置（**仅 Demo 实例**，§6.1） | 拉回目标 | | | |
 | `CORRECTION` | 管理员纠正错误流水（引用原 `entry_id`） | 原增量的反向 | 同左 | 同左 | 同左 |
 
 `CORRECTION` 只能由有纠正权限的管理员发起，必须引用原流水并给原因；原流水保留。原流水之后若已有依赖动作（例如错误的收货之后又有销售），
@@ -263,6 +266,30 @@ stateDiagram-v2
 - `GET /v1/reconciliation/order-lines?changed_after=<cursor>`：按变更顺序列出订单行累计量，供网店每日自动对账（ORD-08）。
   对账由网店发起、差异在网店后台成为待办；Core 不读网店数据库。对账要比较的项见 [SHOP_STOCK_INVENTORY.md](SHOP_STOCK_INVENTORY.md) 第 8 节。
 
+### 5.5 Core 不可用时的故障收款（Q-03）
+
+Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障前最后读到的可售量封顶**。这取代 REQUIREMENTS 原 OPS-05 的“停止新预留与库存确认”。
+
+**触发条件**：预留请求的结果是 `Unknown`（超时、连接失败、5xx），并且按 `order_ref` 查询也查不到结果。
+**业务拒绝不触发**：缺货、停用、超量、各种冲突（4xx）照常拦截，不能当成故障放行。
+
+**网店侧做法：**
+
+1. **封顶。**网店为每个 SKU 记住最近一次从 Core 成功读到的 `available` 和读取时间。故障期间，满足下面两条才放行一单：
+   - 该 SKU 本次故障已放行的件数加上本单件数，不超过这个读数；
+   - 读数不早于 10 分钟（默认值，可配）。
+
+   从没读到过、或读数太旧的 SKU 不放行。封顶计数只是网店的临时闸门，不是库存账，故障结束即作废。
+2. **订单标记。**放行的订单标 `stock_state=unreserved_fault`。支付截止时间用网店配置的同一默认值（15 分钟），因为此时拿不到 Core 的 `expires_at`。
+3. **Core 恢复后按原幂等键补交：**
+   - **已付款的放行订单**：调 `sale-commits`，不带 `reservation_id`。Core 先按 `(channel, order_ref)` 找预留：
+     - 找到（说明当初预留其实成功了、只是响应丢了），按 §5.2 正常确认；
+     - 找不到，按晚到支付处理：整单有货写 `LATE_SALE_COMMIT`；没货不改任何数量，转 `late_payment_review`，由管理员退款或等补货（Q-20、Q-26）。
+   - **未付款的放行订单**：补调预留。成功后照常走；缺货则取消订单，不再收款。
+4. 当初没有成功预留的订单，取消时不调 Core 释放。
+
+**Core 侧**：`sale-commits` 的 `reservation_id` 可为空，流水的 `reason_code` 记 `fault_mode`。对账（§5.4）要单独列出故障期间放行的订单。
+
 ---
 
 ## 6. 库存管理命令
@@ -275,6 +302,36 @@ stateDiagram-v2
 | 不可售 / 恢复 / 报损 | 见 4.3；`unavailable` 不得超过 `stock_balance − reserved`。 |
 
 确认盘点差异、更正、报损需要“库存管理员”角色；普通操作员只能录入、不能确认（STK-05）。角色由网店断言、Core 校验，见第 10 节。
+
+### 6.1 Demo 实例与每日重置
+
+背景：公开 Demo 是 Core V1 的第一个接入方，Kelvin 定 Demo 的每日重置用 Core 里的 Demo 专用命令来做。
+
+**实例区分**
+- Core 启动时读配置 `CORE_ENV=demo|production`，运行中不能改。
+- Demo 实例与将来的生产实例各用独立的库和凭据。
+- 健康检查返回这个环境标记，供网店做启动核对（§9.2）。
+
+**重置命令**：`POST /v1/demo/resets`，只在 Demo 实例上存在。
+- 请求正文：`business_date`（马来西亚日期）、`pool_id`、逐 SKU 的 `target`（网店的“每日初始库存”）。
+- Core 的处理：
+  1. 在一个事务里，按 SKU 升序加锁；
+  2. 对每个列出的 SKU 计算 `new_balance = max(target, reserved + unavailable)`；
+  3. 写一条 `DEMO_RESET` 流水，增量 = `new_balance − stock_balance`；
+  4. `reserved`、`unavailable`、`paid_pending_dispatch` 都不动。
+- 结果：`available = max(target − reserved − unavailable, 0)`，与网店现在的规则“当日可用 = max(初始 − 待付预留, 0)”一致；未结订单的预留和待发货量照常保留。
+- 请求里没列的 SKU 不动。
+- `(pool_id, business_date)` 唯一：同一天重复调用，返回第一次的结果。
+
+**生产实例的防护**
+- 该路径返回 404；
+- `DEMO_RESET` 流水类型在数据库约束层面就被拒；
+- 启动时如果发现 Demo 配置和生产标记冲突，直接拒绝启动。
+
+**留在网店的部分**
+- 什么时候调重置（马来西亚 00:00 之后），以及“每日恢复库存开关”，仍由网店决定。
+- “每日初始库存”是 Demo 的展示配置，也留在网店，不进 Core 目录。
+- Demo 原有的“当日库存调整”（直接把可用量改成某个值）改成调 Core 的盘点更正（§6），Core 不开放直接改数量的接口。
 
 ---
 
@@ -296,7 +353,7 @@ stateDiagram-v2
 **网店侧生成键的建议：**由业务对象确定性派生，持久化在网店订单/支付/发货记录上，例如 `shop:order:<order_id>:reserve:1`。
 进程崩溃重启后用同一个键重试，而不是新生成随机键。
 
-**保留期：**幂等记录和业务引用唯一约束随库存流水长期保留（不放 Redis，不随缓存清理），具体年限是 REQUIREMENTS §8 待定参数（Q-10）。
+**保留期：**幂等记录和业务引用唯一约束随库存流水长期保留（不放 Redis，不随缓存清理），流水与幂等记录永久保留、安全日志保留 1 年（Q-10）。
 
 ### 7.2 审计
 
@@ -336,10 +393,11 @@ stateDiagram-v2
 | | `GET /v1/ledger?sku_id=&from=&to=&after=` | STK-01 |
 | 订单 | `POST /v1/reservations`，`GET /v1/reservations/{id}`，`GET /v1/reservations?order_ref=` | ORD-01 |
 | | `POST /v1/reservations/{id}/release` | ORD-03 |
-| | `POST /v1/orders/{order_ref}/sale-commits`（`reservation_id`、`payment_ref`、`paid_at`） | ORD-02、03 |
+| | `POST /v1/orders/{order_ref}/sale-commits`（`reservation_id` 可空〔故障收款，§5.5〕、`payment_ref`、`paid_at`） | ORD-02、03 |
 | | `POST /v1/orders/{order_ref}/dispatches`、`/refund-restocks`、`/return-receipts` | ORD-04、05、07 |
 | | `POST /v1/orders/{order_ref}/late-payment-review/close` | ORD-03 |
 | | `GET /v1/orders/{order_ref}/stock`，`GET /v1/reconciliation/order-lines?changed_after=` | ORD-06、08 |
+| Demo | `POST /v1/demo/resets`（**仅 Demo 实例**） | §6.1 |
 | 运维 | `GET /healthz`（存活＋线上 commit SHA），`GET /readyz`（数据库与同步副本状态），`GET /v1/ops/invariants`（运维凭据） | OPS-04 |
 
 ### 8.3 错误码（API-03）
@@ -359,7 +417,7 @@ stateDiagram-v2
 | 409 | `REQUEST_IN_PROGRESS` | 按 `Retry-After` 用同键等待 |
 | 413 | `REQUEST_TOO_LARGE` | 不得把整单拆成逐行预留绕过原子性 |
 | 429 | `RATE_LIMITED` | 按 `Retry-After` 同键退避 |
-| 503 | `UNAVAILABLE` / `REPLICA_UNAVAILABLE` | 结果**确定未生效**，可同键重试 |
+| 503 | `UNAVAILABLE` | 结果**确定未生效**，可同键重试 |
 | 超时 / 连接中断 / 其他 5xx | — | 结果**未知**：先按业务引用查询，再同键重试；绝不当成功或失败处理 |
 
 ### 8.4 兼容规则（API-04）
@@ -411,22 +469,22 @@ class StockGateway(Protocol):
 
 | 适配器 | 用在哪 | 说明 |
 | --- | --- | --- |
-| `CoreStockGateway` | 真实网店 V1 | 直连 Core `/v1`；同步语义。 |
+| `CoreStockGateway` | 公开 Demo（接 Demo Core）；将来的真实网店 | 直连 Core `/v1`；同步语义。 |
 | `InventoryStockGateway` | 将来加购 Inventory 且该池启用共卖 | 调 Inventory 兼容库存接口，Inventory 再向同一 Core 提交唯一命令。**未实现**，切换前须统一第 9.3 节的差异。 |
-| `DemoLocalStockGateway`（暂名） | 公开 Demo（如 Q-02 选择 Demo 不接 Core） | 把网店现有本地库存列与每日重置包在同一接口后面；**只能在 Demo 配置里启用**，生产配置启用即启动失败。 |
+| `LocalStockGateway`（暂名，过渡用） | 纯重构阶段（Q-25） | 把网店现有本地库存列与每日重置包在同一接口后面，行为不变。Demo 切到 Core 并稳定后删除（删除前它也是 Demo 的回退路径，§11.4）。生产配置启用即启动失败。 |
 
-适配器由部署配置选择（例如 `STOCK_BACKEND=core|demo_local`），而不是由代码分支判断“是不是 Demo”。生产启动检查：后端必须是 `core`
-（或将来的 `inventory`），且 Core 健康检查返回的租户/环境标记是生产。
+适配器由部署配置选择（例如 `STOCK_BACKEND=core|local`），而不是由代码分支判断“是不是 Demo”。启动检查：后端为 `core` 时，
+Core 健康检查返回的环境标记（`demo` / `production`）必须与网店自身环境一致，防止 Demo 网店连到生产 Core 或反之。
 
 ### 9.3 两种适配器语义上还没对齐的地方（切换前必须定）
 
 | 主题 | Core V1（本文） | Inventory 草案 | 影响 |
 | --- | --- | --- | --- |
-| 预留有效期 | 默认 15 分钟，Core 配置 | 固定 30 分钟 | 支付页截止时间会因切换而变 |
-| 付款后取消 | 只有“已批准退款且未交运”回库 | `sale_cancelled` 取消未出库部分 | 数量效果相同，触发条件不同 |
+| 预留有效期 | 默认 15 分钟，Core 配置 | 固定 30 分钟 | Q-19：以 Core 为准，接 Inventory 前改 Inventory 草案 |
+| 付款后取消 | 只有“已批准退款且未交运”回库 | `sale_cancelled` 取消未出库部分 | Q-28：Inventory 适配器映射到 Core 的退款回库 |
 | 事实提交 | 同步，200 即已生效 | 202 已接收，稍后 `processed/needs_review` | 网店须支持 `Pending` |
-| 超卖事实 | 不改数量，暂停履约待管理员 | 先入账为需求缺口，`needs_review` | Q-20 |
-| Core 不可用时 | 停止新预留与库存确认（OPS-05） | Acuven Shop 可走“故障继续收款” | Q-03，**与需求直接冲突** |
+| 超卖事实 | 不改数量，暂停履约待管理员 | 先入账为需求缺口，`needs_review` | Q-20：V1 按 Core；接 Inventory 时再议 |
+| Core 不可用时 | 故障继续收款，按最后读到的可售量封顶（§5.5） | Acuven Shop 可“故障继续收款”，不封顶 | Q-03：方向一致，接 Inventory 前统一封顶规则 |
 | 未付款占用上限 | 无 | 网店本地每顾客最多 3 笔 | 网店规则，与 Core 无关，但需决定是否保留 |
 
 ### 9.4 Core → Inventory 切换步骤（将来，摘要）
@@ -442,128 +500,126 @@ class StockGateway(Protocol):
 
 1. **租户来自凭据。**每个服务凭据绑定唯一 `tenant_id`、`channel_id`（如有）和一组 scope；请求里没有任何可以改变租户的字段。
    所有表的主键/唯一约束都含 `tenant_id`；跨租户对象一律 404。V1 只有一个租户，但测试必须覆盖“第二租户不可见”。
-2. **两个网店服务身份（建议，Q-11）：**
-   - `shop-storefront`：`availability:read`、`reservation:write`、`sale:commit`、`order-stock:read`。顾客流量路径只持有它。
-   - `shop-backoffice`：目录读写、库存管理命令、发货、退款回库、退货验收、对账读取、合并。
-   分开后，前台进程被攻破也不能改目录或调库存。凭据只在网店服务端环境变量里，不进浏览器、不进模型上下文。
+2. **一个网店服务身份（Q-11）：**每个网店环境一个 `shop` 凭据，持有网店需要的全部 scope（查可售、预留、确认销售、订单库存查询、
+   目录读写、库存管理、发货、退款回库、退货验收、对账读取、合并）。凭据只在网店服务端环境变量里，不进浏览器、不进模型上下文。
+   代价是网店前台进程被攻破时也能调库存管理命令；兜底靠网店自己的后台权限检查、Core 的角色校验（第 3 条）和流水审计。
+   Demo Core 与将来的生产 Core 各发各的凭据，互不通用。
 3. **运营人员身份。**后台命令带 `X-Actor-Ref`（网店管理员的不透明 ID，不含姓名/邮箱）与 `X-Actor-Role`
    （`stock_operator` / `stock_admin` / `catalog_admin`）。Core 不认识网店的用户，只能**信任网店服务断言**，但会：按角色表校验命令
    （例如确认盘点、更正、报损只接受 `stock_admin`）、把断言写入流水与审计。这一信任边界写在验收里，网店后台必须先做自己的权限检查。
 4. **凭据形式：**随机 ≥32 字节的不透明令牌，`Authorization: Bearer`；Core 只存 SHA-256 摘要和凭据 ID；可轮换（新旧重叠期有截止时间）、
    可立即吊销；吊销后所有请求 401。运维接口用独立凭据。
-5. **网络：**Core 不暴露公网入口（不挂到 `infra_nginx` 的公开 vhost）。网店与 Core 之间加密：同机时走仅内部的容器网络＋TLS，
-   跨机时走加密隧道或 mTLS（具体方案 Q-12）。Demo 环境与生产环境使用不同 Core 实例（或 Demo 不接 Core，Q-02）、不同库、不同凭据，
-   网络上互不可达（OPS-02）。
+5. **网络（Q-12）：**Core 不暴露公网入口（不挂到 `infra_nginx` 的公开 vhost）。与网店同机时只挂在仅内部的容器网络上，
+   **不加 TLS**：流量不出宿主机，靠凭据鉴权。这偏离 REQUIREMENTS OPS-02“服务间通信加密”的字面要求，Kelvin 已接受；
+   将来跨机时改走加密隧道。Demo Core 与将来的生产 Core 使用不同实例、不同库、不同凭据，网络上互不可达。
 6. **不存个人资料：**Core 不接收顾客姓名、电话、地址、邮箱、订单金额和支付凭据；`payment_ref` 是网店自己的支付记录 ID，不是支付机构流水号
    （如需对照，由网店保存映射）。
 
 ---
 
-## 11. 网店 Demo 数据的迁移与回退样例
+## 11. 迁移与回退样例
 
 ### 11.1 原则
 
-- **Demo 数字不进生产。**公开 Demo 的商品、库存和订单是模拟数据，每日重置；真实网店的期初来自实物盘点（STK-03，C-12）。
-- 因此“迁移”指的是**网店数据结构与代码路径**的迁移：给网店商品/规格加 Core 映射、把库存读写改走 `StockGateway`、在生产停用本地库存列；
-  不是把 Demo 的数量搬进 Core。
-- 若真实网店要沿用 Demo 里的部分商品资料（名称、SKU 编码、图片），只搬**目录身份**，数量一律重新盘点（Q-01）。
+- **V1 的第一个接入方是公开 Demo（Q-02 答复）**，迁移因此分两件事：
+  1. **Demo 切到 Demo Core**：把 Demo 的商品和库存数字（种子数据：30 件商品、76 个 SKU）导入 Demo Core。这些本来就是演示数据，允许导入。
+  2. **将来的真实网店**（Q-24 暂缓）：Demo 数字一律不进生产 Core，期初来自实物盘点（STK-03）。
+- 网店先做一次行为不变的纯重构，把库存读写收拢到 `StockGateway`＋`LocalStockGateway`（Q-25）；之后再切到 `CoreStockGateway`。
+- 网店侧要加映射列，见 [SHOP_STOCK_INVENTORY.md](SHOP_STOCK_INVENTORY.md) 第 7 节。
 
-### 11.2 样例 A：目录身份回填（网店 → Core）
+### 11.2 样例 A：Demo 目录回填（网店 → Demo Core）
 
-前提：网店规格表新增可空列 `core_product_id`、`core_sku_id`（唯一，见 SHOP_STOCK_INVENTORY 第 7 节），旧列保留。
+1. 导出网店的商品和规格，每个规格带上：
+   - 网店的 `product_id`、`variant_id`；
+   - SKU 编码：直接用网店 `product_variants.sku`（全站唯一，Q-13）；
+   - 条码：网店没有这一列，留空；
+   - 基本名称：取 `name_en`（Q-05）；
+   - 参考价：取当前 `price_sen`。
+2. 调 `catalog-imports` 预览。确认时只执行合格行（Q-07）；被跳过的行修正后重新导入，直到 76 个 SKU 全部成功。
+   Core 按导入行的 `external_ref` 返回“网店规格 → `sku_id`”对照表。
+3. 网店按对照表回填 `core_sku_id`。校验：规格数等于 SKU 数，没有空映射，没有重复映射；抽查 10 条，名称和编码一致。
+4. **回退**：网店切换适配器之前，清空映射列即可；Demo Core 里的这批商品设为 `inactive`，不硬删除。
 
-1. 导出网店商品/规格：`shop_product_id`、`shop_variant_id`、SKU 编码（网店 `product_variants.sku` 已全站唯一，直接用，Q-13）、条码（网店目前无此列，留空）、
-   基本名称（取指定语言，Q-05）、当前营业价作为初始参考价。
-2. 调 `catalog-imports` 预览；处理重复编码/条码后确认，Core 返回 `shop_variant_id → sku_id` 对照（导入行带 `external_ref`）。
-3. 网店按对照回填 `core_sku_id`；校验：规格数 = Core SKU 数，无空映射、无重复映射；抽查 10 条名称/编码一致。
-4. **回退**：在任何真实销售发生前，清空 `core_*` 映射列即可回到原状；Core 侧把这批商品 `inactive`（不硬删，保留审计）。
+### 11.3 样例 B：Demo 切换到 Core
 
-### 11.3 样例 B：期初与切换（真实网店首次开卖）
+设某个 Demo SKU 的每日初始库存是 20；切换前，本地 `available_stock` 是 17，有一笔待付款订单占着 3 件。
 
-设 SKU `sku_01JC…A`（网店规格 #12，“耳机 黑色”），Demo 里 `available_stock = 37`（**忽略**）；实物盘点 20 件，其中 2 件外盒破损。
+1. **选时间、清空未结预留。**选在当天每日重置之后的低峰时段。网店进入维护：停止新结账，公开页面显示维护提示。
+   等所有待付款订单付款或到 15 分钟期限被取消（本例那 3 件被释放，本地回到 20）。
+2. **遗留订单不进 Core。**切换时已付款但还没发货的 Demo 订单标为 `legacy_local`，之后发货、退款都不调 Core，因为这些数量本来就不在 Core 里。
+3. **导入期初。**Demo Core 的池处于 `initializing`，按当前本地 `available_stock` 导入期初（本例 20），然后池切 `live`。
+4. **切换。**网店配置改为 `STOCK_BACKEND=core`，启动核对环境标记（§9.2）通过后恢复结账。
 
-| 步骤 | 动作 | Core 结果（stock_balance / reserved / unavailable / ppd / available） |
+切换后的账面变化（`stock_balance / reserved / unavailable / paid_pending_dispatch / available`）：
+
+| 步骤 | 动作 | 结果 |
 | --- | --- | --- |
-| 1 | 池为 `initializing`；导入期初 20（`OPENING_BALANCE`） | 20 / 0 / 0 / 0 / 20 |
-| 2 | 标记 2 件不可售（`MARK_UNAVAILABLE`） | 20 / 0 / 2 / 0 / 18 |
-| 3 | 网店核对：后台显示 18 可售；Core 账面＋待发货 = 实物 20 ✓；池切 `live` | 同上 |
-| 4 | 生产网店切 `STOCK_BACKEND=core`，开放结账 | — |
-| 5 | 订单 A 买 3：预留 | 20 / 3 / 2 / 0 / 15 |
-| 6 | 订单 A 支付成功：确认 | 17 / 0 / 2 / 3 / 15 |
-| 7 | 发 2 件 | 17 / 0 / 2 / 1 / 15 |
-| 8 | 余下 1 件退款获批且未交运：回库 | 18 / 0 / 2 / 0 / 16 |
-| 9 | 已发 2 件退回 1 件，验收可售 | 19 / 0 / 2 / 0 / 17 |
+| 1 | 期初 20（`OPENING_BALANCE`） | 20 / 0 / 0 / 0 / 20 |
+| 2 | 访客下单 3 件：预留 | 20 / 3 / 0 / 0 / 17 |
+| 3 | 模拟支付成功：确认 | 17 / 0 / 0 / 3 / 17 |
+| 4 | 后台发货 2 件 | 17 / 0 / 0 / 1 / 17 |
+| 5 | 剩下 1 件退款获批、确认未发货：退款回库 | 18 / 0 / 0 / 0 / 18 |
+| 6 | 另一访客下单 4 件，未付款，到 00:00 仍在预留 | 18 / 4 / 0 / 0 / 14 |
+| 7 | 00:00 Demo 重置，target 20：`new_balance = max(20, 4) = 20`，`DEMO_RESET` +2 | 20 / 4 / 0 / 0 / 16 |
 
-核对：在库实物应为 20 − 2（发出）+ 1（退回）= 19 = `stock_balance + ppd` ✓。
+第 7 步结果符合网店现行规则：可用 = 初始 20 − 待付预留 4 = 16。
 
-切换前条件：生产库里**没有**任何依赖本地库存列的未完成订单（真实网店首次开卖时自然为空）；如果是在已有真实订单的网店上切换（不适用于 V1，
-但写在这里备查），需先让所有未付款订单到期或取消，已付款未发货订单按行在 Core 期初后补登 `paid_pending_dispatch`（专用迁移命令，需另过设计）。
-
-### 11.4 样例 C：切换后回退
+### 11.4 回退
 
 | 情况 | 回退做法 | 不能做的 |
 | --- | --- | --- |
-| 已切 `core`、**还没有任何真实订单** | 停结账 → 配置切回（生产不允许 `demo_local`，所以只能“停卖”而不是退回本地库存）→ 修问题后再开 | — |
-| 已有真实订单，Core 出现缺陷 | 停结账（OPS-05 同样做法）；修 Core 后按幂等键补交网店侧积压的命令；跑全量对账后恢复 | 不能把网店本地列改回权威、在 Core 外另记数量；不能删除或倒写 Core 已确认流水 |
-| Core 整机损坏 | 按第 12 节恢复流程在另一故障域恢复 Core，网店按幂等键补交；对账 | 不能用网店缓存的可售数继续卖 |
+| Demo 切到 Core 后发现问题 | Demo **可以退回**本地库存：停结账 → 等未结预留结束 → 配置切回 `local` → 跑一次本地每日重置，重建 `available_stock`（Demo 数据本来就每天重建）。只要 `LocalStockGateway` 还没删掉，这条路就在 | 不删除 Demo Core 的流水 |
+| 将来真实网店切到 Core 之后 | **没有退回本地库存的路径**（Q-14）：停卖 → 修复 → 按幂等键补交 → 对账 → 恢复 | 不能把网店本地列改回权威；不能删除或倒写 Core 已确认的流水 |
+| Core 所在机器损坏 | 按第 12 节从异地备份加日志恢复；网店按幂等键补交；最多 5 分钟的缺口，按网店订单和支付记录对账补录 | 不能无限期地按缓存继续卖。故障收款有封顶和读数时效（§5.5） |
 
-结论：**切到 Core 之后没有“退回网店本地库存”的路径**，回退的含义是“停卖—修复—对账—恢复”。这一点需要 Kelvin 明确接受（Q-14）。
+### 11.5 将来的真实网店（备查，Q-24 暂缓）
 
-### 11.5 ERP 旧数据
+真实网店的期初来自实物盘点，Demo 的数字忽略。示例：某 SKU 实物盘点 20 件，其中 2 件外盒破损。
 
-DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。`erp_os` 不在本轮范围（Core V1 只接网店，C-13），列为后续：ERP 接 Core 前另写
-“ERP SKU/多仓余额 → Core”的迁移设计。
+| 步骤 | 动作 | 结果（同上五个量） |
+| --- | --- | --- |
+| 1 | 期初 20 | 20 / 0 / 0 / 0 / 20 |
+| 2 | 2 件标不可售 | 20 / 0 / 2 / 0 / 18 |
+| 3 | 订单买 3 件：预留 → 支付确认 | 17 / 0 / 2 / 3 / 15 |
+| 4 | 发货 2 件；剩 1 件退款获批、确认未发货，回库 | 18 / 0 / 2 / 0 / 16 |
+| 5 | 已发的 2 件退回 1 件，验收可售 | 19 / 0 / 2 / 0 / 17 |
+
+核对：在库实物 = 20 − 2（发出）+ 1（退回）= 19，等于 `stock_balance + paid_pending_dispatch` ✓。
+
+### 11.6 ERP 旧数据
+
+DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为分两步（Q-18）：ERP 接 Core 之前，再写“ERP 的 SKU 与多仓余额 → Core”的迁移设计。
 
 ---
 
-## 12. RPO=0 / RTO≤4h 对设计的约束
+## 12. RPO≤5 分钟 / RTO≤4h 对设计的约束
 
-需求原文：已确认成功的库存写入在**整台生产服务器永久损坏**时也不能丢（RPO=0），4 小时内恢复可用（RTO≤4h）；普通定时备份或只有异步复制不算满足（OPS-03、C-12）。
+**Kelvin 2026-11-10 的决定（Q-15）**：已确认写入的 RPO 从 0 放宽到 **≤5 分钟**，RTO≤4 小时不变；不为同步副本另加机器。
+这改变了 REQUIREMENTS 原 OPS-03 和 DECISIONS C-12（后者待 acuven_hub 更新，见 OPEN_QUESTIONS 第三节）。
 
-### 12.1 由此推出的设计约束
+### 12.1 设计约束
 
-1. **“确认成功”必须晚于“另一故障域已持久化”。**Core 在数据库事务被至少一个**位于另一台物理服务器/另一机房**的副本确认持久化之后，
-   才向网店返回 2xx。异步复制、定时备份、单机 RAID 都不满足。
-2. **一笔命令只有一个数据库事务。**余额、订单行累计、预留、流水、幂等记录、outbox 必须在同一个库、同一事务里提交；
-   不能把幂等记录或预留放 Redis，也不能跨两个数据库做“先写这边再写那边”。Redis 只可做非权威缓存。
-3. **副本不可达时宁可拒写，不可降级。**同步副本失联时，写请求返回 503 `REPLICA_UNAVAILABLE`（确定未生效），而不是静默退回异步复制
-   （例如 MySQL 半同步在超时后默认会退回异步，必须配置成不退回或改用多数派方案）。结果是：**副本故障 = 网店停卖**，这是 RPO=0 换来的
-   可用性代价；如要“丢一台机器也能继续卖”，需要三节点多数派（Q-15）。
-4. **恢复时防双主。**主库所在机器“看起来死了”但其实只是网络断开时，不能让旧主继续接写。恢复流程必须先隔离（fence）旧主，
-   再提升副本，再把 Core 服务指向新主。
-5. **到期、对账、outbox 都在数据库里驱动。**预留到期用数据库时间；后台任务重启后从数据库状态继续，不依赖进程内存。
-6. **网店重试是恢复的一部分。**恢复后网店把“结果未知”的命令按原幂等键补交：已在副本上提交的会被重放、没提交的会正常执行，
-   不会重复扣库——所以幂等记录必须和数量同库同事务、同样同步复制。
-7. **备份仍然要做。**同步复制防的是“机器没了”，防不了“误操作/错误迁移把数据改坏”（副本会同步收到错误）。仍需每日全量＋二进制日志归档，
-   支持时间点恢复；数据库结构迁移前自动备份。
-8. **数据库结构迁移只做向前兼容的扩展。**合并即部署（沿用 Acuven 项目的部署方式）时，迁移必须是“先加后删”的两段式，
-   新旧代码都能在新结构上运行，便于回滚应用而不回滚数据。
-9. **演练是验收项。**上线前至少一次：模拟主服务器永久损坏 → 在另一故障域恢复 → 核对已确认命令、流水、余额、未结预留、待发货量 → 计时 ≤4h。
-   之后定期演练（频率 Q-16）。
+1. **一笔命令一个数据库事务。**余额、订单行累计、预留、流水、幂等记录、outbox 在同一个库的同一个事务里提交。
+   这条不是为了 RPO，而是为了恢复后网店按原幂等键补交时不会重复扣库。Redis 只能做非权威缓存。
+2. **异地日志。**`infra_mysql` 开启 binlog（ROW 格式），至少每 5 分钟把新的 binlog 传到另一家供应商或另一地区的存储；
+   每日全量备份也传到异地。超过 5 分钟没传成功就告警。
+3. **恢复流程（RTO≤4h）。**新开一台机器（开机器的时间也算在 4 小时里）→ 拉最近一次全量备份 → 重放 binlog 到最后一份 →
+   启动 Core 和网店 → 网店补交“结果未知”的命令 → 对账。写成运行手册，按步骤计时。
+4. **丢失窗口怎么补。**最多丢 5 分钟的 Core 写入。网店的库在同一个 `infra_mysql` 实例上，会丢同一段时间，所以两边大体一致；
+   外部可信的记录是支付机构的成功付款。恢复后，把这段窗口内支付机构有、网店没有的付款逐笔补成订单，再补交库存。
+5. **数据库结构迁移只做向前兼容的扩展。**合并即部署时用“先加后删”两段式；迁移前自动备份。
+6. **时间点恢复也防误操作。**binlog 加全量备份可以恢复到误操作之前的那一刻。
+7. **演练是验收项（Q-16）。**上线前做一次，之后每季度一次，备份方式或数据库拓扑变化后加做一次：
+   模拟整机损坏 → 在另一台机器恢复 → 核对丢失窗口 ≤5 分钟、恢复用时 ≤4 小时。
+8. **不再有“副本失联就拒写”。**Core 整体不可用时，网店按 §5.5 故障收款。
 
 ### 12.2 对现有基础设施的影响
 
-- 现有 VPS 是单机，`vps_infra` 的共享 `infra_mysql` 也在这台机上。**单靠它无法满足 RPO=0**：至少需要一台位于不同机房/不同供应商的
-  服务器承载同步副本（或改用自带同步多可用区的托管数据库）。这是新增的采购与运维成本，需要 Kelvin 决定（Q-15）。
-- 同步复制是数据库实例级设置，会让同实例上所有库的写入变慢、并在副本失联时一起拒写。**建议 Core 用独立数据库实例**，不放进共享
-  `infra_mysql`（Q-17）。
-- Core 应用进程本身可以和网店在同一台 VPS 上跑（STOCKCORE §三允许），但恢复时要能在另一台机器上起 Core 并接管入口名。
-
-### 12.3 数据库拓扑候选（只列出，不选；需故障实测后由 Kelvin 定）
-
-| 候选 | 形态 | RPO=0 条件 | 副本故障时 | 运维量 | 备注 |
-| --- | --- | --- | --- | --- | --- |
-| A | MySQL 8 主＋1 副本，半同步复制（AFTER_SYNC 等待点） | 超时设为不退回异步；副本 relay log 落盘 | 拒写（停卖） | 中 | 与现有技术栈一致；需验证“超时不退回”的配置与提升流程 |
-| B | MySQL 8 Group Replication 单主，3 节点 | 多数派确认 | 丢 1 台仍可写 | 高 | 3 台机器、跨机房延迟影响每笔写 |
-| C | PostgreSQL 主＋同步备（`synchronous_standby_names`） | 同步提交 | 拒写（可配多备的 ANY 1） | 中 | 换数据库，偏离现有组合，需理由 |
-| D | 云厂商托管数据库（同步多可用区） | 依厂商承诺，需核实是否同步 | 厂商自动切换 | 低 | 不在现有 VPS；成本与厂商锁定 |
-
-不论选哪种，**必须用演练证明**，不能以产品文档的说法代替（STOCKCORE §三）。
-
-### 12.4 性能预期（供估算，未实测）
-
-Acuven 自用网店规模小（Inventory 草案按 <100 个规格估计）。同步复制让每笔写多一个跨机房往返（同城几毫秒、跨国几十毫秒），
-对这个规模不构成瓶颈；需要在选定机房后实测一次 p95 写延迟，作为网店接口超时设置的依据（REQUIREMENTS §8）。
+- **不需要第二台数据库服务器。**Core 的库放在共享 `infra_mysql` 里的独立库（Q-17），用独立账号、最小权限。
+- binlog 异地传输是**实例级**设置，会顺带保护同实例上网店、CRM 等其他项目的库，但要在 `vps_infra` 里统一配置。
+  这是 vps_infra 的改动，需另开任务。
+- **需要一处异地存储**放 binlog 和全量备份（另一家供应商的对象存储之类），放在哪家待定（OPEN_QUESTIONS 第二节）。
+- 将来真实网店若要求更严的恢复目标（例如重新要求 RPO=0），再回到“同步副本加第二故障域”的方案。
 
 ---
 
@@ -571,10 +627,13 @@ Acuven 自用网店规模小（Inventory 草案按 <100 个规格估计）。同
 
 | # | 出入 | 涉及 | 处理 |
 | --- | --- | --- | --- |
-| 1 | Inventory API 允许 Acuven Shop 在库存服务不可达时“故障继续收款”；Core 需求 OPS-05 要求停止新预留与库存确认 | `acuven_inventory/docs/API_CONTRACT.md` §5；REQUIREMENTS OPS-05 | Q-03 |
-| 2 | 预留 30 分钟（Inventory）vs 15 分钟可配置（Core） | API_CONTRACT §3.1；REQUIREMENTS §2、ORD-01 | Q-19 |
-| 3 | 超卖事实入账为缺口（Inventory）vs 不入账、暂停履约（Core） | STOCK_RULES §1.1；ORD-03 | Q-20 |
-| 4 | Inventory 的 `sale_cancelled`（付款后取消未出库部分）vs Core 只认“已批准退款”回库 | API_CONTRACT §4；ORD-04 | 9.3 已列，接 Inventory 前统一 |
-| 5 | DEVPRI 阶段 1 要求 ERP/Shop 两边旧数据样例、以及“租户/套餐权限”契约；本文只做 Shop，套餐授权只做到“凭据绑定租户/入口/池” | DEVPRI 阶段 1 | 11.5；Q-18 |
-| 6 | DECISIONS C-12 写“单机 Compose 只能用于开发和隔离 Demo”，而现有 Acuven 项目全部部署在单台 VPS | C-12；`vps_infra` | 12.2；Q-15 |
-| 7 | REQUIREMENTS 期望“运营人员能在网店后台建立及合并商品、导入期初、入库、盘点”——这些全是**网店后台新页面**，网店现有后台只有 Demo 级商品/库存编辑 | REQUIREMENTS §1；网店盘点 | 计入工期（ESTIMATE_BREAKDOWN W6） |
+| 1 | RPO=0 改为 ≤5 分钟 | DECISIONS C-12；REQUIREMENTS OPS-03 | Q-15。REQUIREMENTS 已在本项目修订；DECISIONS 待 acuven_hub 更新 |
+| 2 | V1 首个验收对象由“自用网店”改为“公开 Demo（Demo Core 实例）” | DECISIONS C-13；REQUIREMENTS §1–2 | Q-02 答复。REQUIREMENTS 已修订；DECISIONS 待更新 |
+| 3 | Core 不可用时由“停卖”改为“封顶故障收款” | REQUIREMENTS OPS-05；Inventory API_CONTRACT §5（不封顶） | Q-03。REQUIREMENTS 已修订；Inventory 草案接入前统一 |
+| 4 | 同机服务间通信不加 TLS | REQUIREMENTS OPS-02 | Q-12。REQUIREMENTS 已修订 |
+| 5 | 预留 30 分钟（Inventory）对 15 分钟可配（Core） | API_CONTRACT §3.1 | Q-19：以 Core 为准 |
+| 6 | 超卖事实入账为缺口（Inventory）对不入账、暂停履约（Core） | STOCK_RULES §1.1 | Q-20：V1 按 Core |
+| 7 | `sale_cancelled` 对退款回库 | API_CONTRACT §4 | Q-28：Inventory 适配器映射 |
+| 8 | DEVPRI 阶段 1 的 ERP 样例与套餐权限契约 | DEVPRI 阶段 1 | Q-18：分两步 |
+| 9 | 网店 Demo 现行规则要改：退款不回补、当日直接改库存、迟到付款自动退款、本地每日重置 | `acuven-shop/docs/DESIGN.md` 第 6、12 条与 Stripe 第 6 条 | 网店接 Core 的设计任务（网店设计闸门） |
+| 10 | REQUIREMENTS 要求运营在网店后台完成建商品、合并、期初、入库、盘点，网店现有后台没有这些页面 | REQUIREMENTS §1；网店盘点 | 计入工期（ESTIMATE_BREAKDOWN W6） |

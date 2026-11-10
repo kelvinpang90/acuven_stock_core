@@ -4,6 +4,7 @@
 > 盘点时网店 HEAD `ddfae55`（2026-11-10，分支 `chore/register-shop-task-229-232`）；`main` 为 `69a802e`，两者在 `app/ alembic/ frontend/src tests` 下无差异。
 > 行号随网店后续提交会漂移；改造时以函数名为准。
 > 用途：列出网店里所有商品身份与库存的读写点，标出将来各自换成哪个 `StockGateway` / `CatalogGateway` 调用（契约第 9 节）。
+> 2026-11-10 按 Kelvin 答复修订：**公开 Demo 是 Core V1 的第一个接入方**（独立 Demo Core 实例），下表“将来”一列按此写；真实网店何时接待定（Q-24）。
 
 ## 1. 结论先说
 
@@ -24,8 +25,8 @@
 | `Product` | `app/models/catalog.py:57–89` | `id` int；`slug` 唯一；`name_en/zh/ms`；`is_active`；`max_per_order`（每单限购 1–1000，**不是库存**）；`version` | 加 `core_product_id`（可空、唯一）；三语名称留网店，Core 只存一个基本名称（Q-05） |
 | `ProductVariant` | `app/models/catalog.py:189–213` | `id` int；`product_id`；`sku` String(64) **全站唯一**；`price_sen`（营业价，整数仙）；`daily_initial_stock`；**`available_stock`**；`is_active` | 加 `core_sku_id`（可空、唯一）；`sku` 作为导入 Core 的 `sku_code` 初值；`price_sen` 留网店（渠道价）；生产环境 `daily_initial_stock` / `available_stock` 停用（Demo 继续用） |
 | 规格选项 | `ProductOption`、`ProductOptionValue`、`VariantOptionValue`（catalog.py:140–246） | 颜色/尺码等多语言标签 | 留网店（展示资料） |
-| `StockReset` / `StockResetLine` | `app/models/stock_reset.py`（迁移 0013） | 每日重置记录 | Demo 专用；生产不启用 |
-| `SiteSetting.daily_stock_reset_enabled` | `app/models/site.py:74` | 每日重置开关，默认开 | Demo 专用；生产必须强制关闭（不只是开关） |
+| `StockReset` / `StockResetLine` | `app/models/stock_reset.py`（迁移 0013） | 每日重置记录 | Demo 接 Core 后改记“调 Core 重置命令”的结果；生产不启用 |
+| `SiteSetting.daily_stock_reset_enabled` | `app/models/site.py:74` | 每日重置开关，默认开 | Demo 保留（开关仍在网店，控制是否调 Core 的 Demo 重置命令）；生产必须强制关闭（不只是开关） |
 | `Order` | `app/models/order.py:100–189` | `id` int；`order_number`（16 位 Base32，唯一）；`status`；`idempotency_key` 唯一；`payment_expires_at`；`paid_at` | `order_ref` 建议用 `order_number`（不含个人资料）；`payment_expires_at` 改为取 Core 返回的 `expires_at` |
 | `OrderItem` | `app/models/order.py:192–232` | `variant_id`（可空，SET NULL）；快照 `sku`、三语名称、规格标签、`unit_price_sen`、`quantity`；`(order_id, line_index)` 唯一 | `line_ref` 建议用 `line_index`；加 `core_sku_id` 快照列（下单时固定，契约 5.1）；**没有快照 `product_id`** |
 | 订单状态 | `order.py:37–54`；迁移表 `app/services/order_rules.py:44–56` | `awaiting_demo_payment → demo_paid → demo_packed → demo_shipped → demo_completed`，另有 `demo_cancelled` | 生产需要“部分发货”状态与按行/件数的发货记录（现在没有发货表，只有整单状态） |
@@ -42,12 +43,12 @@
 | W1a | `app/services/ordering.py:356–375` `_reserve_stock`，被 `place_guest_order`（161–277，第 201 行）调用 | `POST /api/orders/guest` | 按规格 ID 升序逐行 `UPDATE … SET available_stock = available_stock − q WHERE available_stock >= q`；任一行失败回滚整单 | 条件 UPDATE；`Idempotency-Key` 头＋`orders.idempotency_key` 唯一＋请求指纹 | `StockGateway.reserve_order(order_number, lines, key)`；**不能**再与订单写入同一个数据库事务（见第 5 节） |
 | W1b | 同一 `_reserve_stock`，被 `member_ordering.py:308–458` `_create_order`（第 385 行）调用 | `POST /api/member/orders` | 同上；加锁顺序：会员 → 规格 → 券 → 积分 | 同上 | 同上 |
 | W2 | `app/services/payment.py:1329–1349` `_release_stock`，唯一调用者 `_cancel`（1303–1326，第 1320 行） | 见下表 7 个入口 | 按订单行合并件数，加回 `available_stock`；无上限保护 | 防重复靠 `_update_awaiting`（1287–1300）的条件 UPDATE：只有 `awaiting_demo_payment` 才命中 | `StockGateway.release(reservation_id, reason, key)` |
-| W3 | `app/services/stock_reset.py:81–106` `reset_daily_stock` → `_reset_variants`（160–204） | 常驻进程 `python -m app.jobs run`（`shop_jobs` 容器，每 60 秒一轮，`jobs.py:245–285`），马来西亚 00:00 后首轮；手动 `python -m app.jobs reset-stock` | 锁全部规格，重建 `available_stock = max(daily_initial_stock − 待付预留, 0)`，覆盖当日调整 | `business_date` 唯一；READ COMMITTED | **生产不存在**。Demo 保留（Q-02）；生产配置下任务必须拒绝运行 |
-| W4 | `app/services/admin_stock_adjust.py:61–135` `adjust_available_stock` | `POST /api/admin/variants/{id}/available-stock` | CAS：`available_stock == expected` 才改成新值（0–9999），写审计 | CAS | 生产没有“直接改数量”（STK-02）。换成 `StockAdminGateway` 的收货 / 盘点 / 不可售 / 更正命令（新页面） |
+| W3 | `app/services/stock_reset.py:81–106` `reset_daily_stock` → `_reset_variants`（160–204） | 常驻进程 `python -m app.jobs run`（`shop_jobs` 容器，每 60 秒一轮，`jobs.py:245–285`），马来西亚 00:00 后首轮；手动 `python -m app.jobs reset-stock` | 锁全部规格，重建 `available_stock = max(daily_initial_stock − 待付预留, 0)`，覆盖当日调整 | `business_date` 唯一；READ COMMITTED | Demo：改为调 Core 的 `POST /v1/demo/resets`（契约 §6.1，target＝`daily_initial_stock`）；生产不存在，生产配置下任务必须拒绝运行 |
+| W4 | `app/services/admin_stock_adjust.py:61–135` `adjust_available_stock` | `POST /api/admin/variants/{id}/available-stock` | CAS：`available_stock == expected` 才改成新值（0–9999），写审计 | CAS | Core 没有“直接改数量”（STK-02）。Demo 的当日调整改为调 Core 的盘点更正；另需收货 / 盘点 / 不可售 / 更正等新页面 |
 | W5 | `app/services/admin_products.py:887–900`（`create_product` 第 893–895 行） | `POST /api/admin/products` | 新 SKU 的 `available_stock = daily_initial_stock` | 唯一约束冲突抛 `ProductChanged` | `CatalogGateway.create_product/create_sku`；新 SKU 在 Core 的余额为 0，入库走收货命令 |
 | W6 | `admin_products.py:1156–1169`（`_insert_additions`，由 `save_product` 调用） | `PUT /api/admin/products/{id}` | 同 W5 | 同上 | 同 W5 |
 | W7 | `admin_products.py:1313–1321`（`save_product`，`VARIANT_FIELDS` 含 `daily_initial_stock`） | `PUT /api/admin/products/{id}` | 改每日初始库存（不改当日可用） | 锁商品与规格行；商品 `version` 乐观校验 | 生产无此字段；价格/启停留网店，SKU 编码改动走 `CatalogGateway.update_sku`（带 `If-Match`） |
-| W8 | `alembic/versions/20260930_0003_demo_catalog.py:693–709` | 部署时 `alembic upgrade head` | 插入种子商品与库存 | — | 生产库不能带这批种子（Q-24：生产部署要能跳过 Demo 种子迁移，或种子改为 Demo 专用命令） |
+| W8 | `alembic/versions/20260930_0003_demo_catalog.py:693–709` | 部署时 `alembic upgrade head` | 插入种子商品与库存 | — | Demo：种子商品经目录导入进 Demo Core（契约 §11.2）；将来的生产库不能带这批种子（生产部署要能跳过，或种子改为 Demo 专用命令） |
 | W9 | `app/services/site_settings.py:226–227` | `PUT /api/admin/site-settings` | 改每日重置开关 | — | 生产隐藏/拒绝该开关 |
 
 ### 3.1 释放（W2）的 7 个入口
@@ -99,8 +100,9 @@ Redis 只用于限流（`app/services/rate_limit.py`），不涉及库存。
 5. **退款与库存分离**：现在退款完全不碰库存；生产要在退款批准后加一个“确认这些件仍在库、未交运”的人工/系统步骤，再回库（ORD-04）。
 6. **发货粒度**：现在只有整单状态，没有发货记录表；生产需要按行/件数发货（ORD-07），这是网店新功能。
 7. **后台新页面**：收货入库、盘点（开单/录入/确认）、不可售/报损、更正、SKU 合并向导、晚到支付待办、每日对账差异待办——网店现有后台都没有（REQUIREMENTS §1 要求运营在网店后台完成这些）。
-8. **Demo 与生产共用代码**：每日重置、当日库存调整、种子迁移、重置开关都要在生产配置下彻底失效（不是默认关闭而是不可开启）。
+8. **Demo 与生产共用代码**：Demo 接 Core 后，每日重置改调 Core 的 Demo 命令，当日调整改为盘点更正；将来生产配置下，每日重置、种子迁移、重置开关都要彻底失效（不是默认关闭，而是不可开启）。
 9. **测试**：网店后端测试跑 SQLite，没有真实并发；接 Core 后网店侧并发风险主要在“本地订单 ↔ Core 预留”的一致性，需要在 CI 里用 Core 的测试替身（或真 Core 容器）做集成测试。
+10. **Demo 现行规则要改**（网店 DESIGN.md 第 6、12 条与 Stripe 第 6 条）：退款要按 Core 规则回库（已批准且未发货）；迟到付款从“自动退款”改为“有货补扣、没货交管理员（退款或等补货）”；Core 不可用时按最后可售量封顶继续收款（契约 §5.5）。这些要过网店自己的设计闸门。
 
 ## 7. 网店侧将来的最小数据变更（建议，不在本轮执行）
 
@@ -127,7 +129,7 @@ Redis 只用于限流（`app/services/rate_limit.py`），不涉及库存。
 
 ## 9. 现有测试里将来要改写或作废的
 
-- 保留并改为针对 `DemoLocalStockGateway`（若 Q-02 选 a）：`tests/test_guest_order.py`（562、765、769、788、830、871、933）、
+- 纯重构阶段改为针对 `LocalStockGateway`，Demo 切到 Core 后大部分改写为针对 `CoreStockGateway` 或作废：`tests/test_guest_order.py`（562、765、769、788、830、871、933）、
   `tests/test_member_ordering.py`（392、709、800）、`tests/test_demo_payment.py`（893、1057、1101–1215）、
   `tests/test_payment_coupons_points.py`（488–598）、`tests/test_jobs.py`（356、589–684）、`tests/test_stock_reset*.py`、
   `tests/test_admin_stock_adjust.py`、`tests/test_admin_product_save.py:398`、`tests/test_admin_product_additions.py:400`、

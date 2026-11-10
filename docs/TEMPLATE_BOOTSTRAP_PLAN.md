@@ -4,7 +4,9 @@
 > 本文**不执行**任何一步：没有建 GitHub 仓库、没有复制模板文件、没有写控制面登记表。标「停」的地方等 Kelvin 回复。
 > 本目录已 `git init`（只含需求与本轮设计文档，未推送、无远端）——这是任务授权范围内的唯一 git 动作。
 
-## 0. 身份（停：Kelvin 确认）
+## 0. 身份（已定）
+
+**Kelvin 2026-11-10 定（Q-22）：`project_id` = `stock_core`，`task_id_pattern` = `^CORE-TASK-[0-9]{3}$`，`display_name` = `Acuven Stock Core`。**下表保留当时的比较。
 
 | 项 | 建议 | 备选 | 理由 |
 | --- | --- | --- | --- |
@@ -21,7 +23,7 @@
 - 碰个人数据：Core 设计上不收个人资料（契约第 10 节第 6 条）；这条本身要在设计批准时一并确认。
 - **停**：设计交 Kelvin 批准（本轮交付）。
 
-## 2. 技术栈（停：Kelvin 确认）
+## 2. 技术栈（已定：与网店、计费一致，Q-23）
 
 建议沿用 `acuven-shop` / `ai_billing_hub` 的组合，理由是同一人维护、Worker 主机已装好依赖、CI 写法可复用：
 
@@ -29,7 +31,7 @@
 | --- | --- | --- |
 | 语言/框架 | Python 3.12 ＋ FastAPI ＋ Pydantic | 与网店、计费一致 |
 | 数据访问 | SQLAlchemy 2 ＋ Alembic | 迁移规则见契约 12.1 第 8 条 |
-| 数据库 | **MySQL 8，独立实例**（拓扑见 Q-15/Q-17） | 若 Kelvin 选 PostgreSQL（契约 12.3 候选 C），这里一起改 |
+| 数据库 | **MySQL 8，共享 `infra_mysql` 里的独立库**（Q-17） | 独立账号、最小权限；binlog 异地传输与备份见契约 §12 |
 | 缓存 | 不用 Redis 存任何权威数据；V1 可完全不用 Redis | 契约 12.1 第 2 条 |
 | 后台任务 | 进程内定时任务（预留到期扫描、outbox），状态全在数据库 | 无需 Celery |
 | 前端 | **无**（Core 没有客户界面；运营界面在网店后台） | CI 不需要 node |
@@ -45,7 +47,7 @@
 | MySQL 并发/锁/事务测试 | ❌ 只放 CI（CI 起真实 MySQL 服务容器） | Inventory STOCK_RULES 也要求“不以 SQLite 锁行为证明生产并发安全” |
 | OpenAPI 与响应一致性检查 | 视实现：纯 schema 校验可进沙箱 | |
 
-- **停**：技术栈报 Kelvin 确认。
+- 技术栈已由 Kelvin 确认（Q-23）。
 
 ## 3. 生成骨架（批准后才做）
 
@@ -76,12 +78,13 @@ CLAUDE.md  AGENTS.md（两份一致）  .gitignore  .env.example
 - `ci.yml`：建议两个 job——`unit`（ruff ＋ 纯单元测试）与 `integration`（起 MySQL 8 服务容器，跑迁移、API 测试与并发测试）。
   `required_status_checks` 写这两个 job 名。
 - `deploy.yml`：按 D1–D5 清单逐项落实；删掉模板里 `is_template` 那一行；保留 `paths-ignore` 与形状约束注释。
-- **与 RPO=0 的关系**：`deploy.yml` 只部署**应用**，不负责数据库拓扑；同步副本、隔离旧主、恢复演练是独立的运维工作（ESTIMATE_BREAKDOWN 的 W7a），
+- **与恢复目标的关系**：`deploy.yml` 只部署**应用**；binlog 异地传输、全量备份、恢复演练是独立的运维工作（ESTIMATE_BREAKDOWN 的 W7a，涉及 `vps_infra`），
   其配置脚本放 `ops/`，由人执行，不进 Worker allowlist（模板 `never_low_risk` 已排除 `database_migration`、`deployment`）。
 - **生产迁移的特殊点**：网店、计费都是“合并即部署”。Core 也可以这样，但数据库迁移须满足契约 12.1 第 8 条（只做向前兼容的扩展、
   迁移前自动备份）。建议在 `deploy.yml` 里迁移前做一次备份并在失败时以失败结束（D3）。
 - 需要 Kelvin 在 GitHub 上配的 secrets / variables（会话不接触凭据）：部署主机连接信息（名称照网店 `deploy.yml` 现有命名）、
-  `HEALTHCHECK_URL`（**注意：Core 没有公网入口**，健康检查要从部署主机本机或内网访问，D3 的实现方式和网店不同，Q-12 一并定）。
+  `HEALTHCHECK_URL`（**注意：Core 没有公网入口**，健康检查在部署主机本机经内部容器网络执行（Q-12），D3 的实现方式和网店不同）。
+- 目前要部署的只有 **Demo Core 实例**（`CORE_ENV=demo`，V1 首个接入方是公开 Demo）；生产实例等真实网店定了再加（Q-24）。
 
 ## 5. `.platform/` 与 planning-v1（批准后才写）
 
@@ -103,14 +106,14 @@ CLAUDE.md  AGENTS.md（两份一致）  .gitignore  .env.example
 - `docs/TODO.md` planning-v1：当前计划放 001；其余写成 `- 待登记：…`。
 - 搜一遍 `<`，确认无占位符。
 
-## 6. 仓库与远端（停：Kelvin 决定）
+## 6. 仓库与远端（可见性与起步方式已定；建远端仍等 Kelvin）
 
 需要 Kelvin 回答：
 
-1. GitHub 仓库建在哪个账号、叫什么（建议与目录同名 `acuven_stock_core`），**公开还是私有**。
-   网店、计费都是公开仓库；Core 是库存账本服务，公开不泄露数据，但部署与故障域细节会公开——倾向私有，由 Kelvin 定（Q-21）。
-2. 起步方式：
-   - **方式 1（建议）**：把模板文件复制进本目录（不带模板的 `.git`），在现有本地仓库上提交，然后推到新建的**空**远端。
+1. **公开仓库**（Q-21a）。仓库名建议与目录同名 `acuven_stock_core`；建在哪个账号、什么时候建，仍等 Kelvin 指示，会话不自行建远端。
+   公开意味着运行手册和工作流里不能写主机名、IP、存储桶名，这些一律放 secrets 或本机配置。
+2. 起步方式（Q-21b 已选方式 1）：
+   - **方式 1（已选）**：把模板文件复制进本目录（不带模板的 `.git`），在现有本地仓库上提交，然后推到新建的**空**远端。
      好处：本轮文档的提交历史保留，不需要合并两段历史。
    - 方式 2：GitHub 上用模板「Use this template」建仓库再克隆，然后把本目录的文档复制进去提交；本地这个 `git init` 的历史丢弃。
 3. 推送后由 Kelvin 配分支保护（禁直推、禁 force push、必需检查 = `unit`、`integration`）和 secrets / variables。
