@@ -1,6 +1,6 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.3｜2026-11-10｜状态：**Kelvin 2026-11-10 批准**（0.2 与第 14 节列出的 0.3 改动均已批准，设计闸门通过）。尚未实现。
+> 版本：0.4｜2026-11-10｜状态：**Kelvin 2026-11-10 批准**（0.2、0.3 与第 14 节第 12–15 条的 0.4 改动均已批准，设计闸门通过）。尚未实现。
 > 按模板规则：设计有改动时，改动部分的批准作废、须重新批准。
 > 依据：[REQUIREMENTS.md](../REQUIREMENTS.md)（Core V1 需求，2026-10-08）、`acuven_hub/DECISIONS.md` 的 C-01～C-19、S-01～S-10、I-02、I-04，
 > 以及 `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md`（Inventory 草案，只读参照）。
@@ -73,12 +73,21 @@
 
 - `(tenant_id, sku_code)` 唯一；`(tenant_id, barcode)` 在非空时唯一：空条码一律存 `NULL`，不存空字符串（数据库检查约束拒绝空串）；MySQL 的唯一索引允许多个 `NULL`，因此不需要部分索引。
 - 名称长度：商品与 SKU 的基本名称 `VARCHAR(200)`；`sku_code`、`barcode` `VARCHAR(64)`（与网店 `sku` 列同长）；币种 `CHAR(3)`，大写字母由接口层校验。
+- **数据库列约定**（目录各表通用，之后的表沿用）：
+  - `tenant_id`：`VARCHAR(32) NOT NULL`。
+  - 时间：`DATETIME(6) NOT NULL`，一律 UTC；`created_at` 默认 `CURRENT_TIMESTAMP(6)`，`updated_at` 由应用在每次修改时写入。
+  - 状态：`VARCHAR(16) NOT NULL`，检查约束限定取值（目录为 `active`、`inactive`）；不用数据库 ENUM，方便以后加值。
+  - 编码类列（`sku_code`、`barcode`、归属表的 `code`）：排序规则 `utf8mb4_0900_ai_ci`，**唯一性不区分大小写**（`abc` 与 `ABC` 视为同一编码）；
+    检查约束要求非空串且首尾无空格（`TRIM(x) = x`），接口层先去首尾空格再写入。
+  - 操作人与原因（如 `sku_code_history`）：`actor_ref VARCHAR(128) NOT NULL`（第 1 节引用格式，网店管理员的不透明 ID）、
+    `reason VARCHAR(500) NULL`。
 - 每个商品、SKU 有整数 `version`，每次修改 +1。修改请求必须带 `If-Match: <version>`（或正文 `expected_version`）；
   不一致返回 409 `VERSION_CONFLICT` 并附当前版本，**不静默覆盖**（CAT-03）。
 - 修改 `sku_code` 时把旧值写入 `sku_code_history`（旧值、新值、操作者、时间、原因；只追加、无唯一约束，同一 SKU 可以改回自己用过的编码）。
 - 旧编码永久保留、不再分配给其他 SKU（Q-06），由另一张表 `sku_code_claims` 保证：每个用过的编码登记一次 `(tenant_id, code) → sku_id`。
   - **数据库保证的一半**：`sku_code_claims` 的主键是 `(tenant_id, code)`（一个编码只能归一个 SKU）；`(tenant_id, sku_id)` 复合外键指向 `skus`。
-  - **服务层保证的一半**：建 SKU 或改编码时，在同一事务里先登记（编码未登记则插入；已登记给别的 SKU 则 409 `SKU_CODE_RETIRED`），再写 `skus.sku_code`。
+  - **服务层保证的一半**：在同一事务里完成。建 SKU 时**先插 SKU 行，再插归属行**（归属行的外键要求 SKU 已存在）；改编码时先查新编码：
+    已登记给别的 SKU 则 409 `SKU_CODE_RETIRED`，未登记则插入归属行，再更新 `skus.sku_code` 并写历史。
     `skus` 不反向外键到归属表（双向外键成环，MySQL 无法延迟检查）。
   - `sku_code_history` 是内部表，主键为自增 `BIGINT id`（不对外暴露，同一秒内的多条按 `id` 排序）。
 
@@ -306,7 +315,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 | --- | --- |
 | 期初 `opening-balances` | 只在池处于 `initializing` 状态时可用；批量“校验预览 → 确认”，与 2.3 同形；**Demo 库存数不得作为期初**（STK-03）。池切到 `live` 后期初命令一律拒绝，只能走盘点更正或经审批的重建流程（Q-09）。 |
 | 收货 `receipts` | `receipt_ref` 唯一；同引用重试不重复入库（STK-02）。V1 无采购单，`receipt_ref` 由网店后台生成。 |
-| 盘点 `counts` | 两步：开盘点单（Core 记下每个 SKU 当时的四个账面量与 `balance_version`）→ 提交实数并确认。实数分两项录：**在架件数**（含已付款待发的件）与**不可售件数**。确认时以当时最新账面计算：新 `unavailable` = 不可售件数，新 `stock_balance` = 在架件数＋不可售件数−`paid_pending_dispatch`；期间有销售/发货时以最新账面为准，不用开单时的快照硬覆盖。写一条 `COUNT_ADJUSTMENT`（`stock_balance` 差 d、`unavailable` 差 u），记账面量、实数、差额、原因（STK-02、STK-05）。**若新值会违反 §4.1 不变量**，整笔拒绝。由上面的算式，`stock_balance − unavailable` = 在架件数 − `paid_pending_dispatch`，所以不变量成立当且仅当 **在架件数 ≥ `reserved` + `paid_pending_dispatch`**（不可售件数不影响这个判断）。不满足时返回 409 `COUNT_BELOW_COMMITMENTS`，逐 SKU 给出一个缺口数 = `reserved` + `paid_pending_dispatch` − 在架件数，盘点单保持未确认：管理员先让相关预留释放或到期，对缺货的已付款订单走退款（退款回库把待发货量转回账面，随后的盘点再把实际短缺记掉，两步都有流水），再重新确认。Core 不记负数，也不替管理员决定先砍哪笔订单（Q-20 同一原则）。 |
+| 盘点 `counts` | 三步：**开单 → 提交实数 → 管理员确认**。实数分两项录：**在架件数**（含已付款待发的件）与**不可售件数**。提交实数时，Core 在同一事务里记下当时每个 SKU 的四个账面量作为**快照**（表示“这个时刻点到的就是这么多”）。确认时按**差额**落账，不用快照覆盖最新账面：`d_u` = 不可售件数 − 快照 `unavailable`；`d_shelf` = 在架件数 − 快照（`stock_balance` − `unavailable` + `paid_pending_dispatch`）；写一条 `COUNT_ADJUSTMENT`：`stock_balance` 增 `d_shelf + d_u`、`unavailable` 增 `d_u`，加到确认时的最新账面上。这样提交之后、确认之前发生的收货、销售、发货都保留（例：提交时点到 20、之后收货 10，确认时差额为 0，账面仍是 30）。`balance_version` 只记入快照备查，不做乐观锁比较。流水记快照、实数、差额、原因（STK-02、STK-05）。**若落账后会违反 §4.1 不变量**（任一量为负，或 `reserved` + `unavailable` > `stock_balance`），整笔拒绝，返回 409 `COUNT_BELOW_COMMITMENTS`，逐 SKU 给出缺口数 = max(0, `reserved` + 新 `unavailable` − 新 `stock_balance`)，以及新 `unavailable` 是否为负；盘点单保持未确认：管理员先让相关预留释放或到期，对缺货的已付款订单走退款（退款回库把待发货量转回账面，随后的盘点再把实际短缺记掉，两步都有流水），再重新提交实数并确认。Core 不记负数，也不替管理员决定先砍哪笔订单（Q-20 同一原则）。 |
 | 不可售 / 恢复 / 报损 | 见 4.3；`unavailable` 不得超过 `stock_balance − reserved`。 |
 
 确认盘点差异、更正、报损需要“库存管理员”角色；普通操作员只能录入、不能确认（STK-05）。角色由网店断言、Core 校验，见第 10 节。
@@ -676,4 +685,13 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 预审另记了一条“0.3 尚未批准”；Kelvin 已于同日批准。
 
-其中只有第 1、9 条影响业务流程（盘点遇到实物少于已承诺数量时，要求先处理订单再确认），其余是数据库与校验细节。
+第三轮预审（同日，0.3 批准后）又提出 4 条，处理如下（Kelvin 同日确认）：
+
+| # | 预审发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 12 | 盘点确认用最新账面算绝对值，会吞掉提交实数后才发生的收货、发货；与 `balance_version` 检查自相矛盾 | 设计缺陷 | 改回差额法：提交实数时记快照，确认时把“实数 − 快照”的差额加到最新账面；`balance_version` 只备查 | §6 |
+| 13 | 建 SKU 若先插归属行，复合外键立即失败 | 设计缺陷 | 写明先插 SKU、再插归属行；改编码的顺序也写明 | §2.2 |
+| 14 | 编码与条码的排序规则（大小写、重音、空格）没定 | 未决定 | `utf8mb4_0900_ai_ci`，唯一性不区分大小写；检查约束拒绝空串和首尾空格 | §2.2 |
+| 15 | 历史表操作人与原因、租户列、时间戳、状态的列类型没定 | 未决定 | 补“数据库列约定” | §2.2 |
+
+其中只有第 1、9、12 条影响业务流程（盘点遇到实物少于已承诺数量时，要求先处理订单再确认），其余是数据库与校验细节。

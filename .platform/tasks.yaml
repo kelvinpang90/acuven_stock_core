@@ -81,7 +81,7 @@ tasks:
       - 账面量是不可变值对象；可售量按契约 4.1 由 stock_balance 减 reserved 减 unavailable 派生，不作为可写字段
       - 不变量按契约 4.1 校验：四个量为非负整数，且 reserved 加 unavailable 不超过 stock_balance；违反时抛出明确的领域异常，不返回半改的结果
       - 契约 4.3 表中除 MERGE_TRANSFER、CORRECTION、COUNT_ADJUSTMENT 外的每种流水类型都有对应规则，给定正整数 q 返回新的账面量
-      - COUNT_ADJUSTMENT 按契约第 6 节由在架件数与不可售件数算出新的 stock_balance 与 unavailable 及两项差额；在架件数小于 reserved 加 paid_pending_dispatch 时抛出领域异常，缺口数等于两者之差；DEMO_RESET 按 6.1 计算，target 为负时拒绝，增量可为 0
+      - COUNT_ADJUSTMENT 按契约第 6 节的差额法：由提交时快照与两项实数算出差额，加到最新账面；违反不变量时抛出带缺口数的领域异常；DEMO_RESET 按 6.1 计算，target 为负时拒绝，增量可为 0
       - 单元测试逐条复算契约 11.3 与 11.5 两张示例表的每一步结果，另覆盖每种流水类型的越界拒绝（例如释放超过预留、发货超过待发货量）
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖
       - allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
@@ -106,13 +106,13 @@ tasks:
       类型前缀加 ULID 的字符串，列宽 32；主键为单列 ID，业务唯一约束都含 tenant_id，表间引用用 tenant_id 加 ID 的复合外键；
       租户内 sku_code 唯一，条码空值存 NULL、拒绝空串、非空唯一；编码归属表主键为 tenant_id 加 code、复合外键指向 SKU（SKU 不反向外键），历史表只追加、主键为自增 BIGINT；参考价只在 SKU 上，
       整数最小货币单位加三位币种，可空但两者同有同无；商品与 SKU 带 version 与 active 或 inactive 状态；merged_into_sku_id 不能指向自身，
-      非空时 SKU 必须 inactive。只做数据库层：不加接口、不写业务服务、不碰库存账表（另一个任务）。
+      非空时 SKU 必须 inactive；列类型、排序规则、时间戳与状态列按 2.2 的数据库列约定。只做数据库层：不加接口、不写业务服务、不碰库存账表（另一个任务）。
     status: ready
     depends_on: []
     acceptance_criteria:
       - 模型放在新文件 app/models/catalog.py，并在 alembic/env.py 里 import 登记；迁移文件放 alembic/versions，upgrade 与 downgrade 都写全；不含任何顾客个人资料字段
       - 唯一约束、复合外键与检查约束按 purpose 所列在数据库层生效（含 version 不小于 1、参考价不为负）；约束名遵循 app/db.py 的命名约定
-      - 集成测试在真 MySQL 上验证：同租户重复 sku_code 被拒、不同租户可用相同 sku_code、两个相同非空 barcode 被拒而多个 NULL 可并存、空串条码被拒、合并指向别的租户或自身被拒、已合并却 active 被拒
+      - 集成测试在真 MySQL 上验证：同租户重复 sku_code 被拒、不同租户可用相同 sku_code、两个相同非空 barcode 被拒而多个 NULL 可并存、空串条码被拒、编码只差大小写被视为重复、合并指向别的租户或自身被拒、已合并却 active 被拒
       - 需要表结构的集成测试经 tests/integration/conftest.py 的共享夹具在开始时升级到 head、结束时降到 base，CI 之后的迁移往返照常从空库开始
       - CI 的迁移往返（upgrade、downgrade 到底、再 upgrade）与 alembic check 通过
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖
