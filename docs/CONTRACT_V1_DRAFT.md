@@ -595,7 +595,7 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 ## 12. RPO≤5 分钟 / RTO≤4h 对设计的约束
 
 **Kelvin 2026-11-10 的决定（Q-15）**：已确认写入的 RPO 从 0 放宽到 **≤5 分钟**，RTO≤4 小时不变；不为同步副本另加机器。
-这改变了 REQUIREMENTS 原 OPS-03 和 DECISIONS C-12（后者待 acuven_hub 更新，见 OPEN_QUESTIONS 第三节）。
+这改变了 REQUIREMENTS 原 OPS-03 和 DECISIONS C-12（两者均已于 2026-11-10 更新）。
 
 ### 12.1 设计约束
 
@@ -623,12 +623,12 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 ---
 
-## 13. 与现有文档的出入（本文没有改那些文件）
+## 13. 与现有文档的出入
 
 | # | 出入 | 涉及 | 处理 |
 | --- | --- | --- | --- |
-| 1 | RPO=0 改为 ≤5 分钟 | DECISIONS C-12；REQUIREMENTS OPS-03 | Q-15。REQUIREMENTS 已在本项目修订；DECISIONS 待 acuven_hub 更新 |
-| 2 | V1 首个验收对象由“自用网店”改为“公开 Demo（Demo Core 实例）” | DECISIONS C-13；REQUIREMENTS §1–2 | Q-02 答复。REQUIREMENTS 已修订；DECISIONS 待更新 |
+| 1 | RPO=0 改为 ≤5 分钟 | DECISIONS C-12；REQUIREMENTS OPS-03 | Q-15。REQUIREMENTS 与 DECISIONS C-12 均已于 2026-11-10 更新 |
+| 2 | V1 首个验收对象由“自用网店”改为“公开 Demo（Demo Core 实例）” | DECISIONS C-13；REQUIREMENTS §1–2 | Q-02 答复。REQUIREMENTS 与 DECISIONS C-13 均已于 2026-11-10 更新 |
 | 3 | Core 不可用时由“停卖”改为“封顶故障收款” | REQUIREMENTS OPS-05；Inventory API_CONTRACT §5（不封顶） | Q-03。REQUIREMENTS 已修订；Inventory 草案接入前统一 |
 | 4 | 同机服务间通信不加 TLS | REQUIREMENTS OPS-02 | Q-12。REQUIREMENTS 已修订 |
 | 5 | 预留 30 分钟（Inventory）对 15 分钟可配（Core） | API_CONTRACT §3.1 | Q-19：以 Core 为准 |

@@ -1,8 +1,8 @@
 # 设计问题清单与 Kelvin 的答复
 
 > 2026-11-10｜Core 阶段 1 设计闸门配套。Kelvin 当天逐条答复，结论记在第一节；第二节是仍未定的；第三节是答复后需要别的仓库/文档跟着改的。
-> 契约正文见 [CONTRACT_V1_DRAFT.md](CONTRACT_V1_DRAFT.md)，已按答复修订。标 **【DECISIONS】** 的条目与 `acuven_hub/DECISIONS.md` 现行条款不同，
-> 本项目没有改那份文件（见第三节）。
+> 契约正文见 [CONTRACT_V1_DRAFT.md](CONTRACT_V1_DRAFT.md)，已按答复修订。标 **【DECISIONS】** 的条目与 `acuven_hub/DECISIONS.md` 原条款不同；
+> 其中 C-12、C-13 已于 2026-11-10 经 Kelvin 同意改入 DECISIONS（见第三节）。
 
 ## 一、已答复（Kelvin，2026-11-10）
 
@@ -67,8 +67,8 @@
 
 | 文件 | 要改什么 | 谁来改 |
 | --- | --- | --- |
-| `acuven_hub/DECISIONS.md` C-12 | “已确认库存写入 RPO=0、需独立故障域同步持久化”改为 **RPO≤5 分钟（异地日志＋每日全量）、RTO≤4h**；“单机 Compose 只能用于开发和隔离 Demo”相应改写 | acuven_hub 会话 |
-| `acuven_hub/DECISIONS.md` C-13 | “V1 只验收 Acuven 自用网店的单租户”改为 **V1 先接公开 Demo（独立 Demo Core 实例）验收**；真实网店何时接、怎么部署待定（Q-24） | acuven_hub 会话 |
+| `acuven_hub/DECISIONS.md` C-12 | “已确认库存写入 RPO=0、需独立故障域同步持久化”改为 **RPO≤5 分钟（异地日志＋每日全量）、RTO≤4h** | **已改**（2026-11-10，Kelvin 同意在本会话改）：C-12 标“已被取代（部分）”，速查表与第四节同步 |
+| `acuven_hub/DECISIONS.md` C-13 | “V1 只验收 Acuven 自用网店的单租户”改为 **V1 先接公开 Demo（独立 Demo Core 实例）验收**；真实网店何时接、怎么部署待定（Q-24） | **已改**（同上）：C-13 标“已被取代（部分）”，第四节加“C-13 后续”待决定行 |
 | `acuven_hub/DECISIONS.md` I-04 | 设计批准后登记重估结果（Q-29） | 批准后 |
 | `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md` | 预留 30→15 分钟可配（Q-19）；故障收款加“按最后可售量封顶”（Q-03）；超卖事实不入账（Q-20）；`sale_cancelled` 映射到退款回库（Q-28） | Inventory 启动时（DEVPRI 阶段 5） |
 | `acuven-shop/docs/DESIGN.md` | Demo 接 Core 后：退款回库、当日库存调整改为盘点更正、每日重置改调 Core、迟到付款改为补扣/待办（Q-26）、故障收款封顶 | 网店接 Core 的设计任务（过网店设计闸门） |
