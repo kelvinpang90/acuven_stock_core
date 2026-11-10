@@ -8,7 +8,7 @@
 
 - **是什么**：Acuven Stock Core，商品身份目录与基础库存账的唯一权威（独立常驻服务＋独立库）。网店等业务模块只经 `/v1` 私有 API 调它；
   没有面向客户的界面。V1 的第一个接入方是公开网店 Demo（独立的 Demo Core 实例，`CORE_ENV=demo`）。
-- **设计依据**：[REQUIREMENTS.md](REQUIREMENTS.md)（需求，2026-11-10 修订）与 [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md)（契约 0.2，Kelvin 2026-11-10 批准）。
+- **设计依据**：[REQUIREMENTS.md](REQUIREMENTS.md)（需求，2026-11-10 修订）与 [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md)（契约 0.3，Kelvin 2026-11-10 批准）。
   账本、流水、预留状态机、幂等、数据库结构都在设计闸门内：实现必须与契约一致，**偏离契约的改动先改契约、重新批准**，不在代码里另立规则。
   问题与答复见 [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md)。
 - **技术栈**：Python 3.12＋FastAPI＋SQLAlchemy 2/Alembic＋MySQL 8（共享 `infra_mysql` 里的独立库）；不用 Redis 存任何权威数据；
