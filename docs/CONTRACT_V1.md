@@ -679,8 +679,8 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 | # | 预审发现 | 类型 | 处理 | 改了哪里 |
 | --- | --- | --- | --- | --- |
-| 9 | 盘点拒绝条件写错（不可售为 0 时也可能违反不变量） | 设计缺陷 | 改为：在架件数 < `reserved` + `paid_pending_dispatch` 时拒绝 | §6 |
-| 10 | `COUNT_BELOW_COMMITMENTS` 的缺口怎么算没说 | 未决定 | 逐 SKU 一个数：`reserved` + `paid_pending_dispatch` − 在架件数 | §6 |
+| 9 | 盘点拒绝条件写错（不可售为 0 时也可能违反不变量） | 设计缺陷 | ~~改为：在架件数 < `reserved` + `paid_pending_dispatch` 时拒绝~~ **已被第 12 条取代**：以 §6 差额法落账后的不变量为准 | §6 |
+| 10 | `COUNT_BELOW_COMMITMENTS` 的缺口怎么算没说 | 未决定 | ~~逐 SKU 一个数：`reserved` + `paid_pending_dispatch` − 在架件数~~ **已被第 12 条取代**：缺口 = max(0, `reserved` + 新 `unavailable` − 新 `stock_balance`)，见 §6 | §6 |
 | 11 | 编码归属表与 SKU 表双向外键成环；历史表、归属表的主键没定 | 设计缺陷／未决定 | 数据库只保证“一个编码归一个 SKU”（归属表主键 `(tenant_id, code)`，外键指向 SKU），“当前编码已登记给自己”由同一事务的服务层保证；历史表用自增 `BIGINT id` | §2.2 |
 
 预审另记了一条“0.3 尚未批准”；Kelvin 已于同日批准。

@@ -27,7 +27,7 @@
 - **数据库迁移只做向前兼容的扩展**（加表、加列、加索引），部署脚本在换容器前跑 `alembic upgrade head`。
 - **共享文件清单**（登记同类任务时逐个对照，补进 `allowed_change_paths`）：
   - 新增 `/v1` 路由的任务：`app/main.py`（挂路由）；
-  - 新增或修改数据库模型的任务：`alembic/env.py` 不用改，但新迁移文件与 `app/db.py` 的模型注册要一起列；
+  - 新增数据库模型模块的任务：`alembic/env.py`（在那里 import 新模型模块，登记到 `Base.metadata`）、`app/models/__init__.py` 与新迁移文件要一起列；`app/db.py` 不用改；
   - 新增配置项的任务：`app/config.py`、`.env.example`、`docker-compose.yml`。
 
 ## 角色与流程
