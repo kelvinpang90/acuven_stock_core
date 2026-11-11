@@ -14,6 +14,7 @@ from sqlalchemy import engine_from_config, pool
 
 from alembic import context
 from app.db import Base
+from app.models import catalog  # noqa: F401
 
 config = context.config
 target_metadata = Base.metadata
