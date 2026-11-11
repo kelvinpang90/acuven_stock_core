@@ -110,7 +110,7 @@ tasks:
       参考价金额列为 BIGINT；表默认字符集 utf8mb4、排序规则 utf8mb4_0900_ai_ci，ID 类列与 status 列用 utf8mb4_bin 精确比较（大小写不同的状态值被检查约束拒绝）；
       历史表的旧编码与新编码列沿用编码列的类型、排序规则与首尾空格检查，但不设唯一；只追加的历史表与归属表只有 created_at、没有 updated_at；
       其余表的 created_at 与 updated_at 在插入时都用数据库默认 CURRENT_TIMESTAMP(6)，之后 updated_at 由应用在修改时写入。只做数据库层：不加接口、不写业务服务、不碰库存账表（另一个任务）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 模型放在新文件 app/models/catalog.py，并在 alembic/env.py 里 import 登记；迁移文件放 alembic/versions，upgrade 与 downgrade 都写全；不含任何顾客个人资料字段

@@ -26,7 +26,6 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-002` 建立商品目录的数据库表与首个迁移
 
 ### 已阻塞
 
