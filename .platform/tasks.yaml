@@ -75,7 +75,7 @@ tasks:
       paid_pending_dispatch）、派生的可售量、不变量和每种流水类型对四个量的增减规则写成纯函数，作为之后数据库层与接口层的唯一规则来源。
       只做 app/domain 下的纯 Python：不 import FastAPI、SQLAlchemy 或任何做 I/O 的库，不建表、不加接口。
       SKU 合并的迁移流水与 CORRECTION 的依赖检查不在本任务（之后随合并与更正任务做）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 账面量是不可变值对象；可售量按契约 4.1 由 stock_balance 减 reserved 减 unavailable 派生，不作为可写字段
