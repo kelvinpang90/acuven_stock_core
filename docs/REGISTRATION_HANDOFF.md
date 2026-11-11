@@ -2,8 +2,9 @@
 
 > 2026-11-10。登记**不在本项目会话里做**：把本文交给控制面会话（在控制面目录另开会话），由它按 `docs/ONBOARD-PROJECT.md`
 > 改登记表、渲染、自查、提 PR，经独立受限评审、Kelvin 合并。
-> **前提**：本仓库已推到 GitHub 默认分支，且下面的自检是对那个推送后的干净检出重跑过的。截至本文，仓库只在本地，
-> 自检是对本地提交 `01c3908` 的干净克隆跑的。
+> **现状（2026-11-11）**：已推到公开仓库 `kelvinpang90/acuven_stock_core`，main 受保护（必需检查 `unit`、`integration`）；
+> Demo Core 实例已按提交 SHA 部署上线，健康检查报出所部署的提交。下面的 `contract_check` 是对 GitHub 上 main（`1e15a57`）的
+> 干净克隆重跑的；设计预审是对 `01c3908` 跑的，此后契约、`tasks.yaml`、`docs/TODO.md` 与代码都没有改动，结论仍有效。
 
 ## 登记表字段
 
@@ -19,7 +20,8 @@
 
 ## 需要 Worker 主机登记 `check_win32k` 的命令
 
-逐字与 `.platform/commands.yaml` 一致：
+`check_win32k` 写在 Git 忽略的 Worker 本机配置里，项目分配为 `windows-native`（单独复审的任务）时随本机配置一起登记；
+`worker: none` 阶段用不到。逐字与 `.platform/commands.yaml` 一致：
 
 - `lint.check`：`python ["-I", "-m", "ruff", "check", "."]`
 - `format.check`：`python ["-I", "-m", "ruff", "format", "--check", "."]`
@@ -27,7 +29,7 @@
 `tests.unit`（`python ["-I", "-m", "unittest", "discover", "-s", "tests/unit", "-t", "."]`）只跑纯领域代码，不需要 Win32k；
 `tests.integration` 只在 CI 跑，没有写进任何任务的 `allowed_commands`。
 
-## `contract_check` 输出（对 `01c3908` 的干净克隆）
+## `contract_check` 输出（对 GitHub 上 main `1e15a57` 的干净克隆）
 
 ```text
 ok    project.yaml: identity and worker consent

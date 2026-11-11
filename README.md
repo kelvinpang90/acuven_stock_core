@@ -1,6 +1,6 @@
 # Acuven Stock Core
 
-`acuven_stock_core` 是商品身份目录与基础库存账的**独立服务项目**。需求见 [REQUIREMENTS.md](REQUIREMENTS.md)，契约 [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) 已于 2026-11-10 批准。目前只有从项目模板起步的最小服务骨架（健康检查、CI、部署工作流、OpenClaw 契约），还没有业务功能；没有 GitHub 远端仓库，也没有部署。
+`acuven_stock_core` 是商品身份目录与基础库存账的**独立服务项目**。需求见 [REQUIREMENTS.md](REQUIREMENTS.md)，契约 [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) 已于 2026-11-10 批准。目前只有从项目模板起步的最小服务骨架（健康检查、CI、部署工作流、OpenClaw 契约），还没有业务功能。仓库已推到 GitHub（公开），Demo Core 实例已部署（无公网入口）；尚未登记 OpenClaw 控制面。
 
 服务范围：统一 SKU、条码、基本商品名称与参考价；记录库存地点、预留、出入库与可追溯流水。`acuven_inventory` 另负责跨销售入口的库存分配、外部平台同步与对账。
 
