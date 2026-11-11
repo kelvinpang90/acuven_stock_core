@@ -139,27 +139,28 @@ tasks:
     purpose: >-
       按已批准契约 docs/CONTRACT_V1.md 的第 1 节、第 3 节、4.1、4.3、7.1 与第 10 节第 1 条，建立库存侧六张表的 SQLAlchemy 模型和第二个
       Alembic 迁移，为之后的幂等中间件与库存命令打底。沿用 2.2 的数据库列约定与 CORE-TASK-002 的写法：稳定 ID 为类型前缀加 ULID、
-      VARCHAR(32)、utf8mb4_bin；业务唯一约束都含 tenant_id；表间引用用 tenant_id 加 ID 的复合外键，被引用的表另设 tenant_id 加 ID 的唯一约束作引用目标（同目录表）；状态列 VARCHAR(16) 加检查约束，不用 ENUM；
+      VARCHAR(32)、utf8mb4_bin；主键都是单列稳定 ID（第 10 节第 1 条，六张表无例外）；各表 tenant_id 都非空并外键到 tenants；业务唯一约束都含 tenant_id；表间引用用 tenant_id 加 ID 的复合外键，被引用的表另设 tenant_id 加 ID 的唯一约束作引用目标（同目录表）；状态列 VARCHAR(16) 加检查约束，不用 ENUM；
       时间列 DATETIME(6)，created_at 默认 CURRENT_TIMESTAMP(6)，updated_at 插入时同默认、之后由应用写入；只追加的表没有 updated_at。
       六张表：一，locations（前缀 loc_）：location_id 主键、tenant_id、name VARCHAR(200)、status 取 active 或 inactive。
       二，stock_pools（前缀 pool_）：pool_id 主键、tenant_id、location_id 复合外键指向同租户地点、name VARCHAR(200)、status 取 initializing 或 live（第 6 节期初只在 initializing 可用）。
       三，sales_channels（前缀 chn_）：channel_id 主键、tenant_id、pool_id 复合外键指向同租户的池、name VARCHAR(200)、status 取 active 或 inactive；
       按第 3 节一个池只允许一个销售入口，以 tenant_id 加 pool_id 唯一约束在数据库层兜底（将来启用共卖时另行迁移放开）。
-      四，stock_balances：每个 tenant、pool、sku 一行，主键为 tenant_id、pool_id、sku_id 三列（内部表，不对外暴露 ID；多 SKU 命令按 pool_id、sku_id 升序锁行）；
+      四，stock_balances（前缀 bal_）：balance_id 主键；每个 tenant、pool、sku 一行，以 tenant_id、pool_id、sku_id 三列唯一约束保证（多 SKU 命令按 pool_id、sku_id 升序锁行）；
       pool 与 sku 各用复合外键指向同租户的池与 SKU；四个账面量为 BIGINT、默认 0，检查约束要求各自不小于 0 且 reserved 加 unavailable 不超过 stock_balance；
       不设 available 列（4.1 派生量）；balance_version 为 BIGINT、默认 0、不小于 0，每次变化由应用加 1。
-      五，ledger_entries：只追加；主键为自增 BIGINT id（内部排序用，同 sku_code_history），对外的 entry_id（前缀 led_）全局唯一；
-      tenant_id、pool_id、sku_id 以复合外键指向 stock_balances 的同一行；entry_type VARCHAR(32) utf8mb4_bin，检查约束限定为 4.3 表的十八种
+      五，ledger_entries（前缀 led_）：只追加；entry_id 主键；
+      tenant_id、pool_id、sku_id 以复合外键指向 stock_balances 那三列的唯一约束；entry_type VARCHAR(32) utf8mb4_bin，检查约束限定为 4.3 表的十八种
       （含 MERGE_TRANSFER_OUT、MERGE_TRANSFER_IN、DEMO_RESET、CORRECTION）；四个量各一列增量（BIGINT，可正可负）与一列变动后值（BIGINT），
       变动后值的检查约束与余额表相同；balance_version_after 为 BIGINT 不小于 1；channel_id 可空，非空时复合外键指向同租户的销售入口；
       source_type VARCHAR(32) 与 source_ref VARCHAR(128) 同空同有，line_ref VARCHAR(128) 可空；command_id VARCHAR(32) 非空（前缀 cmd_，同一命令写的各条流水相同，建索引）；
       idempotency_key VARCHAR(128) 可空（Core 自己的到期关闭没有请求）；credential_id VARCHAR(32) 可空，actor_ref VARCHAR(128) 可空，actor_role VARCHAR(32) 可空；
       reason_code VARCHAR(32) 可空，note VARCHAR(500) 可空，request_id VARCHAR(128) 可空；corrects_entry_id 可空，非空时复合外键指向同租户的另一条流水，
-      检查约束要求 entry_type 为 CORRECTION 时它非空、否则为空；occurred_at 非空，recorded_at 默认 CURRENT_TIMESTAMP(6)；
-      为按 SKU 查流水建 tenant_id、pool_id、sku_id、id 的索引。
-      六，idempotency_records：只追加；主键为自增 BIGINT id；按 7.1 作用域以 tenant_id、credential_id、operation、idempotency_key 四列唯一；
-      credential_id VARCHAR(32)、operation VARCHAR(64)、idempotency_key VARCHAR(128)；request_hash CHAR(64)（规范化请求摘要 SHA-256 的小写十六进制）；
-      response_status SMALLINT，检查约束限定 200 到 499（7.1：5xx 与处理中不作为确定结果保存）；response_body JSON 非空；request_id VARCHAR(128) 可空；created_at。
+      检查约束要求 entry_type 为 CORRECTION 时它非空、否则为空，且不等于自身 entry_id；occurred_at 非空，recorded_at 默认 CURRENT_TIMESTAMP(6)；
+      为按 SKU 查流水建 tenant_id、pool_id、sku_id、recorded_at、entry_id 的索引（同一余额行的流水在行锁下串行写入，按 recorded_at 加 entry_id 排序）。
+      六，idempotency_records（前缀 idem_）：只追加；idempotency_record_id 主键；按 7.1 作用域以 tenant_id、credential_id、operation、idempotency_key 四列唯一；
+      credential_id VARCHAR(32)、operation VARCHAR(64)、idempotency_key VARCHAR(128)、request_hash CHAR(64)（规范化请求摘要 SHA-256 的小写十六进制）、response_status SMALLINT、response_body JSON 都非空；
+      response_status 的检查约束限定 200 到 499 且不为 429（7.1 与 8.3：5xx、限流与处理中都不作为确定结果保存）；request_id VARCHAR(128) 可空；created_at。
+      超过 64 字符的约束名照 CORE-TASK-002 先例由命名约定生成，迁移里用 op.f 引用，不手写。
       调用方引用、幂等键、操作人、凭据 ID、原因代码都用 utf8mb4_bin 精确比较，格式由接口层按第 1 节与 7.1 校验，数据库不另加格式约束。
       明确不做：服务凭据表与鉴权（下一任务，届时再给 credential_id 加外键）；业务引用唯一（随各自的预留、收货、盘点等事实表做）；
       预留、订单行累计、盘点单、outbox 与目录变更流的表；流水禁改禁删的触发器或权限；DEMO_RESET 在生产库被数据库拒绝的防护（6.1，随 Demo 重置任务做）。
@@ -172,8 +173,8 @@ tasks:
       - 主键、唯一约束、复合外键、检查约束与索引按 purpose 所列在数据库层生效；约束名遵循 app/db.py 的命名约定
       - 集成测试在真 MySQL 上验证地点、池与入口：池指向别的租户的地点被拒、同一个池登记第二个销售入口被拒、池状态取 initializing 与 live 以外的值（含只差大小写）被拒
       - 集成测试在真 MySQL 上验证余额：同一 tenant、pool、sku 第二行被拒，任一账面量为负被拒，reserved 加 unavailable 超过 stock_balance 被拒，指向别的租户的 SKU 被拒
-      - 集成测试在真 MySQL 上验证流水与幂等记录：未知 entry_type 被拒、变动后值违反不变量被拒、CORRECTION 不带被更正流水或非 CORRECTION 带了都被拒、source_type 与 source_ref 一空一有被拒；同一 tenant、credential、operation、键的第二条幂等记录被拒而换 operation 可以，response_status 为 500 被拒
-      - CI 的迁移往返（upgrade、downgrade 到底、再 upgrade）与 alembic check 通过；集成测试经 tests/integration/conftest.py 已有的 migrated_engine 夹具升降迁移
+      - 集成测试在真 MySQL 上验证流水与幂等记录：未知 entry_type 被拒、变动后值违反不变量被拒、CORRECTION 不带被更正流水或非 CORRECTION 带了都被拒、source_type 与 source_ref 一空一有被拒；同一 tenant、credential、operation、键的第二条幂等记录被拒而换 operation 可以，response_status 为 500 或 429 被拒
+      - CI 的迁移往返（upgrade、downgrade 到底、再 upgrade）与 alembic check 通过；集成测试经 tests/integration/conftest.py 的 migrated_engine 夹具升降迁移；两个 schema 测试共用的连接夹具与辅助函数可以移进 conftest
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
       - 集成测试与迁移检查由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
@@ -181,6 +182,8 @@ tasks:
       - app/models/inventory.py
       - alembic/env.py
       - alembic/versions/20261111_0002_inventory.py
+      - tests/integration/conftest.py
+      - tests/integration/test_catalog_schema.py
       - tests/integration/test_inventory_schema.py
     allowed_commands:
       - lint.check
