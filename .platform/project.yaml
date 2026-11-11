@@ -56,9 +56,11 @@ repository:
         - unit
         - integration
 
+# independent_reviewer：另起的 Claude 独立审查（Kelvin 2026-11-11 定）。
+# merge_owner：Worker 实现 PR 的合并由 Kelvin 在 Telegram「批准」；会话里开的 PR 由实现会话在审查通过后合并（见 CLAUDE.md）。
 roles:
   development_owner: claude_code
-  independent_reviewer: codex
+  independent_reviewer: claude_code
   merge_owner: kelvin
 
 # 默认拒绝：未在 commands.yaml / tasks.yaml 里列出的东西一律不可执行、不可调度。
