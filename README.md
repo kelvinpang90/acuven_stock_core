@@ -1,6 +1,6 @@
 # Acuven Stock Core
 
-`acuven_stock_core` 是商品身份目录与基础库存账的**独立服务项目**。需求见 [REQUIREMENTS.md](REQUIREMENTS.md)，契约 [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) 已于 2026-11-10 批准。目前只有从项目模板起步的最小服务骨架（健康检查、CI、部署工作流、OpenClaw 契约），还没有业务功能；没有 GitHub 远端仓库，也没有部署。
+`acuven_stock_core` 是商品身份目录与基础库存账的**独立服务项目**。需求见 [REQUIREMENTS.md](REQUIREMENTS.md)，契约 [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) 已于 2026-11-10 批准。目前只有从项目模板起步的最小服务骨架（健康检查、CI、部署工作流、OpenClaw 契约），还没有业务功能。仓库已推到 GitHub（公开），Demo Core 实例已部署（无公网入口）；尚未登记 OpenClaw 控制面。
 
 服务范围：统一 SKU、条码、基本商品名称与参考价；记录库存地点、预留、出入库与可追溯流水。`acuven_inventory` 另负责跨销售入口的库存分配、外部平台同步与对账。
 
@@ -12,7 +12,7 @@
 | --- | --- |
 | [docs/SHOP_STOCK_INVENTORY.md](docs/SHOP_STOCK_INVENTORY.md) | 网店现有商品与库存代码盘点，及将来换成调用 Core 的每个调用点 |
 | [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) | Core V1 契约（0.4，2026-11-10 批准）：商品身份、库存池、数量模型与流水、预留→确认→释放、幂等与审计、`/v1` API、`StockGateway`、迁移与回退样例、租户与鉴权、恢复目标（RPO≤5 分钟、RTO≤4h）的设计约束 |
-| [docs/TEMPLATE_BOOTSTRAP_PLAN.md](docs/TEMPLATE_BOOTSTRAP_PLAN.md) | 从项目模板起步的方案（2026-11-10 已按它起步，推送与登记待做） |
+| [docs/TEMPLATE_BOOTSTRAP_PLAN.md](docs/TEMPLATE_BOOTSTRAP_PLAN.md) | 从项目模板起步的方案（2026-11-10 已按它起步，2026-11-11 已推送并部署，登记待做） |
 | [docs/ESTIMATE_BREAKDOWN.md](docs/ESTIMATE_BREAKDOWN.md) | 工期重估（I-04）用的工作拆分，不是排期 |
 | [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | 设计问题与 Kelvin 的答复（Q-24 暂缓） |
 
