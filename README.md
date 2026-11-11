@@ -11,7 +11,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [docs/SHOP_STOCK_INVENTORY.md](docs/SHOP_STOCK_INVENTORY.md) | 网店现有商品与库存代码盘点，及将来换成调用 Core 的每个调用点 |
-| [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) | Core V1 契约（0.4，2026-11-10 批准）：商品身份、库存池、数量模型与流水、预留→确认→释放、幂等与审计、`/v1` API、`StockGateway`、迁移与回退样例、租户与鉴权、恢复目标（RPO≤5 分钟、RTO≤4h）的设计约束 |
+| [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) | Core V1 契约（0.5，2026-11-12 批准）：商品身份、库存池、数量模型与流水、预留→确认→释放、幂等与审计、`/v1` API、`StockGateway`、迁移与回退样例、租户与鉴权、恢复目标（RPO≤5 分钟、RTO≤4h）的设计约束 |
 | [docs/TEMPLATE_BOOTSTRAP_PLAN.md](docs/TEMPLATE_BOOTSTRAP_PLAN.md) | 从项目模板起步的方案（2026-11-10 已按它起步，2026-11-11 已推送并部署，登记待做） |
 | [docs/ESTIMATE_BREAKDOWN.md](docs/ESTIMATE_BREAKDOWN.md) | 工期重估（I-04）用的工作拆分，不是排期 |
 | [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | 设计问题与 Kelvin 的答复（Q-24 暂缓） |
