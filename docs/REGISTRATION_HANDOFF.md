@@ -5,8 +5,8 @@
 > **现状（2026-11-11）**：已推到公开仓库 `kelvinpang90/acuven_stock_core`，main 受保护（必需检查 `unit`、`integration`）；
 > Demo Core 实例已按提交 SHA 部署上线，健康检查报出所部署的提交。下面的 `contract_check` 是对 GitHub 上 main（`1e15a57`）的
 > 干净克隆重跑的；设计预审是对 `01c3908` 跑的，此后契约、`tasks.yaml`、`docs/TODO.md` 与应用代码（`app/`、`alembic/`、`tests/`）
-> 都没有改动；其间只改了 `deploy/healthcheck.sh`（部署健康检查）与 `.platform/project.yaml` 的 `roles`（审查方改为 `claude_code`），
-> 都不涉及任务范围，预审结论仍有效。
+> 都没有改动；其间的改动只有 `deploy/healthcheck.sh`（部署健康检查）、`.platform/project.yaml` 的 `roles`（审查方改为 `claude_code`）、
+> `CLAUDE.md` / `AGENTS.md` 的「角色与流程」（审查与合并分工）和几份状态文档，都不涉及任务范围，预审结论仍有效。
 
 ## 登记表字段
 
