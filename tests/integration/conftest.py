@@ -1,10 +1,13 @@
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import Engine
+from sqlalchemy import Connection, Engine
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.sql.expression import Executable
 
 from alembic import command
 from app.db import make_engine
@@ -34,3 +37,25 @@ def migrated_engine() -> Iterator[Engine]:
         finally:
             engine.dispose()
             command.downgrade(config, "base")
+
+
+# 下面是 schema 测试共用的：每个测试在一个事务里跑、结束时回滚；
+# 被拒的语句包在保存点里，并断言拒绝它的正是预期的那条约束，而不是碰巧别的错误。
+
+
+@pytest.fixture
+def db(migrated_engine: Engine) -> Iterator[Connection]:
+    with migrated_engine.connect() as conn:
+        conn.begin()
+        yield conn
+        conn.rollback()
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex[:26].upper()}"
+
+
+def assert_rejected_by(db: Connection, statement: Executable, constraint: str) -> None:
+    with pytest.raises(DBAPIError) as caught, db.begin_nested():
+        db.execute(statement)
+    assert constraint in str(caught.value.orig)
