@@ -47,7 +47,7 @@
 | W4 | `app/services/admin_stock_adjust.py:61–135` `adjust_available_stock` | `POST /api/admin/variants/{id}/available-stock` | CAS：`available_stock == expected` 才改成新值（0–9999），写审计 | CAS | Core 没有“直接改数量”（STK-02）。Demo 的当日调整改为调 Core 的盘点更正；另需收货 / 盘点 / 不可售 / 更正等新页面 |
 | W5 | `app/services/admin_products.py:887–900`（`create_product` 第 893–895 行） | `POST /api/admin/products` | 新 SKU 的 `available_stock = daily_initial_stock` | 唯一约束冲突抛 `ProductChanged` | `CatalogGateway.create_product/create_sku`；新 SKU 在 Core 的余额为 0，入库走收货命令 |
 | W6 | `admin_products.py:1156–1169`（`_insert_additions`，由 `save_product` 调用） | `PUT /api/admin/products/{id}` | 同 W5 | 同上 | 同 W5 |
-| W7 | `admin_products.py:1313–1321`（`save_product`，`VARIANT_FIELDS` 含 `daily_initial_stock`） | `PUT /api/admin/products/{id}` | 改每日初始库存（不改当日可用） | 锁商品与规格行；商品 `version` 乐观校验 | 生产无此字段；价格/启停留网店，SKU 编码改动走 `CatalogGateway.update_sku`（带 `If-Match`） |
+| W7 | `admin_products.py:1313–1321`（`save_product`，`VARIANT_FIELDS` 含 `daily_initial_stock`） | `PUT /api/admin/products/{id}` | 改每日初始库存（不改当日可用） | 锁商品与规格行；商品 `version` 乐观校验 | 生产无此字段；价格/启停留网店，SKU 编码改动走 `CatalogGateway.update_sku`（正文带 `expected_version`，契约 §2.6） |
 | W8 | `alembic/versions/20260930_0003_demo_catalog.py:693–709` | 部署时 `alembic upgrade head` | 插入种子商品与库存 | — | Demo：种子商品经目录导入进 Demo Core（契约 §11.2）；将来的生产库不能带这批种子（生产部署要能跳过，或种子改为 Demo 专用命令） |
 | W9 | `app/services/site_settings.py:226–227` | `PUT /api/admin/site-settings` | 改每日重置开关 | — | 生产隐藏/拒绝该开关 |
 
