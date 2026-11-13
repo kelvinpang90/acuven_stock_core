@@ -852,15 +852,20 @@ tasks:
       一，预览：要求 catalog.write 与 catalog_admin，经 run_idempotent，不声明目录写锁（预览不写目录）。正文顶层只有 rows，它是 1 到 100 个元素的数组（批量数组，超过 100 为 413），
       每个元素是 JSON 对象；顶层多字段、rows 不是数组、为空数组或元素不是对象都整单 422；行内字段的问题不整单拒绝，由 CORE-TASK-014 记为 invalid_format。
       按本次导入出现的编码与条码查出现有归属编码与现有 SKU 当前条码（任何状态的 SKU）的比较键，调用预览判定；保存一行导入：前缀 imp_，status previewed，
-      expires_at 为数据库当前时间加 24 小时（在同一条 SQL 里算），rows 存各行原文与预览结果，记预览的凭据、操作者与请求 ID。返回 201 与导入的表示。
+      expires_at 为数据库当前时间加 24 小时（在同一条 SQL 里算），记预览的凭据、操作者与请求 ID。rows 列存各行原文与预览结果：每行的原文按 json.dumps（ensure_ascii 为假）序列化成字符串再存，
+      不把调用方的原始值直接放进 JSON 列（MySQL 的 JSON 列限嵌套 100 层、超出 64 位的整数会转成浮点丢精度，原始值不合规时会 500 或被改写）；
+      预览结果与合格行规范化后的字段值（只有字符串、null 与不超过 9007199254740991 的整数）直接存。返回 201 与导入的表示。
       二，确认：要求 catalog.write 与 catalog_admin，没有请求体（非空 422），经 run_idempotent 并声明目录写锁。事务里用 SELECT FOR UPDATE 按 ID 读导入行，依次判定：
       不存在 404 IMPORT_NOT_FOUND，属于别的租户时响应完全相同并经执行器登记 cross_tenant；已确认过返回 200 与当前表示，不再执行；已过有效期（expires_at 不晚于数据库当前时间）409 IMPORT_EXPIRED；
       否则按当前目录重查预览为 ok 的各行的编码与条码冲突，调用确认计划，按组建商品与 SKU 并写变更记录（带 import_id），把导入改为 confirmed，存逐行结果与确认的凭据、操作者、请求 ID 与数据库时间；
       一组都没建成也算确认完成。全部在执行器的一个事务里。返回 200 与当前表示。
       三，查询：要求 catalog.read，不要求角色；不存在与跨租户同上，跨租户用 cross_tenant_not_found 记事件。
       四，表示：import_id、status（previewed、expired 或 confirmed；expired 由 previewed 且 expires_at 不晚于数据库当前时间推出，不存）、expires_at、created_at、confirmed_at（未确认为 null）、
-      rows（每行 index、external_ref、product_ref、result、invalid_fields）、summary（counts 为六种结果各自的行数、executable_groups、executable_rows）、
-      result（未确认为 null；确认后为逐行的 index、external_ref、product_ref、outcome 为 created、skipped 或 failed，created 带 product_id 与 sku_id，skipped 带预览结果，failed 带 conflicts_existing 或 group_blocked）。
+      rows（每行 index、external_ref、product_ref、result、invalid_fields；invalid_fields 在 invalid_format 时为出错字段名的列表，其余为空列表）、
+      summary（counts 为六种结果各自的行数、executable_groups、executable_rows）、
+      result（未确认为 null；确认后为逐行对象，键都在：index、external_ref、product_ref、outcome 为 created、skipped 或 failed；product_id 与 sku_id 在 created 时有值、否则为 null；
+      preview_result 在 skipped 时为预览结果、否则为 null；failure 在 failed 时为 conflicts_existing 或 group_blocked、否则为 null）。
+      表示里的 external_ref 与 product_ref 在行里是字符串时原样回显，否则（没带、数字、对象等）为 null，这样响应体（也存进幂等记录的 JSON 列）里不会出现调用方的任意值。
       时间格式用 CORE-TASK-016 的函数。
       明确不做：往现有商品加规格、修改现有商品、CSV 解析、过期导入的清理、变更流接口。
     status: ready
@@ -871,7 +876,7 @@ tasks:
     acceptance_criteria:
       - 接口放 app/api/catalog_imports.py 并在 app/main.py 挂上，数据库读写放 app/services/catalog_imports.py
       - 集成测试在真 MySQL 上验证预览：201、import_id 前缀 imp_、status previewed、expires_at 为数据库时间加 24 小时（允许几秒误差）、逐行结果与汇总按 CORE-TASK-014；库里一行导入记录带凭据、操作者与请求 ID；目录没有新行；另一个连接持有本租户目录锁时预览照常成功
-      - 集成测试验证预览的整单拒绝：非法 JSON、顶层多字段、rows 不是数组、空数组、元素不是对象都为 422，101 行为 413；行内缺字段只让那一行 invalid_format
+      - 集成测试验证预览的整单拒绝：非法 JSON、顶层多字段、rows 不是数组、空数组、元素不是对象都为 422，101 行为 413；行内缺字段只让那一行 invalid_format；某行的 sku_name 是嵌套 120 层的数组、external_ref 是超出 64 位的整数时，那一行 invalid_format、external_ref 回显为 null，预览照常 201，库里存的原文与发来的一致
       - 集成测试验证确认：按组建商品与 SKU，变更记录带 import_id；逐行 created 带 ID、预览不合格的行 skipped；预览之后测试在库里占用某组一个编码，确认时那组不建、冲突行 failed conflicts_existing、同组别的行 failed group_blocked，别的组照建；导入记录为 confirmed 并记了确认人；一组都没建成也为 confirmed
       - 集成测试验证确认的判定：不存在与跨租户得完全相同的 404 IMPORT_NOT_FOUND，跨租户记 cross_tenant；已确认后换新键再确认得 200 与当前表示且不再建；同键重试原样重放；测试把 expires_at 改到过去后确认 409 IMPORT_EXPIRED 且什么也不建；带请求体 422
       - 集成测试验证查询：previewed、expired（库里 status 仍为 previewed）与 confirmed 三种表示；跨租户 404 并记事件；只要 catalog.read
