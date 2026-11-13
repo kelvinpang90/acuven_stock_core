@@ -653,7 +653,7 @@ tasks:
       字段取值、比较键用 CORE-TASK-013 的函数，引用格式用 app/domain/requests.py 已有的 is_reference。只 import 标准库与 app/domain 内的模块。
       一，预览判定：输入 rows（JSON 解析后的列表，每个元素已由接口确认是对象）、现有归属表里编码的比较键集合（含任何 SKU 的当前与退役编码）、现有 SKU 当前条码的比较键集合
       （服务层按本次导入出现的编码与条码查出）。逐行先校验字段：必填 external_ref、product_ref（第 1 节引用格式）、product_name（按商品名称）、sku_code、sku_name（按 SKU 名称）；
-      barcode、reference_price 可不带或为 null；多出的字段与缺的字段都算不合规，记下出错的字段名；多出的字段统一记为固定字符串 unknown_field（只记一次），不记调用方的键名，以免响应里回显调用方的任意值。然后按 2.3 的顺序取第一个命中的结果：
+      barcode、reference_price 可不带或为 null；多出的字段与缺的字段都算不合规，记下出错的字段名；多出的字段统一记为固定字符串 unknown_field（只记一次），不记调用方的键名，以免响应里回显调用方的任意值。因 external_ref 重复而 invalid_format 的行记 external_ref，因同组 product_name 不一致而 invalid_format 的行记 product_name，与行内字段错误合并去重；列表按固定顺序 external_ref、product_ref、product_name、sku_code、sku_name、barcode、reference_price、unknown_field 排列。然后按 2.3 的顺序取第一个命中的结果：
       invalid_format（行内字段不合规；或 external_ref 在本次导入里重复，重复的各行都算；或同一 product_ref 各行的 product_name 去首尾空白后不完全相同，该组各行都算）、
       duplicate_sku_code（别的行用了比较键相同的 sku_code，各行都算）、duplicate_barcode（同上，只比较非空条码）、conflicts_existing（编码键在归属集合里，或条码键在条码集合里）、
       group_blocked（本行没问题，但同一 product_ref 的别的行有问题）、ok。判定细则照 2.3：external_ref 与 product_ref 按字符串原样比较、区分大小写；product_ref 本身不合规的行不归任何组、只影响自己；
