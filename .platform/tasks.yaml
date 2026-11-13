@@ -190,3 +190,227 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+
+  - id: CORE-TASK-004
+    title: 实现请求头、幂等摘要与令牌的纯规则及稳定 ID 生成
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.6 的第 1 节、7.1、8.1 与第 10 节第 1、3、4 条，把鉴权与幂等里不碰数据库、不碰框架的规则写成纯函数，
+      作为之后凭据表、鉴权与幂等执行器的唯一规则来源。只做 app/domain 下的纯 Python，只用标准库，不 import FastAPI、SQLAlchemy 或任何做 I/O 的库。
+      一，稳定 ID：类型前缀加下划线加 26 个字符的 ULID（Crockford Base32，大写；前 10 个字符是毫秒时间戳，后 16 个是随机数），
+      生成函数可注入时间与随机字节以便测试；前缀只接受小写字母，总长不超过 32。
+      二，请求头：Idempotency-Key 为 1 到 128 个 0x21 到 0x7E 的字符；X-Request-ID 与 X-Actor-Ref 为 1 到 128 个字母、数字或点、下划线、冒号、连字符；
+      X-Actor-Role 只接受 stock_operator、stock_admin、catalog_admin，区分大小写；两个操作者头要么都有要么都没有；User-Agent 截断到 200 字符。
+      不合格时抛出同一个带头名的格式异常，不猜、不去空格。
+      三，令牌：csk_ 加 32 字节的 base64url 编码（不补等号，43 个字符）；摘要是令牌全文 UTF-8 的 SHA-256 小写十六进制；
+      解析 Authorization 头：方案名 Bearer 不区分大小写，与令牌之间正好一个空格，令牌须符合上述格式，否则视为认不出（返回空，不抛出）；
+      令牌可用的判断：未吊销、所属凭据为 active、所属租户为 active、没有截止时间或当前时间早于截止时间（到点即失效），当前时间由调用方传入。
+      四，scope：契约 10.4 的八个 scope 常量；判断授予的 scope 是否覆盖接口要求的全部 scope（合并接口要求两个）；
+      签发时的 scope 校验：非空、无重复、都是已知值，含 ops.read 时不能有别的 scope、凭据也不能带销售入口。
+      五，池授权：给定凭据销售入口绑定的池（可空）、请求的池、该池是否属于本租户，按契约 10.4 的顺序判定：没有销售入口 403，池不属于本租户 404，
+      属于本租户但不是获准的池 403，否则允许；销售类命令不带池，只判有没有销售入口；按对象判定时，请求的池就是对象所属的池、属于本租户即对象属于本租户。
+      六，幂等：规范化请求摘要按 7.1（路径参数与请求体放进 path 与 body 两个键，没有请求体时 body 为 null；只有 body 顶层名为 lines 且元素都是带字符串 line_ref 的对象的数组按 line_ref 排序，
+      line_ref 相同时按元素的规范化 JSON 排序以保证确定，更深层与其他数组保持原序；键名排序、无空白、非 ASCII 原样、UTF-8 后取 SHA-256 小写十六进制；
+      输入里出现浮点数、NaN、Infinity 或含孤立代理项的字符串时抛出异常，不算摘要，这些输入本应在请求体校验时被 422 拒绝）；
+      命名锁的锁名是数据库名与 tenant_id、credential_id、操作类型、幂等键五项以换行符连接后 UTF-8 的 SHA-256 小写十六进制，64 个字符；
+      已有记录与本次摘要的比较返回执行、重放或冲突三种决定；结果是否作为确定结果保存：200 到 499，但 429 与错误码为 REQUEST_IN_PROGRESS 或 IDEMPOTENCY_CONFLICT 的 409 除外。
+      明确不做：建表、HTTP 接口、中间件、命令行、读写数据库。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 规则分放 app/domain/ids.py、app/domain/requests.py、app/domain/service_auth.py、app/domain/idempotency.py，单元测试放对应的 tests/unit 文件，用标准库 unittest
+      - 稳定 ID 测试覆盖：长度与字符集、注入固定时间与随机字节时结果确定、时间戳在前所以较晚生成的 ID 按字符串排序更大、非法前缀被拒
+      - 请求头测试覆盖每个头的边界：长度 0、1、128、129，越界字符（含空格、制表符、非 ASCII），角色只差大小写被拒，只带一个操作者头被拒，User-Agent 恰好 200 与 201 字符
+      - 令牌测试覆盖：生成的令牌符合格式、摘要与已知向量一致、Authorization 头的方案名大小写、多空格、缺令牌、格式不对都返回认不出；截止时间恰好等于当前时间时不可用
+      - scope 与池授权测试覆盖：合并要求两个 scope 缺一不可、未知 scope 与重复 scope 被拒、ops.read 与别的 scope 同时出现或带销售入口被拒；池授权每个判定分支各有用例，没有销售入口且池属于别的租户时得 403 而不是 404
+      - 幂等测试覆盖：请求体键序不同、顶层 lines 顺序不同时摘要相同，路径参数不同、更深层或 lines 以外的数组顺序不同、多一个值为 null 的键时摘要不同，没有请求体与空对象的摘要不同，浮点数与孤立代理项被拒；锁名为 64 个小写十六进制字符且任一项不同时不同；三种决定各有用例；保存判断对 200、404、422、409 业务错误、409 处理中、409 幂等冲突、429、500 的结果正确
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - PR 的必需 CI 检查 unit 与 integration 通过
+    allowed_change_paths:
+      - app/domain/ids.py
+      - app/domain/requests.py
+      - app/domain/service_auth.py
+      - app/domain/idempotency.py
+      - tests/unit/test_ids.py
+      - tests/unit/test_requests.py
+      - tests/unit/test_service_auth.py
+      - tests/unit/test_idempotency.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-005
+    title: 建立服务凭据、令牌与安全事件的数据库表并补凭据外键
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.6 的 7.2 与第 10 节第 1、4 条，建立三张表的 SQLAlchemy 模型和第三个 Alembic 迁移，
+      并给已有的幂等记录与流水表补上指向凭据的外键，为之后的鉴权与幂等执行器打底。沿用 2.2 的数据库列约定与 CORE-TASK-002、003 的写法：
+      稳定 ID 为类型前缀加 ULID、VARCHAR(32)、utf8mb4_bin；主键都是单列稳定 ID；tenant_id 外键到 tenants；表间引用用 tenant_id 加 ID 的复合外键，
+      被引用的表另设 tenant_id 加 ID 的唯一约束作引用目标；状态列 VARCHAR(16) 加检查约束；时间列 DATETIME(6)，created_at 默认 CURRENT_TIMESTAMP(6)，
+      updated_at 插入时同默认、之后由应用写入；只追加的表没有 updated_at。
+      一，credentials（前缀 cred_）：credential_id 主键、tenant_id 非空、channel_id 可空，非空时复合外键指向同租户的销售入口；name VARCHAR(200)；
+      scopes 为 JSON，检查约束要求是非空数组（scope 的取值由应用校验）；status 取 active 或 revoked；revoked_at 可空，检查约束要求 status 为 revoked 时它非空、否则为空；
+      created_at、updated_at；tenant_id 加 credential_id 唯一，作引用目标。
+      二，credential_tokens（前缀 ctk_）：token_id 主键、tenant_id 非空、credential_id 非空并以复合外键指向同租户的凭据；
+      token_digest CHAR(64) utf8mb4_bin 非空，全表唯一（鉴权时还不知道租户，按契约 10.4 全库唯一），检查约束要求是 64 个小写十六进制字符；
+      expires_at 与 revoked_at 可空；created_at、updated_at；不存明文令牌。
+      三，security_events（前缀 sev_）：只追加；event_id 主键；event_type VARCHAR(32) utf8mb4_bin，检查约束限定为 invalid_credential、forbidden、cross_tenant、
+      idempotency_conflict、business_ref_conflict、rate_limited、credential_issued、token_issued、token_revoked、credential_revoked 十种；
+      occurred_at 默认 CURRENT_TIMESTAMP(6) 并建索引（满 1 年清理按它）；tenant_id 可空，非空时外键到 tenants；credential_id 可空，
+      非空时以复合外键指向同租户的凭据，检查约束要求 credential_id 非空时 tenant_id 也非空；request_id VARCHAR(128) 可空（命令行操作没有请求）；
+      actor_ref VARCHAR(128) utf8mb4_bin 可空（命令行操作的操作者，契约 7.2）；http_method VARCHAR(10) 可空，path VARCHAR(512) 可空（不含查询串），
+      user_agent VARCHAR(200) 可空，details JSON 可空（原因、目标令牌、旧令牌截止时间等）。轮换记为 token_issued，不另设类型。
+      令牌摘要全表唯一、不含 tenant_id，是契约第 10 节第 1 条写明的唯一例外。
+      四，补外键：idempotency_records 的 tenant_id 加 credential_id 复合外键指向凭据；ledger_entries 的 tenant_id 加 credential_id（可空）复合外键指向凭据。
+      超过 64 字符的约束名照先例由命名约定生成，迁移里用 op.f 引用。明确不做：鉴权、命令行、写安全事件的代码、到期清理；不改领域层与目录表。
+    status: ready
+    depends_on:
+      - CORE-TASK-003
+    acceptance_criteria:
+      - 三张表的模型放新文件 app/models/service_auth.py，在 alembic/env.py 里 import 登记；补的两个外键改在 app/models/inventory.py；迁移文件放 alembic/versions，revision 接在 0002 之后，upgrade 与 downgrade 都写全
+      - 主键、唯一约束、复合外键、检查约束与索引按 purpose 所列在数据库层生效；约束名遵循 app/db.py 的命名约定
+      - 集成测试在真 MySQL 上验证凭据：指向别的租户的销售入口被拒，scopes 为空数组或不是数组被拒，status 为 revoked 却没有 revoked_at 或 active 却有 revoked_at 被拒，状态只差大小写被拒
+      - 集成测试在真 MySQL 上验证令牌：两个令牌摘要相同被拒（即使属于不同租户），摘要不是 64 个小写十六进制字符被拒，令牌指向别的租户的凭据被拒
+      - 集成测试在真 MySQL 上验证安全事件与补的外键：未知事件类型被拒，有 credential_id 而无 tenant_id 被拒；幂等记录与流水的 credential_id 指向不存在或别的租户的凭据被拒，流水的 credential_id 为空可以
+      - CI 的迁移往返（upgrade、downgrade 到底、再 upgrade）与 alembic check 通过；集成测试经 tests/integration/conftest.py 的 migrated_engine 夹具升降迁移；已有的库存表测试若因新外键要先建凭据，补建凭据的夹具，并可把用例里写死的凭据 ID 换成夹具建好的（按用例需要建，同一租户可以有多个），不删用例、不改断言要验证的约束
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试与迁移检查由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/models/__init__.py
+      - app/models/service_auth.py
+      - app/models/inventory.py
+      - alembic/env.py
+      - alembic/versions/20261113_0003_service_auth.py
+      - tests/integration/conftest.py
+      - tests/integration/test_inventory_schema.py
+      - tests/integration/test_service_auth_schema.py
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-006
+    title: 实现请求 ID、错误封装、请求体解析与大小限制等共用请求处理
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.6 的 7.1、8.1 与 8.3，在接口层实现所有接口共用、与鉴权无关的请求处理，格式规则调用 CORE-TASK-004 的纯函数。
+      一，请求 ID：每个请求校验或生成 X-Request-ID，每个响应（含错误与 healthz、readyz）都带这个头，响应体的 request_id 与它相同；
+      X-Request-ID 不合格时 400，这个响应带 Core 生成的 ID；healthz 与 readyz 不校验，不合格时改用生成的 ID；路由 404 与 405 的响应在提供的 ID 合格时回显，否则用生成的。
+      二，错误封装：成功体为 data 加 request_id，错误体为 error（code、message、retryable、details）加 request_id；接口层统一的业务异常带状态码、错误码、是否可重试、details，并可附带响应头（如 Retry-After）；
+      未知路由 404 NOT_FOUND，方法不对 405 METHOD_NOT_ALLOWED，未处理的异常 500 INTERNAL_ERROR（retryable 为 true）且响应体不含异常文本与内部信息。
+      三，请求大小：请求体超过 128 KiB 为 413 REQUEST_TOO_LARGE，先按 Content-Length 判断，没有时按实际读到的字节数。
+      四，请求体：按契约 8.1 第 7 步，接口声明有没有请求体：没有请求体的接口收到空请求体跳过本步、收到非空请求体 422；有请求体的接口请求体为空或 Content-Type 不是 application/json 为 422（只比较媒体类型、不分大小写，允许带 charset 等参数）；然后分三小步，先解析 JSON（不是合法 JSON——含不是 UTF-8 的字节、带 UTF-8 BOM、Content-Type 的 charset 不是 utf-8、整数位数超过 Python 解析上限——、顶层不是对象、重复的键、带小数点或指数的数、NaN 与 Infinity、含孤立代理项的字符串都 422 INVALID_REQUEST），
+      再查请求体模型声明的批量数组长度（各最多 100 个元素，超过 413；字段不是数组时不计数），最后做字段校验 422（未知字段、类型与取值、lines 中重复的 line_ref；类型严格匹配，整数字段不接受字符串与布尔，不做转换）；
+      提供请求体模型的基类（禁止未知字段、可声明批量数组）与解析依赖，供之后的接口与幂等执行器取得原始 JSON 解析结果算摘要。
+      五，进程日志：每个请求结束时写一行结构化日志（方法、不含查询串的路径、状态码、X-Request-ID、截断到 200 字符的 User-Agent、耗时），不记 Authorization 头、令牌与请求体（契约 7.2、8.1）。
+      六，检查顺序：本任务实现契约 8.1 十步里的第 1、2、3、7 步，并在第 3 步与第 7 步之间留出鉴权、scope、其他请求头的位置（下一任务接入），一个请求只报最先遇到的错误。
+      本任务不新增任何业务接口；集成测试在测试里给 create_app 返回的应用挂测试专用路由来验证。明确不做：鉴权、授权、安全事件（下一任务）、幂等执行器、命令行、限流。
+    status: ready
+    depends_on:
+      - CORE-TASK-004
+    acceptance_criteria:
+      - 新代码放 app/api 下 allowed_change_paths 所列的文件，在 app/main.py 里挂上中间件与异常处理；healthz 与 readyz 原有返回体不变，只多 X-Request-ID 头
+      - 集成测试验证请求 ID：回显合格的 X-Request-ID、没带时生成 req_ 加 ULID、非法时 400 且响应带生成的 ID、healthz 带非法 ID 时照常 200 并带生成的 ID、404 与 405 的回显规则；未知路径带非法请求 ID 或超过 128 KiB 的请求体时得 404（第 1 步先于第 2、3 步）
+      - 集成测试验证错误封装：成功体与错误体的形状，未知路由 404、方法不对 405，测试路由抛出未处理异常时 500 且响应体不含异常文本
+      - 集成测试验证请求体：非法 JSON、顶层为数组、重复的键、浮点数、NaN、孤立代理项、未知字段、重复 line_ref、整数字段传字符串或布尔、有请求体的接口收到空请求体或非 JSON 的 Content-Type、没有请求体的接口收到非空请求体都为 422，没有请求体的接口收到空请求体正常；超过 128 KiB（有与没有 Content-Length 各一例）与批量数组 101 个元素为 413，100 个可以；lines 不是数组时 422 而不是 413；101 个元素且含未知字段时得 413
+      - 测试路由能取得请求体的原始 JSON 解析结果（不补默认值）；业务异常附带的响应头出现在响应里；每个请求写一行进程日志，含请求 ID 与截断后的 User-Agent，不含 Authorization 头与请求体
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/main.py
+      - app/api/__init__.py
+      - app/api/errors.py
+      - app/api/requests.py
+      - tests/integration/conftest.py
+      - tests/integration/test_api_requests.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-007
+    title: 实现鉴权、scope、角色与池授权的依赖及安全事件记录
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.6 的 7.2、8.1 与第 10 节第 3、4 条，在接口层实现鉴权与授权，规则调用 CORE-TASK-004 的纯函数，表用 CORE-TASK-005 的模型，
+      请求处理与错误封装用 CORE-TASK-006 的。
+      一，鉴权依赖：除 healthz、readyz 外，解析 Authorization 头，按摘要查令牌，并在同一条查询里联查凭据、租户、销售入口与入口绑定的池，截止时间按数据库时间比较；
+      令牌不存在、已吊销、已到截止时间、凭据已吊销、租户已停用，与头缺少或格式不对一样，一律 401 UNAUTHORIZED、同一个错误体；每个请求都查库、不缓存；
+      成功时给出租户、凭据、销售入口与它绑定的池（入口已停用时视同没有入口）、scope。鉴权与授权查库时数据库不可用为 503 UNAVAILABLE（还没进入幂等，确定未生效，契约 8.3），不是 500。
+      二，授权依赖：接口声明要求的 scope，缺少时 403 FORBIDDEN；其他请求头格式（Idempotency-Key 在写接口必带、操作者头）不对为 400；
+      接口声明接受的角色（可以按请求体里的动作决定），要求角色却没带操作者头为 400，角色不被接受为 403；池授权按契约 10.4 的三类与顺序返回 403 或 404，
+      按对象判定时由接口提供查对象所属池的函数；404 按契约 8.3 用 POOL_NOT_FOUND 或该对象的错误码，对象不存在与属于别的租户时错误码与 message 完全相同。
+      三，接入检查顺序：放在 CORE-TASK-006 留出的位置，按契约 8.1 第 4、5、6 步在请求体之前，第 8、9 步在请求体之后；一个请求只报最先遇到的错误。
+      四，安全事件：401、403 与跨租户 404 各写一条，按契约 7.2 在返回响应前、业务事务之外另开短事务写入（用处理请求的连接，还没取连接就从池里取一个），
+      写入失败只记进程日志，不改变响应；字段与补充说明的内容按契约 7.2（401 的内部原因只记在事件里、不进响应；403 记被拒类别及缺的 scope、被拒的角色或请求的池），两个操作者头都带且都合格时才记操作者；请求路径超过 512 字符时截断到 512 再记；同时有几种 401 原因时，按令牌不存在、令牌已吊销、令牌已到截止时间、凭据已吊销、租户已停用的顺序记第一种；不记 Authorization 头、令牌与请求体，路径不含查询串，User-Agent 截断到 200 字符。
+      提供写安全事件的服务函数（可传入已有连接），供之后的幂等执行器、业务引用冲突与命令行复用。
+      本任务不新增任何业务接口；集成测试给应用挂测试专用路由来验证。明确不做：幂等执行器（下一任务）、命令行、限流、到期清理。
+    status: ready
+    depends_on:
+      - CORE-TASK-005
+      - CORE-TASK-006
+    acceptance_criteria:
+      - 新代码放 app/api 与 app/services 下 allowed_change_paths 所列的文件；healthz 与 readyz 不要求鉴权
+      - 集成测试在真 MySQL 上验证鉴权：缺头、方案名错、令牌格式不对、令牌不存在、令牌已吊销、令牌已到截止时间、凭据已吊销、租户已停用都得同样的 401 错误体；同一凭据的两个令牌在轮换重叠期内都能通过，旧令牌到截止时间后 401
+      - 集成测试验证授权：缺 scope 为 403；合并类接口缺两个 scope 之一为 403；写接口缺 Idempotency-Key 为 400；要求角色的接口缺操作者头为 400、角色不被接受为 403、按请求体动作定角色时同一接口两种动作结果不同；池授权按 pool_id 与按对象两类的每个分支，入口已停用时 403；第二租户的凭据看不到第一租户的池与对象，得 404
+      - 集成测试验证数据库不可用时鉴权得 503 UNAVAILABLE（例如让测试应用连一个连不上的库）；验证检查顺序：鉴权失败且请求体非法得 401、缺 scope 且池属于别的租户得 403、请求体非法且角色不被接受得 422、未鉴权的大请求得 413
+      - 集成测试验证安全事件：401、403、跨租户 404 各写一条，字段与补充说明按契约 7.2（每种 401 原因记对、响应体不含原因），只带一个操作者头时不记操作者，不含令牌与请求体；不存在与跨租户的 404 响应完全相同；业务事务回滚时安全事件仍在；让安全事件写入失败时响应不变
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/main.py
+      - app/api/requests.py
+      - app/api/auth.py
+      - app/services/__init__.py
+      - app/services/security_events.py
+      - tests/integration/conftest.py
+      - tests/integration/test_api_auth.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-008
+    title: 实现通用幂等执行器，含命名锁、重放、冲突与结果保存
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.6 的 7.1 与 8.3，实现所有 /v1 写命令共用的幂等执行器，规则调用 CORE-TASK-004 的纯函数，请求处理与错误封装用 CORE-TASK-006 的，鉴权、授权与写安全事件的函数用 CORE-TASK-007 的。
+      执行顺序：契约 8.1 第 1 到 9 步都在执行器之前完成，它们的拒绝不保存。写接口声明固定的操作类型。
+      执行器用处理请求的连接（鉴权等前几步用过的连接，先结束它上面的事务），在没有打开事务时按 7.1 取命名锁（等待 0）：返回 0 为 409 REQUEST_IN_PROGRESS 加 Retry-After 为 1，返回 NULL 为 503 UNAVAILABLE，都不写任何东西；
+      返回 1 之后才在同一连接上开事务，按作用域查幂等记录：摘要相同则原样重放原状态码与原响应体，加 Idempotency-Replayed 为 true，X-Request-ID 头是本次的；
+      摘要不同为 409 IDEMPOTENCY_CONFLICT，不产生变化，并写一条安全事件；没有记录则在同一事务里执行命令并写幂等记录后提交。
+      命令成功时，幂等记录与命令的写入同一事务提交；命令以业务 4xx 拒绝时默认撤销命令的全部写入、只保存幂等记录；
+      命令可以声明被拒时仍要保留的写入（契约 7.1，如 5.2 的晚到支付转待审），这些写入与幂等记录同一事务提交；
+      命令抛出未处理异常或数据库错误时回滚、不保存，返回 500 INTERNAL_ERROR。写幂等记录撞上唯一约束时回滚命令，另开事务读出已有记录，按重放或冲突返回，
+      得到冲突时照常写幂等冲突事件，被回滚的命令登记的安全事件丢弃；命令抛出未处理异常时，它在异常之前登记的事件照样在回滚并释放锁之后写入（契约 7.2：有业务事务的事件在事务结束后写），同键重试再登记的会再写一次。
+      无论结果如何，最后在同一连接上执行 RELEASE_ALL_LOCKS；释放出错或连接已坏时把连接从连接池作废，不放回池里。
+      安全事件：命令在事务里发现的安全事件（跨租户 404、业务引用冲突）交给执行器暂存，与幂等冲突的事件一样，在事务结束并释放锁之后用同一连接写，
+      连接已作废时从池里另取一个（契约 7.2）；重放时不再写。执行器提供命令登记这类事件的方法。
+      保存的响应体就是首次返回的完整响应体（含当时的 request_id）。本任务不新增业务接口；集成测试给应用挂测试专用的写路由，命令在事务里插一行可观察的数据。
+      明确不做：业务引用层的去重（随各命令做）、限流、到期清理、命令行。
+    status: ready
+    depends_on:
+      - CORE-TASK-007
+    acceptance_criteria:
+      - 执行器放 app/services/idempotency.py；写接口怎么声明操作类型、怎么接入执行器在模块文档里写明，供之后的命令任务照用
+      - 集成测试在真 MySQL 上验证：首次成功写入命令数据与幂等记录；同键同内容重放得到相同状态码与响应体并带 Idempotency-Replayed 头，命令数据不重复；请求体键序不同仍算同内容
+      - 集成测试验证：同键不同内容为 409 IDEMPOTENCY_CONFLICT，命令数据不变并写了安全事件；命令登记的安全事件在命令成功、以业务 4xx 被拒或抛异常时都在事务结束后写入，撞唯一约束被回滚时丢弃，重放时不写；换操作类型或换凭据用同一个键互不影响；同一凭据轮换后用新令牌、同一个键重试得到重放
+      - 集成测试验证：测试先在另一个连接上持有同一锁名，请求得到 409 REQUEST_IN_PROGRESS 与 Retry-After 为 1，且没有写幂等记录；锁释放后同键重试正常执行
+      - 集成测试验证：命令以业务 4xx 拒绝时命令数据回滚、幂等记录保存了该 4xx，同键重试重放 4xx、换新键可以重新执行；声明了被拒仍保留的写入时，这些写入与幂等记录都在；命令抛异常时返回 500、命令数据与幂等记录都没有，同键重试会重新执行；鉴权或格式被拒的请求没有幂等记录，改正后同键可以执行
+      - 集成测试验证：每个请求结束后命名锁已释放（另一个连接能取到同名锁），包括命令抛异常的请求；写幂等记录撞唯一约束时返回重放或冲突而不是 5xx（测试在执行器查完幂等记录之后、写入之前，从另一个连接绕过锁提交一条同键记录，例如经测试命令里的钩子）
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/idempotency.py
+      - app/api/requests.py
+      - tests/integration/conftest.py
+      - tests/integration/test_idempotency.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
