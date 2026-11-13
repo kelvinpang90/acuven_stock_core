@@ -4,28 +4,34 @@
 
 子命令模块只 import 本模块、不 import __main__，并提供 register(subparsers)：给每个子命令
 set_defaults(handler=...)。handler 收到同一事务里的连接与解析好的参数，返回要输出的 JSON 对象；
+参数里另有 args.core_env，即 CORE_ENV。改变权限的命令返回 Audited：
+提交之后另开短事务写它的安全事件（契约 7.2）。
 校验不过就抛 CliError，事务回滚、什么也不写。
 
 退出码与输出约定：
-- 0：成功，向标准输出写一行 JSON；
+- 0：成功，向标准输出写一行 JSON；安全事件没写进去时另向标准错误写一行警告，操作照样算成功；
 - 2：参数或校验错误，向标准错误写一行说明；
 - 1：数据库未配置、连不上等其他失败，向标准错误写一行说明。
 所有说明都不含连接串、密码、堆栈与运维传入的参数值（误传的明文令牌不会被打出来）。
 """
 
 import json
+import logging
 import unicodedata
 from argparse import Namespace
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, TextIO
 
-from sqlalchemy import Connection, Row, select
+from sqlalchemy import Connection, Engine, Row, select
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from app.config import Settings
 from app.db import make_engine
 from app.models.catalog import Tenant
 from app.models.inventory import SalesChannel
+from app.services.security_events import SecurityEventRecord, record_security_event
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -34,7 +40,19 @@ EXIT_USAGE = 2
 ACTIVE = "active"
 MAX_NAME_LENGTH = 200
 
-Handler = Callable[[Connection, Namespace], dict[str, Any]]
+# record_security_event 写入失败时自己记一行带堆栈的异常；命令行只报自己的一行警告。
+SECURITY_EVENTS_LOGGER = "app.services.security_events"
+
+
+@dataclass(frozen=True)
+class Audited:
+    """改变权限的命令的结果：payload 是要输出的 JSON 对象，event 在业务事务提交之后写。"""
+
+    payload: dict[str, Any]
+    event: SecurityEventRecord
+
+
+Handler = Callable[[Connection, Namespace], dict[str, Any] | Audited]
 
 
 class CliError(Exception):
@@ -96,10 +114,41 @@ def require_channel(conn: Connection, tenant_id: str, channel_id: str, *, active
     return channel
 
 
+@contextmanager
+def quiet_security_event_log() -> Iterator[None]:
+    """在一次入口函数调用期间关掉安全事件的进程日志，返回前恢复原状。
+
+    写入失败时命令行自己报一行警告（write_audit_event），那行带堆栈的日志不能再进标准错误。
+    要设 disabled：这个日志器没有处理器，只关 propagate 时记录落到 logging.lastResort，
+    堆栈照样写进标准错误。
+    """
+    logger = logging.getLogger(SECURITY_EVENTS_LOGGER)
+    disabled = logger.disabled
+    logger.disabled = True
+    try:
+        yield
+    finally:
+        logger.disabled = disabled
+
+
+def write_audit_event(engine: Engine, event: SecurityEventRecord, stderr: TextIO) -> None:
+    """业务事务提交之后另开短事务写事件；写不进去不改变结果，只报一行警告供运维手工补记。"""
+    if record_security_event(event, engine=engine):
+        return
+    targets = [f"type={event.event_type}", f"credential={event.credential_id}"]
+    token_id = (event.details or {}).get("token_id")
+    if token_id is not None:
+        targets.append(f"token={token_id}")
+    stderr.write(
+        f"warning: security event not written ({', '.join(targets)}); "
+        "the operation succeeded, record the event manually\n"
+    )
+
+
 def run_command(
     settings: Settings, handler: Handler, args: Namespace, stdout: TextIO, stderr: TextIO
 ) -> int:
-    """一个命令一个数据库事务：handler 抛错时回滚，提交成功后才输出结果。"""
+    """一个命令一个数据库事务：handler 抛错时回滚，提交成功后才写安全事件、输出结果。"""
     if not settings.database_url:
         fail(stderr, "database not configured (CORE_DATABASE_URL is empty)")
         return EXIT_FAILURE
@@ -108,24 +157,29 @@ def run_command(
     except Exception:
         fail(stderr, "database configuration is invalid")
         return EXIT_FAILURE
+    args.core_env = settings.env
     try:
-        with engine.begin() as conn:
-            payload = handler(conn, args)
-    except CliError as error:
-        fail(stderr, error.message)
-        return error.exit_code
-    except OperationalError:
-        # 提交途中断开时不确定有没有写入，所以不说「什么也没写」。
-        fail(stderr, "database unavailable")
-        return EXIT_FAILURE
-    except SQLAlchemyError:
-        fail(stderr, "database error; nothing was written")
-        return EXIT_FAILURE
-    except Exception as error:
-        # 只给异常类名：异常文本可能带连接串或参数值。
-        fail(stderr, f"unexpected failure ({type(error).__name__}); nothing was written")
-        return EXIT_FAILURE
+        try:
+            with engine.begin() as conn:
+                result = handler(conn, args)
+        except CliError as error:
+            fail(stderr, error.message)
+            return error.exit_code
+        except OperationalError:
+            # 提交途中断开时不确定有没有写入，所以不说「什么也没写」。
+            fail(stderr, "database unavailable")
+            return EXIT_FAILURE
+        except SQLAlchemyError:
+            fail(stderr, "database error; nothing was written")
+            return EXIT_FAILURE
+        except Exception as error:
+            # 只给异常类名：异常文本可能带连接串或参数值。
+            fail(stderr, f"unexpected failure ({type(error).__name__}); nothing was written")
+            return EXIT_FAILURE
+        if isinstance(result, Audited):
+            write_audit_event(engine, result.event, stderr)
+            result = result.payload
     finally:
         engine.dispose()
-    write_json(stdout, payload)
+    write_json(stdout, result)
     return EXIT_OK

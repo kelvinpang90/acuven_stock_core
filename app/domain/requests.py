@@ -43,6 +43,11 @@ def _matches(pattern: re.Pattern, value) -> bool:
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
+def is_reference(value) -> bool:
+    """是不是第 1 节的引用格式（1–128 个 [A-Za-z0-9._:-]）；命令行的 --actor 也用它。"""
+    return _matches(_REF, value)
+
+
 def parse_idempotency_key(value: str | None) -> str:
     """写请求必带 Idempotency-Key：没带与不合格同样抛出。"""
     if not _matches(_IDEMPOTENCY_KEY, value):

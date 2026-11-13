@@ -9,7 +9,17 @@ import sys
 from collections.abc import Sequence
 from typing import NoReturn, TextIO
 
-from app.cli import EXIT_FAILURE, EXIT_OK, EXIT_USAGE, CliError, fail, provisioning, run_command
+from app.cli import (
+    EXIT_FAILURE,
+    EXIT_OK,
+    EXIT_USAGE,
+    CliError,
+    fail,
+    provisioning,
+    quiet_security_event_log,
+    run_command,
+    service_auth,
+)
 from app.config import Settings
 
 
@@ -37,19 +47,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="python -m app.cli", description="Acuven Stock Core operator commands")
     subparsers = parser.add_subparsers(dest="command", required=True)
     provisioning.register(subparsers)
+    service_auth.register(subparsers)
     return parser
 
 
 def main(argv: Sequence[str], settings: Settings, stdout: TextIO, stderr: TextIO) -> int:
-    try:
-        args = build_parser().parse_args(list(argv))
-    except _HelpRequested as help_requested:
-        stdout.write(help_requested.text)
-        return EXIT_OK
-    except CliError as error:
-        fail(stderr, error.message)
-        return EXIT_USAGE
-    return run_command(settings, args.handler, args, stdout, stderr)
+    # 日志配置只在这一次调用期间生效，返回前恢复，不影响同一进程里的其他代码。
+    with quiet_security_event_log():
+        try:
+            args = build_parser().parse_args(list(argv))
+        except _HelpRequested as help_requested:
+            stdout.write(help_requested.text)
+            return EXIT_OK
+        except CliError as error:
+            fail(stderr, error.message)
+            return EXIT_USAGE
+        return run_command(settings, args.handler, args, stdout, stderr)
 
 
 def run_process() -> int:

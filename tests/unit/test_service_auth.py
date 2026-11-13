@@ -12,6 +12,7 @@ from app.domain.service_auth import (
     SCOPES,
     STOCK_READ,
     STOCK_WRITE,
+    InvalidOption,
     InvalidScopes,
     PoolDecision,
     authorize_pool,
@@ -20,8 +21,12 @@ from app.domain.service_auth import (
     is_token_format,
     is_token_usable,
     parse_authorization,
+    parse_overlap_hours,
+    parse_reason,
+    rotation_deadline,
     scopes_cover,
     token_digest,
+    tokens_to_expire,
     validate_issued_scopes,
 )
 
@@ -211,6 +216,101 @@ class IssuedScopesTest(unittest.TestCase):
         # 运维接口用独立凭据：不能顺带有业务 scope，也不能带销售入口。
         self.assert_rejected([OPS_READ, STOCK_READ], False)
         self.assert_rejected([OPS_READ], True)
+
+
+class ReasonTest(unittest.TestCase):
+    def assert_rejected(self, value):
+        with self.assertRaises(InvalidOption) as caught:
+            parse_reason(value)
+        # 消息原样写到标准错误，不能带传入的值。
+        self.assertNotIn(value.strip() or "\x00", str(caught.exception))
+
+    def test_length_boundaries_after_trimming(self):
+        self.assertEqual(parse_reason("r"), "r")
+        self.assertEqual(parse_reason("r" * 500), "r" * 500)
+        self.assertEqual(parse_reason("  " + "r" * 500 + "\t"), "r" * 500)
+        self.assert_rejected("r" * 501)
+        self.assert_rejected("")
+        self.assert_rejected("   ")
+
+    def test_counts_characters_not_bytes(self):
+        self.assertEqual(parse_reason("原" * 500), "原" * 500)
+        self.assert_rejected("原" * 501)
+
+    def test_surrounding_spaces_are_trimmed(self):
+        self.assertEqual(parse_reason("  rotate before launch \n"), "rotate before launch")
+
+    def test_must_be_a_single_line_without_control_characters(self):
+        # 原因记进安全事件：多行或带控制字符的原因会让审计记录难以阅读、可被伪造成多条。
+        for bad in ("\n", "\r", "\t", "\x07", "\x7f", " ", " ", "\udc80"):
+            with self.subTest(char=bad):
+                self.assert_rejected(f"leaked{bad}token")
+
+
+class OverlapHoursTest(unittest.TestCase):
+    def assert_rejected(self, value):
+        with self.assertRaises(InvalidOption):
+            parse_overlap_hours(value)
+
+    def test_boundaries(self):
+        # 0 即刻失效；168 小时是契约的上限 7 天。
+        self.assertEqual(parse_overlap_hours("0"), 0)
+        self.assertEqual(parse_overlap_hours("24"), 24)
+        self.assertEqual(parse_overlap_hours("168"), 168)
+        self.assert_rejected("169")
+        self.assert_rejected("999")
+
+    def test_negative_numbers_are_rejected(self):
+        for bad in ("-1", "-0", "-168"):
+            with self.subTest(value=bad):
+                self.assert_rejected(bad)
+
+    def test_non_integers_are_rejected(self):
+        # int() 能接受的空格、正号与全角数字也不收：运维写错时报错，而不是猜。
+        for bad in ("", "1.5", "24.0", "1e2", "abc", " 24", "24 ", "+24", "２４", "0x10", "1_0"):
+            with self.subTest(value=bad):
+                self.assert_rejected(bad)
+
+    def test_long_digit_strings_are_rejected(self):
+        self.assert_rejected("0" * 5000 + "1")
+        self.assert_rejected("9" * 5000)
+
+
+T = datetime(2026, 11, 13, 8, 0)
+
+
+class RotationTest(unittest.TestCase):
+    def test_deadline_is_the_rotation_moment_plus_the_overlap(self):
+        self.assertEqual(rotation_deadline(T, 24), T + timedelta(hours=24))
+        self.assertEqual(rotation_deadline(T, 0), T)
+        self.assertEqual(rotation_deadline(T, 168), T + timedelta(days=7))
+
+    def test_contract_example(self):
+        # 令牌 A 无截止时间，在 T 以 24 小时轮换得 B：A 的截止时间为 T + 24h。
+        first_deadline = rotation_deadline(T, 24)
+        self.assertEqual(tokens_to_expire([("ctk_A", None)], first_deadline), ["ctk_A"])
+        self.assertEqual(first_deadline, T + timedelta(hours=24))
+
+        # T + 1h 再以 0 小时轮换得 C：A 与 B 的截止时间都改为 T + 1h，即刻失效。
+        second_deadline = rotation_deadline(T + timedelta(hours=1), 0)
+        others = [("ctk_A", first_deadline), ("ctk_B", None)]
+        self.assertEqual(tokens_to_expire(others, second_deadline), ["ctk_A", "ctk_B"])
+        self.assertEqual(second_deadline, T + timedelta(hours=1))
+
+    def test_an_earlier_deadline_is_not_pushed_back(self):
+        # 已更早到期（或更早截止）的旧令牌不动：轮换不能延长旧令牌的寿命。
+        deadline = rotation_deadline(T, 24)
+        others = [
+            ("ctk_expired", T - timedelta(hours=1)),
+            ("ctk_sooner", T + timedelta(hours=2)),
+            ("ctk_same", deadline),
+            ("ctk_later", deadline + timedelta(microseconds=1)),
+            ("ctk_open", None),
+        ]
+        self.assertEqual(tokens_to_expire(others, deadline), ["ctk_later", "ctk_open"])
+
+    def test_no_other_tokens(self):
+        self.assertEqual(tokens_to_expire([], rotation_deadline(T, 24)), [])
 
 
 class PoolAuthorizationTest(unittest.TestCase):

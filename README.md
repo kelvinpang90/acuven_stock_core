@@ -18,9 +18,9 @@
 
 开发任务清单与 OpenClaw 计划见 [docs/TODO.md](docs/TODO.md)；项目规则见 [CLAUDE.md](CLAUDE.md)（与 `AGENTS.md` 同一内容）。
 
-## 运维命令行（开通租户、地点、库存池与销售入口）
+## 运维命令行（开通租户、地点、库存池与销售入口；服务凭据与令牌）
 
-Core 没有 HTTP 管理接口（契约第 10 节第 4 条），租户、地点、库存池与销售入口只能由运维在服务器上、在运行中的 Core 容器里用 `python -m app.cli` 建。
+Core 没有 HTTP 管理接口（契约第 10 节第 4 条），租户、地点、库存池与销售入口只能由运维在服务器上、在运行中的 Core 容器里用 `python -m app.cli` 建；服务凭据的签发、轮换与吊销也只走这里。
 命令用容器里已有的 `CORE_ENV` 与 `CORE_DATABASE_URL`（与服务同一个数据库账号）。写法同 [deploy/healthcheck.sh](deploy/healthcheck.sh)：按 compose 标签找到容器，再 `docker exec`：
 
 ```bash
@@ -43,6 +43,32 @@ docker exec "$container" python -m app.cli show --tenant ten_…
   数据库未配置、连不上等其他失败标准错误一行说明、退出码 1。一个命令一个事务，失败时什么也不写。
 - 新库存池的状态是 `initializing`（期初只在这个状态可用）；V1 每租户建一个地点、一个池、一个入口，命令行不另加数量限制，由运维照做。
   命令行只建不改：停用、改名、删除与库存池切 `live` 不在这里。
+
+### 服务凭据与令牌
+
+```bash
+docker exec "$container" python -m app.cli credential issue --tenant ten_… --name "Demo shop" \
+    --channel chan_… --scope catalog.read --scope stock.read --scope orders.write \
+    --actor ops-7 --reason "Demo shop launch"
+docker exec "$container" python -m app.cli credential rotate --credential cred_… --overlap-hours 24 \
+    --actor ops-7 --reason "Scheduled rotation"
+docker exec "$container" python -m app.cli token revoke --token ctk_… --actor ops-7 --reason "Token leaked"
+docker exec "$container" python -m app.cli credential revoke --credential cred_… --actor ops-7 --reason "Shop retired"
+docker exec "$container" python -m app.cli credential list --tenant ten_…
+```
+
+- 会改变权限的四个子命令（`credential issue`、`credential rotate`、`token revoke`、`credential revoke`）都必须带 `--actor` 与 `--reason`：
+  `--actor` 是运维人员标识（1 到 128 个字母、数字或 `.` `_` `:` `-`，不写姓名与邮箱）；`--reason` 去首尾空格后 1 到 500 个字符、单行。
+- **明文令牌只显示一次**：`credential issue` 与 `credential rotate` 成功时，标准输出的那行 JSON 里的 `token` 是唯一一次出现，
+  库里只存摘要，安全事件、报错与日志里都没有。把它直接交给调用方的配置，不要另存文件；输出丢了就用 `token revoke` 吊销那个令牌（`ctk_` 开头的令牌 ID），再轮换一次。
+- `credential issue`：租户与销售入口（可选）须为 active 且入口属于该租户；`--scope` 可重复，须是已知值且不重复，`ops.read` 只能单独出现且不带入口。
+  `CORE_ENV=production` 时拒绝带 `demo.reset` 的凭据（轮换也拒绝）。签发后 scope 与入口不能改：要改就签发新凭据、吊销旧的。
+- `credential rotate`：签发新令牌；`--overlap-hours` 是 0 到 168 的整数，该凭据其余未吊销的令牌截止时间改为「轮换时刻 + 重叠小时数」
+  （已更早到期的不动）。0 表示旧令牌即刻失效。
+- `token revoke` 与 `credential revoke` 立即生效、不可撤销；凭据吊销后它的所有令牌都失效。`--token` 收令牌 ID，误传 `csk_` 开头的明文令牌会被拒绝。
+- `credential list` 只读：列出该租户的凭据与各自令牌的 ID、创建、截止与吊销时间，不输出摘要。
+- 每次成功的签发、轮换与吊销在提交后记一条安全事件（操作者、原因、目标凭据与令牌 ID）。事件写入失败时操作照样生效、退出码 0，
+  标准错误多一行 `warning: security event not written (...)`，带操作类型与目标 ID，请据此手工补记审计。
 
 ## 网店单卖与加购 Inventory 的建议连接方式
 

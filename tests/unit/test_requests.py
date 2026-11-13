@@ -7,6 +7,7 @@ from app.domain.requests import (
     REQUEST_ID,
     Actor,
     InvalidHeader,
+    is_reference,
     parse_actor,
     parse_idempotency_key,
     parse_request_id,
@@ -109,6 +110,29 @@ class ActorTest(HeaderErrorMixin, unittest.TestCase):
         for bad in (" stock_admin", "stock_admin ", "", "shop_admin"):
             with self.subTest(role=bad):
                 self.assert_invalid(ACTOR_ROLE, parse_actor, "u1", bad)
+
+
+class ReferenceTest(unittest.TestCase):
+    def test_length_boundaries(self):
+        self.assertTrue(is_reference("a"))
+        self.assertTrue(is_reference("a" * 128))
+        self.assertFalse(is_reference(""))
+        self.assertFalse(is_reference("a" * 129))
+
+    def test_reference_characters_are_accepted(self):
+        self.assertTrue(is_reference("ops:admin_7.on-call"))
+
+    def test_other_characters_are_rejected(self):
+        # 命令行的 --actor 记进安全事件：邮箱（带 @）与带空格的姓名都不合格。
+        for bad in (*OUT_OF_RANGE, "/", "+", "=", "@"):
+            with self.subTest(char=bad):
+                self.assertFalse(is_reference(f"ops{bad}7"))
+        self.assertFalse(is_reference(" ops"))
+
+    def test_non_strings_are_rejected(self):
+        for bad in (None, 7, b"ops"):
+            with self.subTest(value=bad):
+                self.assertFalse(is_reference(bad))
 
 
 class UserAgentTest(unittest.TestCase):
