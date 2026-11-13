@@ -668,7 +668,7 @@ tasks:
       - CORE-TASK-013
     acceptance_criteria:
       - 规则放 app/domain/catalog_imports.py，只 import 标准库与 app/domain 内的模块；单元测试放 tests/unit/test_catalog_imports.py
-      - 单元测试覆盖字段：缺必填字段、多出字段、类型不对、引用格式不对都为 invalid_format 并带出错字段名；barcode 与 reference_price 不带或为 null 可以
+      - 单元测试覆盖字段：缺必填字段、多出字段、类型不对、引用格式不对都为 invalid_format 并带出错字段名；barcode 与 reference_price 不带或为 null 可以；invalid_fields 按 purpose 第一条：多出几个字段都只记一次 unknown_field、external_ref 重复记 external_ref、同组名称不一致记 product_name、与行内错误合并去重、按固定顺序排列
       - 单元测试覆盖顺序与细则：external_ref 重复的各行 invalid_format；同组 product_name 去空白后不一致时组内各行 invalid_format，且只在合规名称之间比较；sku_code 只差大小写的两行都 duplicate_sku_code；非空条码重复为 duplicate_barcode，两个 null 条码不算重复；invalid_format 的行与另一行编码相同时另一行仍可为 ok；一行同时请求内重复且与现有冲突时取 duplicate_sku_code
       - 单元测试覆盖 conflicts_existing（编码在归属集合里，含退役编码与只差大小写；条码在条码集合里）与 group_blocked（组内一行不合格其余合格行为 group_blocked；product_ref 不合规的行不归任何组、不连累别的行）
       - 单元测试覆盖汇总计数与确认计划：两组都 ok 时按首次出现顺序建；一组重查有冲突时冲突行 failed conflicts_existing、同组别的行 failed group_blocked、别的组照建；预览不合格的行 skipped 并带预览结果；全部组都冲突时仍给出完整的逐行结果
@@ -811,7 +811,7 @@ tasks:
       name 或 sku_code 为 null 422；barcode、reference_price 为 null 是清空；其他字段（status、product_id、merged_into_sku_id 等）是未知字段，422。
       在事务里用 SELECT FOR UPDATE 按 ID 读要改的行，依次判定：不存在 404 PRODUCT_NOT_FOUND 或 SKU_NOT_FOUND，属于别的租户时响应完全相同并经执行器登记 cross_tenant；
       已合并的 SKU 不是“只清空条码”的修改时 409 SKU_MERGED；版本不符 409 VERSION_CONFLICT，details.current_version 为当前版本；按 CORE-TASK-013 算改动字段，全都相同时返回 200 与当前表示，
-      不加版本、不写变更记录与编码历史；改动的编码或条码与别的 SKU 冲突时 409（同 CORE-TASK-017，冲突项不带 index）；万一写入仍撞上唯一约束，按撞上的约束报 409、不返回 500：撞 skus 的编码唯一约束为 SKU_CODE_TAKEN，撞条码唯一约束为 BARCODE_TAKEN，撞归属表主键时在同一事务里按 CORE-TASK-013 的编码归属判定重查归属 SKU 及其当前编码，定 SKU_CODE_TAKEN 或 SKU_CODE_RETIRED，details.conflicts 只列撞上的那一项；否则写入：改字段、版本加 1、updated_at 写数据库当前时间，
+      不加版本、不写变更记录与编码历史；改动的编码或条码与别的 SKU 冲突时 409（同 CORE-TASK-017，冲突项不带 index）；万一写入仍撞上唯一约束，按撞上的约束报 409、不返回 500：撞 skus 的编码唯一约束为 SKU_CODE_TAKEN，撞条码唯一约束为 BARCODE_TAKEN，撞归属表主键时在同一事务里用加锁读（SELECT FOR SHARE，直接查归属行与那个 SKU 的当前编码，不经测试会替换的冲突查询函数）重查，按 CORE-TASK-013 的编码归属判定定 SKU_CODE_TAKEN 或 SKU_CODE_RETIRED（重查仍找不到归属行时不猜码，抛出异常按 500 处理），details.conflicts 只列撞上的那一项；否则写入：改字段、版本加 1、updated_at 写数据库当前时间，
       写一条 product_updated 或 sku_updated，changes 只含改动字段。改了 sku_code 时照 2.2：按编码归属判定决定是否插入归属行，把旧值、新值、X-Actor-Ref 与正文 reason 写进 sku_code_history。
       inactive 的商品与 SKU 也可以改。返回 200 与改后的表示。
       二，停用与重新启用：没有请求体（非空请求体 422）。事务里 SELECT FOR UPDATE 读行；不存在与跨租户同上；重新启用已合并的 SKU 409 SKU_MERGED；已是目标状态时返回 200 与当前表示，
