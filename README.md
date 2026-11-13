@@ -18,6 +18,32 @@
 
 开发任务清单与 OpenClaw 计划见 [docs/TODO.md](docs/TODO.md)；项目规则见 [CLAUDE.md](CLAUDE.md)（与 `AGENTS.md` 同一内容）。
 
+## 运维命令行（开通租户、地点、库存池与销售入口）
+
+Core 没有 HTTP 管理接口（契约第 10 节第 4 条），租户、地点、库存池与销售入口只能由运维在服务器上、在运行中的 Core 容器里用 `python -m app.cli` 建。
+命令用容器里已有的 `CORE_ENV` 与 `CORE_DATABASE_URL`（与服务同一个数据库账号）。写法同 [deploy/healthcheck.sh](deploy/healthcheck.sh)：按 compose 标签找到容器，再 `docker exec`：
+
+```bash
+container="$(docker ps -q \
+    --filter label=com.docker.compose.project=acuven_stock_core \
+    --filter label=com.docker.compose.service=core_api)"
+docker exec "$container" python -m app.cli --help
+docker exec "$container" python -m app.cli tenant create --name "Demo Shop"
+docker exec "$container" python -m app.cli location create --tenant ten_… --name "Warehouse"
+docker exec "$container" python -m app.cli pool create --tenant ten_… --location loc_… --name "Main"
+docker exec "$container" python -m app.cli channel create --tenant ten_… --pool pool_… --name "Web shop"
+docker exec "$container" python -m app.cli show
+docker exec "$container" python -m app.cli show --tenant ten_…
+```
+
+- 不用 `docker compose exec`：它要展开 `docker-compose.yml` 里只由部署脚本设置的镜像变量，没有它直接报错。
+- 不用 `docker compose run`：新容器的输出经容器的日志驱动落盘，之后凭据签发打印的明文令牌会进日志。
+- 成功时标准输出一行 JSON（新对象的 ID 与字段；`show` 列出全部租户，或一个租户的地点、库存池与销售入口），退出码 0；
+  参数或校验错误（名称为空、超过 200 个字符或不是单行，租户不存在或已停用，地点或库存池不属于该租户，地点已停用，库存池已有销售入口等）标准错误一行说明、退出码 2；
+  数据库未配置、连不上等其他失败标准错误一行说明、退出码 1。一个命令一个事务，失败时什么也不写。
+- 新库存池的状态是 `initializing`（期初只在这个状态可用）；V1 每租户建一个地点、一个池、一个入口，命令行不另加数量限制，由运维照做。
+  命令行只建不改：停用、改名、删除与库存池切 `live` 不在这里。
+
 ## 网店单卖与加购 Inventory 的建议连接方式
 
 | 购买组合 | 网店的商品身份读取 | 网店的库存操作 | 数量权威 |
