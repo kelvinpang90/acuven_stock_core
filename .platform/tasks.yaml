@@ -264,7 +264,7 @@ tasks:
       令牌摘要全表唯一、不含 tenant_id，是契约第 10 节第 1 条写明的唯一例外。
       四，补外键：idempotency_records 的 tenant_id 加 credential_id 复合外键指向凭据；ledger_entries 的 tenant_id 加 credential_id（可空）复合外键指向凭据。
       超过 64 字符的约束名照先例由命名约定生成，迁移里用 op.f 引用。明确不做：鉴权、命令行、写安全事件的代码、到期清理；不改领域层与目录表。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-003
     acceptance_criteria:
