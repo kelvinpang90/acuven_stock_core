@@ -497,7 +497,7 @@ tasks:
       明文令牌只在事务提交之后向标准输出写一次（成功输出的 JSON 里），不落库、不进安全事件、不进标准错误与日志、不进异常信息；输出丢了就吊销那个令牌再轮换。
       在 README.md 的命令行一节补上这些子命令与令牌只显示一次的说明。
       明确不做：HTTP 管理接口、修改凭据的 scope 或入口（契约 10.4：要改就签发新凭据、吊销旧的）、恢复已吊销的对象、到期清理。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-009
     acceptance_criteria:
