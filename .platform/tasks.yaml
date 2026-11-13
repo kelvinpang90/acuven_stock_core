@@ -165,7 +165,7 @@ tasks:
       明确不做：服务凭据表与鉴权（下一任务，届时再给 credential_id 加外键）；业务引用唯一（随各自的预留、收货、盘点等事实表做）；
       预留、订单行累计、盘点单、outbox 与目录变更流的表；流水禁改禁删的触发器或权限；DEMO_RESET 在生产库被数据库拒绝的防护（6.1，随 Demo 重置任务做）。
       只做数据库层：不加接口、不写业务服务、不改领域层与目录表。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-002
     acceptance_criteria:
