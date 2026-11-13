@@ -1,14 +1,16 @@
 """服务凭据的令牌、scope 与池授权规则（契约 §8.1、§10 第 4 条）。
 
 这里只有不碰数据库的判断：按摘要查令牌、读凭据与租户状态由上层做，结果交给这里判定。
+运维命令行的 --reason、--overlap-hours 与轮换时选哪些旧令牌也在这里（app/cli/service_auth.py）。
 """
 
 import base64
 import hashlib
 import os
 import re
-from collections.abc import Collection, Sequence
-from datetime import datetime
+import unicodedata
+from collections.abc import Collection, Iterable, Sequence
+from datetime import datetime, timedelta
 from enum import StrEnum
 
 TOKEN_PREFIX = "csk_"
@@ -40,8 +42,20 @@ SCOPES = frozenset(
 )
 
 
+MAX_REASON_LENGTH = 500
+# 轮换的重叠期：旧令牌的截止时间不晚于轮换时刻后 7 天（契约第 10 节第 4 条）。
+MAX_OVERLAP_HOURS = 7 * 24
+# 只收 ASCII 数字：int() 还认全角数字、正负号与空格。三位以内，避开超长数字串。
+_OVERLAP_HOURS = re.compile(r"[0-9]{1,3}")
+_OVERLAP_HOURS_MESSAGE = f"overlap hours must be a whole number from 0 to {MAX_OVERLAP_HOURS}"
+
+
 class InvalidScopes(ValueError):
     """签发凭据时给的 scope 不合格（命令行拒绝签发）。"""
+
+
+class InvalidOption(ValueError):
+    """命令行的参数不合格；消息会写到标准错误，所以不带参数值。"""
 
 
 class PoolDecision(StrEnum):
@@ -137,6 +151,47 @@ def validate_issued_scopes(scopes: Sequence[str], *, has_channel: bool) -> froze
         if has_channel:
             raise InvalidScopes(f"a credential with {OPS_READ} cannot have a sales channel")
     return frozenset(scopes)
+
+
+def parse_reason(value: str) -> str:
+    """命令行的 --reason：去首尾空格后 1 到 500 个字符、单行、不含控制字符。"""
+    reason = value.strip()
+    if not reason:
+        raise InvalidOption("reason must not be empty")
+    if len(reason) > MAX_REASON_LENGTH:
+        raise InvalidOption(f"reason must be at most {MAX_REASON_LENGTH} characters")
+    # 与命令行的名称同一规则：Cc 含换行与制表符，Zl、Zp 是行与段分隔符，Cs 是孤立代理项。
+    if any(unicodedata.category(char) in ("Cc", "Zl", "Zp", "Cs") for char in reason):
+        raise InvalidOption("reason must be a single line without control characters")
+    return reason
+
+
+def parse_overlap_hours(value: str) -> int:
+    """命令行的 --overlap-hours：0 到 168 的整数（0 表示旧令牌即刻失效）。"""
+    if not isinstance(value, str) or not _OVERLAP_HOURS.fullmatch(value):
+        raise InvalidOption(_OVERLAP_HOURS_MESSAGE)
+    hours = int(value)
+    if hours > MAX_OVERLAP_HOURS:
+        raise InvalidOption(_OVERLAP_HOURS_MESSAGE)
+    return hours
+
+
+def rotation_deadline(rotated_at: datetime, overlap_hours: int) -> datetime:
+    """旧令牌的截止时间：数据库时间的轮换时刻加重叠小时数。"""
+    return rotated_at + timedelta(hours=overlap_hours)
+
+
+def tokens_to_expire(
+    others: Iterable[tuple[str, datetime | None]], deadline: datetime
+) -> list[str]:
+    """轮换时要把截止时间改成 deadline 的旧令牌 ID。
+
+    others 是该凭据其余未吊销的令牌 (token_id, expires_at)，不含这次签发的新令牌。
+    没有截止时间或截止时间晚于 deadline 的改；已更早到期的不动（不把截止时间往后推）。
+    """
+    return [
+        token_id for token_id, expires_at in others if expires_at is None or expires_at > deadline
+    ]
 
 
 def authorize_sales_command(granted_pool_id: str | None) -> PoolDecision:
