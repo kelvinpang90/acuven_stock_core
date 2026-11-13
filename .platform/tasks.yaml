@@ -439,7 +439,7 @@ tasks:
       再用 docker exec 在里面执行 python -m app.cli；写明不用 docker compose exec（要展开只由部署脚本设置的镜像变量，没有它直接报错）
       与 docker compose run（输出经容器的日志驱动落盘，下一任务的明文令牌会进日志）；不写主机名与服务器路径。
       明确不做：停用、改名、删除，库存池切 live，凭据与令牌（下一任务），HTTP 接口，新的配置项。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 命令行放 app/cli 下 allowed_change_paths 所列的文件，入口在 __main__.py、共用部分在 __init__.py，python -m app.cli 可执行；README.md 有执行方法一节，用按标签找容器再 docker exec 的写法
