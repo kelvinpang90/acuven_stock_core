@@ -1,30 +1,13 @@
 """目录表的约束在真 MySQL 上生效（契约 2.2、2.4 与第 10 节第 1 条）。
 
-这些规则由数据库兜底，服务层的 bug 也绕不过去。每个测试在一个事务里跑、结束时回滚；
-被拒的语句包在保存点里，并断言拒绝它的正是预期的那条约束，而不是碰巧别的错误。
+这些规则由数据库兜底，服务层的 bug 也绕不过去。连接夹具 db 与 assert_rejected_by 见 conftest。
 """
 
-from collections.abc import Iterator
-from uuid import uuid4
-
-import pytest
-from sqlalchemy import Connection, Engine, insert, update
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy import Connection, insert, update
 from sqlalchemy.sql.expression import Executable
 
 from app.models.catalog import Product, Sku, SkuCodeClaim, SkuCodeHistory, Tenant
-
-
-@pytest.fixture
-def db(migrated_engine: Engine) -> Iterator[Connection]:
-    with migrated_engine.connect() as conn:
-        conn.begin()
-        yield conn
-        conn.rollback()
-
-
-def new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid4().hex[:26].upper()}"
+from tests.integration.conftest import assert_rejected_by, new_id
 
 
 def add_tenant_with_product(db: Connection) -> tuple[str, str]:
@@ -59,12 +42,6 @@ def add_sku(db: Connection, tenant_id: str, product_id: str, **overrides: object
 
 def sku_update(sku_id: str, **values: object) -> Executable:
     return update(Sku).where(Sku.sku_id == sku_id).values(values)
-
-
-def assert_rejected_by(db: Connection, statement: Executable, constraint: str) -> None:
-    with pytest.raises(DBAPIError) as caught, db.begin_nested():
-        db.execute(statement)
-    assert constraint in str(caught.value.orig)
 
 
 def test_sku_code_is_unique_within_a_tenant(db: Connection):
