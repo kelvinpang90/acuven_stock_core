@@ -583,7 +583,8 @@ tasks:
       （SKU 事件的 object_id 与 product_id 的对应由服务层保证）；version 为 INT 非空且不小于 1；changes 为 JSON 非空，检查约束要求是对象；credential_id 非空，以复合外键指向同租户的凭据；
       actor_ref 非空；actor_role 为 VARCHAR(32) utf8mb4_bin 非空；reason 为 VARCHAR(500) 可空；import_id 可空，非空时以复合外键指向同租户的导入；request_id 非空；idempotency_key 非空；created_at。
       索引 (tenant_id, id) 与 (tenant_id, object_id, id)。没有 updated_at。
-      超过 64 字符的约束名照先例由命名约定生成，迁移里用 op.f 引用。明确不做：写这两张表的代码、目录写锁、接口；不改已有表。
+      超过 64 字符的约束名照先例由命名约定生成，迁移里用 op.f 引用。catalog_imports 的两个凭据外键都以 tenant_id 开头、指向 credentials，按命名约定会同名，
+      所以确认人的外键在模型与迁移里显式命名为 fk_catalog_imports_confirmed_credential_id_credentials（预览人的外键照约定命名）。明确不做：写这两张表的代码、目录写锁、接口；不改已有表。
     status: ready
     depends_on: []
     acceptance_criteria:
@@ -731,9 +732,11 @@ tasks:
       先插 SKU 行再插归属行），写一条 product_created，再按请求顺序每个 SKU 写一条 sku_created，返回 201 与商品的表示。
       加规格：正文是一个 SKU 对象，另可带 reason；商品不存在 404 PRODUCT_NOT_FOUND，属于别的租户时响应完全相同并经执行器登记一条 cross_tenant 安全事件；
       商品 inactive 时照样可以加；不改商品的版本；冲突同上（冲突项不带 index）；写一条 sku_created，返回 201 与 SKU 的表示。
-      万一写入仍撞上编码或条码的唯一约束，按对应的 409 报（SKU_CODE_TAKEN 或 BARCODE_TAKEN），不返回 500。
+      万一写入仍撞上唯一约束（冲突查询之后才被占用等），按撞上的约束报 409、不返回 500：先插 SKU 行，撞 skus 的编码唯一约束为 SKU_CODE_TAKEN（是别的 SKU 的当前编码）；
+      SKU 行插入成功而撞归属表主键为 SKU_CODE_RETIRED（编码已登记、但不是任何 SKU 的当前编码）；撞条码唯一约束为 BARCODE_TAKEN。这种 409 的 details.conflicts 只列撞上的那一项
+      （field、value、code，新建商品时带该 SKU 在 skus 里的 index），不再补查其他冲突。
       二，查询：authorize 要求 catalog.read，不要求角色。GET 商品与 GET SKU：不存在 404 PRODUCT_NOT_FOUND 或 SKU_NOT_FOUND，属于别的租户时响应完全相同并用 cross_tenant_not_found 记事件；
-      已合并的 SKU 照常返回。GET /v1/skus：sku_code、barcode、ids 三个查询参数恰好带一个且只出现一次，否则 422，其他查询参数也 422；sku_code 与 barcode 按 CORE-TASK-013 的取值规则校验（不合规 422），
+      已合并的 SKU 照常返回。GET /v1/skus：sku_code、barcode、ids 三个查询参数恰好带一个且只出现一次，否则 422，其他查询参数也 422；sku_code 与 barcode 按 CORE-TASK-013 的取值规则校验（不合规 422；barcode 去首尾空白后为空串时也 422，不当作查空条码），
       按比较键精确匹配当前值，返回 0 或 1 个（退役编码查不到）；ids 是逗号分隔的 1 到 100 个 ID，有空项或重复 422，只返回属于本租户的，不存在或属于别的租户的不出现、不报错、不记事件。
       结果为 skus 数组，按 sku_id 升序，不分页。
       三，表示：商品为 product_id、name、status、version、created_at、updated_at、skus（SKU 的表示，按 sku_id 升序）；SKU 为 sku_id、product_id、sku_code、barcode、name、
@@ -749,8 +752,8 @@ tasks:
       - 接口放 app/api/catalog.py 并在 app/main.py 挂上，数据库读写放 app/services/catalog.py；healthz 与 readyz 不变
       - 集成测试在真 MySQL 上验证新建商品：201 与表示；库里的商品、SKU、归属行与表示一致；变更记录先一条 product_created、再按请求顺序每个 SKU 一条 sku_created，before 全为 null，带凭据、操作者、角色、请求 ID、幂等键与原因；条码为空白串时存 NULL；同键重放不重复建
       - 集成测试验证新建被拒：skus 为空 422、101 个 413、字段不合规 422、请求内编码只差大小写的重复 422、非空条码重复 422；与现有 SKU 当前编码相同 409 SKU_CODE_TAKEN，与退役编码相同 409 SKU_CODE_RETIRED（测试在库里造改过编码的 SKU 与归属行），条码已被使用 409 BARCODE_TAKEN；多处冲突时顶层码与 details.conflicts 按顺序列全；被拒时库里没有新商品、SKU、归属行与变更记录
-      - 集成测试验证加规格：inactive 的商品照样能加且商品版本不变；商品不存在与属于别的租户得完全相同的 404 PRODUCT_NOT_FOUND，跨租户记一条 cross_tenant；冲突项不带 index；测试让冲突查询漏报时，写入撞唯一约束得对应的 409 而不是 500
-      - 集成测试验证查询：GET 商品的 SKU 按 sku_id 升序；GET SKU 带 product_status 与 merged_into_sku_id；别的租户的商品与 SKU 得 404 并记 cross_tenant；按编码与条码查询不区分大小写、退役编码查不到；ids 只返回本租户的、按 sku_id 升序、不记事件；三个参数都不带、带两个、同一参数出现两次、ids 重复或超过 100 个都为 422
+      - 集成测试验证加规格：inactive 的商品照样能加且商品版本不变；商品不存在与属于别的租户得完全相同的 404 PRODUCT_NOT_FOUND，跨租户记一条 cross_tenant；冲突项不带 index；测试让冲突查询漏报时，撞当前编码、退役编码与条码分别得 409 SKU_CODE_TAKEN、SKU_CODE_RETIRED、BARCODE_TAKEN 而不是 500，且什么也没建
+      - 集成测试验证查询：GET 商品的 SKU 按 sku_id 升序；GET SKU 带 product_status 与 merged_into_sku_id；别的租户的商品与 SKU 得 404 并记 cross_tenant；按编码与条码查询不区分大小写、退役编码查不到；ids 只返回本租户的、按 sku_id 升序、不记事件；三个参数都不带、带两个、同一参数出现两次、barcode 为空白串、ids 重复或超过 100 个都为 422
       - 集成测试验证授权：写命令缺 catalog.write 为 403、缺操作者头为 400、角色不是 catalog_admin 为 403；读接口只要 catalog.read，不要求角色
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
       - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
@@ -869,7 +872,8 @@ tasks:
       每条为 cursor、event_type、object_type、object_id、product_id、version、changes（存的 JSON 原样）、actor_ref、reason、import_id、request_id、occurred_at（取 created_at）；
       不输出 credential_id、actor_role 与 idempotency_key。
       明确不做：推送、按对象或事件类型筛选、Core 侧保存消费进度。
-    status: ready
+      暂不可开始：设计预审发现按自增 id 的游标在整机恢复丢失最近写入后会让新记录复用网店已保存游标之前的 id、被跳过，需先改契约并经 Kelvin 批准，之后按新契约改写本任务再改回 ready。
+    status: blocked
     depends_on:
       - CORE-TASK-012
       - CORE-TASK-013
