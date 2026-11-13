@@ -544,7 +544,7 @@ tasks:
       三，接入：create_app 在数据库已配置时用 FastAPI 的 lifespan 启动清理任务、在应用关闭时停止；数据库未配置时不启动。uvicorn 单进程运行（Dockerfile 的启动命令不变）；
       将来多个进程同时清理也只是重复删除同一批，结果不变。
       明确不做：别的数据的保留期（流水与幂等记录永久保留）、预留到期扫描、新的配置项、手工清理的命令行。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 清理函数放 app/services/security_events.py，定时机制放 app/services/periodic.py，在 app/main.py 接入；healthz 与 readyz 的行为不变
