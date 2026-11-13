@@ -414,3 +414,155 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+
+  - id: CORE-TASK-009
+    title: 实现开通租户、地点、库存池与销售入口的运维命令行
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.6 的第 1 节、第 3 节与第 10 节第 4 条，给 Core 加一个只在 Core 容器里由运维执行的命令行，先做开通：
+      Core 没有 HTTP 管理接口（契约 10.4），租户、地点、库存池与销售入口只能这样建，下一任务的凭据签发也接在这个入口上。
+      一，入口：python -m app.cli 加子命令（标准库 argparse），读 app/config.py 的 Settings（CORE_ENV 与 CORE_DATABASE_URL，与服务同一个数据库账号）；
+      入口函数放 app/cli/__main__.py，接受参数列表、Settings、标准输出流与标准错误流，返回退出码，测试直接调用它并传入测试库的 Settings；
+      参数错误由入口函数自己接住（不让 argparse 打印多行用法后退出进程），向标准错误写一行、返回 2；这一行不含任何参数值（argparse 的报错文本会带上传入的值，不能原样输出，以免运维误传的明文令牌被打出来）；-h 与 --help 的帮助写到传入的标准输出流、返回 0。数据库未配置时向标准错误写一行、返回 1，不打印连接串；
+      python -m app.cli 的进程入口构造 Settings 时缺少或写错 CORE_ENV 等配置的校验异常也要接住，写一行、退出码 1、不打印堆栈。
+      之后各子命令共用的部分（错误与退出码约定、事务包装、按 ID 查租户与入口、输出一行 JSON）放 app/cli/__init__.py，子命令模块只 import 它、不 import __main__，下一任务的凭据子命令照用。
+      二，子命令：tenant create 加 --name；location create 加 --tenant 与 --name；pool create 加 --tenant、--location 与 --name；
+      channel create 加 --tenant、--pool 与 --name；show 不带参数时列出全部租户，加 --tenant 时列出该租户的地点、库存池与销售入口（ID、名称、状态、所属），租户不存在时向标准错误写一行、退出码 2。
+      新建对象的 ID 用 app/domain/ids.py 的 new_id，前缀依次为 ten、loc、pool、chan；租户、地点、销售入口状态为 active，库存池为 initializing
+      （契约第 6 节，期初只在 initializing 可用；切到 live 随期初任务做，本任务不做）。
+      三，校验：名称去首尾空格后 1 到 200 个字符、单行、不含控制字符；引用的租户须存在且为 active；地点须属于该租户且为 active；库存池须属于该租户；
+      一个库存池已有销售入口时拒绝再建（契约第 3 节，C-07，数据库已有唯一约束），并发时撞上唯一约束也报同样的说明而不是堆栈。
+      V1 每租户一个地点、一个池、一个入口（契约第 1、3 节）由运维照做，命令行不另加数量限制，数据键保留这些维度。
+      四，事务与输出：一个命令一个数据库事务，失败时什么也不写；成功时向标准输出写一行 JSON（新对象的 ID 与字段；show 输出 JSON），退出码 0；
+      参数或校验错误向标准错误写一行说明、退出码 2；数据库不可用等其他失败写一行说明、退出码 1；都不打印连接串、密码与堆栈。
+      五，不写安全事件（契约 7.2 的事件类型只含凭据与令牌的操作，不含开通）。
+      在 README.md 加一节说明怎样在服务器上执行这些命令：写法同 deploy/healthcheck.sh，按 compose 项目 acuven_stock_core、服务 core_api 的标签找到运行中的容器，
+      再用 docker exec 在里面执行 python -m app.cli；写明不用 docker compose exec（要展开只由部署脚本设置的镜像变量，没有它直接报错）
+      与 docker compose run（输出经容器的日志驱动落盘，下一任务的明文令牌会进日志）；不写主机名与服务器路径。
+      明确不做：停用、改名、删除，库存池切 live，凭据与令牌（下一任务），HTTP 接口，新的配置项。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 命令行放 app/cli 下 allowed_change_paths 所列的文件，入口在 __main__.py、共用部分在 __init__.py，python -m app.cli 可执行；README.md 有执行方法一节，用按标签找容器再 docker exec 的写法
+      - 集成测试在真 MySQL 上验证四个 create 子命令：输出的 JSON 含新 ID 且前缀正确，库里的行与输出一致，状态按 purpose 所列（库存池为 initializing），名称前后空格被去掉
+      - 集成测试验证校验：未知子命令或缺必填参数、名称为空或全是空格或超过 200 个字符或含换行、租户不存在或已停用、地点或库存池属于别的租户、地点已停用、库存池已有销售入口，都是退出码 2、标准错误有一行说明、库里没有多出任何行
+      - 集成测试验证 show：不带参数列出全部租户，带 --tenant 只列该租户的地点、库存池与销售入口，不出现别的租户的对象
+      - 集成测试验证失败输出：数据库未配置与数据库连不上时退出码 1，show --tenant 给了不存在的租户时退出码 2，标准输出与标准错误里都没有连接串与堆栈
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/cli/__init__.py
+      - app/cli/__main__.py
+      - app/cli/provisioning.py
+      - tests/integration/conftest.py
+      - tests/integration/test_cli_provisioning.py
+      - README.md
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-010
+    title: 实现服务凭据签发、轮换与吊销的运维命令行并记安全事件
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.6 的 7.2 与第 10 节第 4 条，在 CORE-TASK-009 的命令行入口上加凭据与令牌的操作。规则调用 CORE-TASK-004 的纯函数
+      （generate_token、token_digest、validate_issued_scopes），表用 CORE-TASK-005 的模型，写安全事件用 CORE-TASK-007 的 record_security_event，
+      错误与退出码约定、事务包装等共用部分用 CORE-TASK-009 放在 app/cli/__init__.py 的（需要时可小幅补充）。
+      不碰数据库的规则写成纯函数加进 app/domain/service_auth.py，用 tests/unit 测：--reason 与 --overlap-hours 的校验、轮换时选出要改截止时间的旧令牌（用第三条的例子写单元测试）；
+      --actor 的格式复用 app/domain/requests.py 的引用格式规则：在那里加一个公开的引用格式校验函数（不改现有函数的行为），单元测试加在 tests/unit/test_requests.py。
+      一，共同参数：会改变权限的四个子命令都必须带 --actor 与 --reason。--actor 是运维人员标识，格式同契约第 1 节的引用
+      （1 到 128 个字母、数字或点、下划线、冒号、连字符），不含姓名与邮箱；--reason 去首尾空格后 1 到 500 个字符、单行、不含控制字符。
+      改已有行（吊销凭据，轮换与吊销令牌）时同时按数据库时间写 updated_at（CORE-TASK-005 的约定）。
+      二，credential issue 加 --tenant、--name（去首尾空格后 1 到 200 个字符、单行、不含控制字符）、可重复的 --scope、可选的 --channel：租户须存在且为 active；
+      带 --channel 时入口须属于该租户且为 active；scope 按 validate_issued_scopes 校验（非空、无重复、已知值，ops.read 单独出现且不带入口）；
+      CORE_ENV 为 production 时拒绝带 demo.reset 的凭据（契约 6.1、10.4），demo 时允许。
+      在一个事务里建凭据（前缀 cred_，active）与它的第一个令牌（前缀 ctk_，无截止时间），库里只存令牌摘要。安全事件 credential_issued，补充说明记原因与令牌 ID。
+      三，credential rotate 加 --credential 与 --overlap-hours（必填，0 到 168 的整数，即不晚于轮换时刻后 7 天）：凭据须存在且为 active，在事务里锁住凭据行；
+      所属租户须为 active（与签发一致）；CORE_ENV 为 production 时，带 demo.reset 的凭据同样拒绝轮换（与拒绝签发一致）；
+      签发新令牌（无截止时间）；截止时间等于数据库时间的轮换时刻加重叠小时数；该凭据其余未吊销的令牌中，没有截止时间或截止时间晚于它的，截止时间改成它，已更早到期的不动。
+      例：令牌 A 无截止时间，在 T 时刻以 24 小时轮换，得新令牌 B，A 的截止时间为 T 加 24 小时；在 T 加 1 小时再以 0 小时轮换，得新令牌 C，
+      A 与 B 的截止时间都改为 T 加 1 小时，即刻失效。安全事件 token_issued，补充说明记原因、新令牌 ID 与被设截止时间的旧令牌 ID 及其截止时间。
+      四，token revoke 加 --token：令牌须存在且未吊销，记吊销时间（数据库时间），立即生效；安全事件 token_revoked。
+      credential revoke 加 --credential：凭据须为 active，改为 revoked 并记吊销时间，令牌行不动（凭据已吊销时鉴权一律 401）；安全事件 credential_revoked。
+      吊销不可撤销，再吊销已吊销的对象是错误；吊销在事务里锁住目标行（或用带未吊销条件的 UPDATE 按受影响行数判断），两次并发吊销只有一次成功、只写一条事件。--token 传入以 csk_ 开头的值（误把明文令牌当令牌 ID）时单独报错，提示要传 ctk_ 开头的令牌 ID；
+      所有报错（含对象不存在）都不回显参数值。
+      五，credential list 加 --tenant：列出该租户的凭据（ID、名称、入口、scope、状态、吊销时间）与各自的令牌（ID、创建时间、截止时间、吊销时间），不输出摘要；只读，不写事件；租户不存在时向标准错误写一行、退出码 2（与 show --tenant 一致）。
+      六，安全事件与输出：一次成功的操作在业务事务提交之后另开短事务写一条事件（契约 7.2），操作者记 --actor，request_id、HTTP 方法、路径与 User-Agent 为空，
+      凭据与租户记目标对象的；失败的操作什么也不改、不写事件，只在标准错误报一行（校验错误退出码 2，其他失败退出码 1）。
+      事件写入失败时向标准错误报一行警告（带操作类型与目标凭据或令牌 ID，便于运维手工补记审计；不带堆栈、SQL 与连接信息），操作照样算成功、退出码 0（契约 7.2 写入失败不改变结果）；
+      命令行入口为此配置日志，使 record_security_event 自己记的那行异常在命令行里不输出（标准错误上只有命令行这一行警告，没有堆栈）：
+      调用期间把 app.services.security_events 日志器设为 disabled（或把它的级别调到 CRITICAL 以上），不能只关 propagate（这个日志器没有处理器，只关 propagate 时记录会落到 logging.lastResort，堆栈照样写进标准错误）；
+      这项日志配置只在一次入口函数调用期间生效、返回前恢复原状，不影响同一进程里的其他代码与测试（例如 tests/integration/test_api_auth.py 对该日志器的日志捕获）。
+      明文令牌只在事务提交之后向标准输出写一次（成功输出的 JSON 里），不落库、不进安全事件、不进标准错误与日志、不进异常信息；输出丢了就吊销那个令牌再轮换。
+      在 README.md 的命令行一节补上这些子命令与令牌只显示一次的说明。
+      明确不做：HTTP 管理接口、修改凭据的 scope 或入口（契约 10.4：要改就签发新凭据、吊销旧的）、恢复已吊销的对象、到期清理。
+    status: ready
+    depends_on:
+      - CORE-TASK-009
+    acceptance_criteria:
+      - 新子命令放 app/cli/service_auth.py，在 app/cli/__main__.py 里挂上；README.md 的命令行一节有这些子命令；纯规则加在 app/domain/service_auth.py，单元测试覆盖 --reason 与 --overlap-hours 的边界（0、168、169、负数、非整数、500 与 501 个字符、换行）和第三条的轮换例子
+      - 集成测试在真 MySQL 上验证签发：输出的令牌符合格式，库里只有它的摘要、没有明文；签发的令牌能通过 CORE-TASK-007 的鉴权（测试应用挂一个要求鉴权的测试路由）；写了一条 credential_issued 事件，操作者、原因与令牌 ID 对、不含明文令牌
+      - 集成测试验证签发被拒时退出码 2、库里没有新凭据、令牌与事件：未知或重复的 scope、ops.read 与别的 scope 同时出现或带入口、入口属于别的租户或已停用、租户已停用、缺 --actor 或 --reason 或格式不对、CORE_ENV 为 production 时带 demo.reset（demo 时可以签发）
+      - 集成测试按 purpose 第三条的例子验证轮换：重叠期内新旧令牌都能鉴权通过，截止时间到后旧令牌 401（例如测试把截止时间改到过去）；重叠小时数为负数、169 或不是整数时被拒；已吊销的凭据或已停用租户的凭据不能轮换，CORE_ENV 为 production 时带 demo.reset 的凭据不能轮换；轮换后改过的行 updated_at 已更新；写了一条 token_issued 事件，记了旧令牌的截止时间
+      - 集成测试验证吊销：吊销令牌后用它鉴权立即 401、同凭据的其他令牌不受影响；吊销凭据后它的所有令牌 401；再吊销已吊销的令牌或凭据被拒且不多写事件；--token 传明文令牌时单独报错且标准错误里没有该值；list 只列该租户的凭据与令牌、不含摘要，租户不存在时退出码 2
+      - 集成测试验证保密与事件失败：所有子命令的标准错误与日志里没有明文令牌；让安全事件写入失败时（例如照 tests/integration/test_api_auth.py 的先例替换写入函数）操作照样生效、退出码 0，传入的标准错误流只有一行警告（带操作类型与目标 ID、没有堆栈），并且在同一个测试里两项都断言：用 caplog 断言调用期间没有来自 app.services.security_events 的日志记录，用 capsys 断言调用期间 sys.stderr 没有任何输出（不做配置时记录被 pytest 的日志捕获截走、sys.stderr 看不到；只关 propagate 时记录落到 logging.lastResort、caplog 收不到但堆栈写进 sys.stderr；所以两项都要）；入口函数返回后日志配置已恢复原状；参数错误的一行不含参数值（例如把明文令牌当位置参数传入时）
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/cli/__init__.py
+      - app/cli/__main__.py
+      - app/cli/service_auth.py
+      - app/domain/requests.py
+      - app/domain/service_auth.py
+      - tests/unit/test_requests.py
+      - tests/unit/test_service_auth.py
+      - tests/integration/conftest.py
+      - tests/integration/test_cli_service_auth.py
+      - README.md
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-011
+    title: 实现安全事件满一年的定时清理
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.6 的 7.1 保留期与 7.2（安全日志保留 1 年；满 1 年的事件整批删除，由 Core 自己的定时任务用 Core 的数据库账号执行），
+      给 Core 加一个进程内的定时任务机制和第一项定时任务。之后的预留到期扫描（契约 5.2 第 4 条）复用同一机制。
+      一，清理函数，放 app/services/security_events.py：删除 occurred_at 不晚于数据库当前时间减 1 年的安全事件（按数据库时间，MySQL 的 INTERVAL 1 YEAR，恰好满 1 年即删除）；
+      每批最多删 1000 行、每批一个短事务，直到某批不足 1000 行为止；返回删除总数并写一行进程日志。只删 security_events，不碰别的表。
+      清理函数接受一个数据库连接（定时任务从引擎取一个传入），各批都在这个连接上执行，测试因此可以在同一连接上用 SET TIMESTAMP 冻结数据库时间来验证边界。
+      清理函数被调用时，传入的连接上不能有打开的事务（与 record_security_event 的约定一致）。
+      清理的结果行与定时机制记的异常要在生产上能看到：沿用 app/services/idempotency.py 的先例，写到已挂处理器的 app.api 日志器（或它的子日志器），保证 INFO 级别能输出；
+      不给 app.services.security_events 或其他日志器另挂处理器，因为命令行也 import 这个模块，挂上会让命令行把 record_security_event 记的堆栈打到标准错误；本任务不改变命令行的任何输出。
+      例：数据库时间为某年 11 月 13 日 12:00:00 时，前一年 11 月 13 日 12:00:00 的事件删除，12:00:01 的保留。
+      二，定时机制，放新文件 app/services/periodic.py：一个守护线程按固定间隔反复执行一个函数；启动后先等一段时间再跑第一次（默认 60 秒），之后每隔一段时间跑一次（默认 24 小时）；
+      函数抛出异常时记进程日志，线程不退出，下个周期照常；停止时通知线程并等它结束（带超时）。间隔与首次等待由调用代码传入，测试可以传很短的值；不新增配置项。
+      三，接入：create_app 在数据库已配置时用 FastAPI 的 lifespan 启动清理任务、在应用关闭时停止；数据库未配置时不启动。uvicorn 单进程运行（Dockerfile 的启动命令不变）；
+      将来多个进程同时清理也只是重复删除同一批，结果不变。
+      明确不做：别的数据的保留期（流水与幂等记录永久保留）、预留到期扫描、新的配置项、手工清理的命令行。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 清理函数放 app/services/security_events.py，定时机制放 app/services/periodic.py，在 app/main.py 接入；healthz 与 readyz 的行为不变
+      - 集成测试在真 MySQL 上按 purpose 第一条的例子验证边界：在传给清理函数的连接上用 SET TIMESTAMP 冻结数据库时间，构造恰好满 1 年、差 1 秒满 1 年与刚写入的事件，只删恰好满 1 年及更早的；测试结束时在该连接上执行 SET TIMESTAMP = DEFAULT 或作废该连接，冻结的时间不留给之后复用连接的测试；别的表的行不受影响
+      - 集成测试验证分批：2500 条满 1 年的事件全部删除，返回总数 2500；每个测试结束时清掉自己造的事件，互不影响计数
+      - 集成测试验证清理结果的日志行写到 app.api 日志器或它的子日志器，且 app.services.security_events 日志器没有被挂上处理器
+      - 集成测试验证定时机制：传很短的间隔时函数被反复调用；函数抛出异常后下个周期照常调用且异常记了日志；停止后不再调用且线程已结束
+      - 集成测试验证接入：数据库已配置时进入与退出应用的 lifespan（例如 with TestClient）会启动与停止清理任务，数据库未配置时不启动
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/periodic.py
+      - app/services/security_events.py
+      - app/main.py
+      - tests/integration/test_security_event_purge.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
