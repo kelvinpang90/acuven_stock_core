@@ -14,6 +14,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     engine = make_engine(settings.database_url) if settings.database_url else None
     app = FastAPI(title="Acuven Stock Core", docs_url=None, redoc_url=None, openapi_url=None)
+    # 鉴权、授权与之后的命令按请求从这里取连接（app.api.requests.request_connection）。
+    app.state.engine = engine
     app.add_middleware(RequestMiddleware)
     install_error_handlers(app)
 

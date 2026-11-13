@@ -10,6 +10,10 @@
       （校验后的模型与原始 JSON 解析结果，后者不补默认值，供幂等摘要用）；
       没有请求体的接口挂 no_body。
   8–9 步（角色、池授权）放在第 7 步的参数之后。
+  4–6、8–9 步的依赖见 app/api/auth.py。
+
+数据库连接：一个请求用一个连接（request_connection），第一次用时从连接池取，
+请求结束时由 RequestMiddleware 归还；取不到时 503 UNAVAILABLE。
 
 每个请求结束时在 app.api.access 写一行 JSON 日志；不记 Authorization 头、令牌与请求体。
 """
@@ -23,6 +27,9 @@ from typing import ClassVar
 
 from fastapi import Request
 from pydantic import BaseModel, ConfigDict, ValidationError
+from sqlalchemy import Connection
+from sqlalchemy.exc import SQLAlchemyError
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -40,8 +47,11 @@ from app.api.errors import (
 from app.domain.ids import new_id
 from app.domain.requests import REQUEST_ID, InvalidHeader, parse_request_id, truncate_user_agent
 
+UNAVAILABLE = "UNAVAILABLE"
 MAX_BODY_BYTES = 128 * 1024
 MAX_BATCH_ITEMS = 100
+# request.state 里放本请求数据库连接的键。
+_CONNECTION = "db_connection"
 # 不校验 X-Request-ID 的路径：不合格时改用生成的 ID（§8.1）。
 UNCHECKED_REQUEST_ID_PATHS = frozenset({"/healthz", "/readyz"})
 
@@ -57,6 +67,61 @@ _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 def _too_large() -> ApiError:
     return ApiError(413, REQUEST_TOO_LARGE, "request is too large")
+
+
+def unavailable() -> ApiError:
+    """503：数据库不可用；还没进入幂等时结果确定未生效，可同键重试（§8.3）。"""
+    return ApiError(503, UNAVAILABLE, "service unavailable", retryable=True)
+
+
+def current_connection(request: Request) -> Connection | None:
+    """本请求已经取到的连接；还没取时为 None。"""
+    return getattr(request.state, _CONNECTION, None)
+
+
+def request_connection(request: Request) -> Connection:
+    """处理这个请求的连接：第一次用时从连接池取，之后同一个请求都用它。
+
+    没配数据库或连不上时 503。用完一段读写要结束上面的事务（提交或回滚），
+    之后的步骤（安全事件、幂等的命名锁）要求连接上没有打开的事务。
+    """
+    connection = current_connection(request)
+    if connection is not None:
+        return connection
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise unavailable()
+    try:
+        connection = engine.connect()
+    except SQLAlchemyError:
+        request_id = request.state.request_id
+        _log.warning("database unavailable (request_id=%s)", request_id, exc_info=True)
+        raise unavailable() from None
+    setattr(request.state, _CONNECTION, connection)
+    return connection
+
+
+def discard_connection(request: Request) -> None:
+    """连接出错后不再给本请求用：关掉它（坏连接由连接池作废），之后需要时另取一个。"""
+    connection = current_connection(request)
+    if connection is None:
+        return
+    setattr(request.state, _CONNECTION, None)
+    try:
+        connection.close()
+    except SQLAlchemyError:
+        _log.warning("closing a failed connection failed", exc_info=True)
+
+
+async def _release_connection(scope: Scope) -> None:
+    """请求结束时把本请求的连接还给连接池（还开着的事务回滚）。"""
+    connection = scope.get("state", {}).pop(_CONNECTION, None)
+    if connection is None:
+        return
+    try:
+        await run_in_threadpool(connection.close)
+    except SQLAlchemyError:
+        _log.warning("closing the request connection failed", exc_info=True)
 
 
 def _match_route(scope: Scope) -> tuple[Match, set[str]]:
@@ -165,6 +230,7 @@ class RequestMiddleware:
                     raise
                 await reply(internal_error())
         finally:
+            await _release_connection(scope)
             line = {
                 "method": scope["method"],
                 "path": scope["path"],
