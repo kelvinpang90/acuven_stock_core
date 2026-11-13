@@ -718,52 +718,36 @@ tasks:
     creates_pull_request: true
 
   - id: CORE-TASK-016
-    title: 实现新建商品、加规格与商品和 SKU 查询的目录接口
+    title: 实现商品与 SKU 的查询接口与表示
     purpose: >-
-      按契约 docs/CONTRACT_V1.md 0.7 的 2.1、2.2、2.6 第 1、2、3、6、7 条与 2.7，实现 POST /v1/products（操作类型 products.create）、POST /v1/products/{product_id}/skus（skus.create）、
-      GET /v1/products/{product_id}、GET /v1/skus/{sku_id} 与 GET /v1/skus。表用 CORE-TASK-012 的，规则用 CORE-TASK-013 的纯函数，写命令经 run_idempotent 并声明 CORE-TASK-015 的目录写锁；
-      请求处理、鉴权与授权沿用已有的。接口放新文件 app/api/catalog.py（APIRouter，在 app/main.py 挂上），读写数据库的部分放新文件 app/services/catalog.py；
-      服务层的建 SKU（SKU 行、归属行、变更记录）、写变更记录与读表示的函数写成可复用的，供之后的修改、批量导入与变更流任务调用（导入建的变更记录带 import_id）。
-      一，写命令：authorize 要求 catalog.write 且 write 为真，角色要求 catalog_admin，有请求体；变更记录的 credential_id、actor_ref、actor_role、request_id、idempotency_key 取自本请求，
-      reason 取正文规范化后的值，version 为对象改动后的版本，changes 按 CORE-TASK-013 第三条。
-      新建商品：正文 name、skus（批量数组，1 到 100 个，超过 100 为 413，空数组 422）、可选 reason；每个 SKU 对象含 sku_code、name，可带 barcode、reference_price；未知字段 422。
-      字段不合规 422（details 指出字段位置）；同一请求里 sku_code 比较键重复或非空条码比较键重复 422。与现有目录的冲突：逐个 SKU 按 CORE-TASK-013 的编码归属判定查归属表、按比较键查现有 SKU 的当前条码，
-      收集全部冲突，有冲突时 409（顶层错误码与 details.conflicts 按 CORE-TASK-013 第五条），一个都不建。否则建商品（前缀 prd_，active，版本 1）与各 SKU（前缀 sku_，active，版本 1，
-      先插 SKU 行再插归属行），写一条 product_created，再按请求顺序每个 SKU 写一条 sku_created，返回 201 与商品的表示。
-      加规格：正文是一个 SKU 对象，另可带 reason；商品不存在 404 PRODUCT_NOT_FOUND，属于别的租户时响应完全相同并经执行器登记一条 cross_tenant 安全事件；
-      商品 inactive 时照样可以加；不改商品的版本；冲突同上（冲突项不带 index）；写一条 sku_created，返回 201 与 SKU 的表示。
-      万一写入仍撞上唯一约束（冲突查询之后才被占用等），按撞上的约束报 409、不返回 500：先插 SKU 行，撞 skus 的编码唯一约束为 SKU_CODE_TAKEN（是别的 SKU 的当前编码）；
-      SKU 行插入成功而撞归属表主键为 SKU_CODE_RETIRED（编码已登记、但不是任何 SKU 的当前编码）；撞条码唯一约束为 BARCODE_TAKEN。这种 409 的 details.conflicts 只列撞上的那一项
-      （field、value、code，新建商品时带该 SKU 在 skus 里的 index），不再补查其他冲突。
-      二，查询：authorize 要求 catalog.read，不要求角色。GET 商品与 GET SKU：不存在 404 PRODUCT_NOT_FOUND 或 SKU_NOT_FOUND，属于别的租户时响应完全相同并用 cross_tenant_not_found 记事件；
-      已合并的 SKU 照常返回。GET /v1/skus：sku_code、barcode、ids 三个查询参数恰好带一个且只出现一次，否则 422，其他查询参数也 422；sku_code 与 barcode 按 CORE-TASK-013 的取值规则校验（不合规 422；barcode 去首尾空白后为空串时也 422，不当作查空条码），
+      按契约 docs/CONTRACT_V1.md 0.7 的 2.1、2.4 中已合并 SKU 的查询规则、2.6 第 6、7 条与 7.2，实现 GET /v1/products/{product_id}、GET /v1/skus/{sku_id} 与 GET /v1/skus，
+      要求 catalog.read，不要求角色；查询参数的取值规则用 CORE-TASK-013 的纯函数，请求处理、鉴权与授权沿用已有的。接口放新文件 app/api/catalog.py（APIRouter，在 app/main.py 挂上），
+      读数据库的部分放新文件 app/services/catalog.py；读表示的函数与时间格式化函数写成可复用的，供之后的写命令、批量导入与变更流任务调用。
+      一，按 ID 查询：GET 商品与 GET SKU，不存在 404 PRODUCT_NOT_FOUND 或 SKU_NOT_FOUND，属于别的租户时响应完全相同并用 cross_tenant_not_found 记事件；已合并的 SKU 照常返回、带 merged_into_sku_id。
+      二，GET /v1/skus：sku_code、barcode、ids 三个查询参数恰好带一个且只出现一次，否则 422，其他查询参数也 422；sku_code 与 barcode 按 CORE-TASK-013 的取值规则校验（不合规 422；barcode 去首尾空白后为空串时也 422，不当作查空条码），
       按比较键精确匹配当前值，返回 0 或 1 个（退役编码查不到）；ids 是逗号分隔的 1 到 100 个 ID，有空项或重复 422，只返回属于本租户的，不存在或属于别的租户的不出现、不报错、不记事件。
       结果为 skus 数组，按 sku_id 升序，不分页。
       三，表示：商品为 product_id、name、status、version、created_at、updated_at、skus（SKU 的表示，按 sku_id 升序）；SKU 为 sku_id、product_id、sku_code、barcode、name、
       reference_price（null 或含 amount_minor 与 currency 的对象）、status、product_status（所属商品的状态）、merged_into_sku_id、version、created_at、updated_at。
       时间为 UTC 的 RFC 3339 字符串，微秒精度，以 Z 结尾；格式化函数放在 app/api/catalog.py，之后的接口照用。
-      明确不做：修改、停用、重新启用（下一任务）、批量导入、变更流接口、预留对商品状态的检查（随预留任务做）。
+      明确不做：任何写命令（下一任务起）、批量导入、变更流接口。
     status: ready
     depends_on:
-      - CORE-TASK-012
       - CORE-TASK-013
-      - CORE-TASK-015
     acceptance_criteria:
-      - 接口放 app/api/catalog.py 并在 app/main.py 挂上，数据库读写放 app/services/catalog.py；healthz 与 readyz 不变
-      - 集成测试在真 MySQL 上验证新建商品：201 与表示；库里的商品、SKU、归属行与表示一致；变更记录先一条 product_created、再按请求顺序每个 SKU 一条 sku_created，before 全为 null，带凭据、操作者、角色、请求 ID、幂等键与原因；条码为空白串时存 NULL；同键重放不重复建
-      - 集成测试验证新建被拒：skus 为空 422、101 个 413、字段不合规 422、请求内编码只差大小写的重复 422、非空条码重复 422；与现有 SKU 当前编码相同 409 SKU_CODE_TAKEN，与退役编码相同 409 SKU_CODE_RETIRED（测试在库里造改过编码的 SKU 与归属行），条码已被使用 409 BARCODE_TAKEN；多处冲突时顶层码与 details.conflicts 按顺序列全；被拒时库里没有新商品、SKU、归属行与变更记录
-      - 集成测试验证加规格：inactive 的商品照样能加且商品版本不变；商品不存在与属于别的租户得完全相同的 404 PRODUCT_NOT_FOUND，跨租户记一条 cross_tenant；冲突项不带 index；测试让冲突查询漏报时，撞当前编码、退役编码与条码分别得 409 SKU_CODE_TAKEN、SKU_CODE_RETIRED、BARCODE_TAKEN 而不是 500，且什么也没建
-      - 集成测试验证查询：GET 商品的 SKU 按 sku_id 升序；GET SKU 带 product_status 与 merged_into_sku_id；别的租户的商品与 SKU 得 404 并记 cross_tenant；按编码与条码查询不区分大小写、退役编码查不到；ids 只返回本租户的、按 sku_id 升序、不记事件；三个参数都不带、带两个、同一参数出现两次、barcode 为空白串、ids 重复或超过 100 个都为 422
-      - 集成测试验证授权：写命令缺 catalog.write 为 403、缺操作者头为 400、角色不是 catalog_admin 为 403；读接口只要 catalog.read，不要求角色
+      - 接口放 app/api/catalog.py 并在 app/main.py 挂上，读数据库放 app/services/catalog.py；healthz 与 readyz 不变
+      - 集成测试在真 MySQL 上（测试直接在库里造商品与 SKU）验证按 ID 查询：商品表示的字段齐全、SKU 按 sku_id 升序；SKU 表示带 product_status 与 merged_into_sku_id，已合并的照常返回；参考价为 null 或对象；时间为以 Z 结尾、微秒精度的 UTC 字符串
+      - 集成测试验证跨租户：别的租户的商品与 SKU 得与不存在完全相同的 404，并各记一条 cross_tenant
+      - 集成测试验证列表查询：按编码与条码查询不区分大小写、退役编码查不到、查不到时为空数组；ids 只返回本租户的、按 sku_id 升序、不记事件；三个参数都不带、带两个、同一参数出现两次、带未知参数、barcode 为空白串、编码不合规、ids 有空项或重复或超过 100 个都为 422
+      - 集成测试验证授权：缺 catalog.read 为 403；不带操作者头照常 200
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
       - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
       - app/api/catalog.py
       - app/services/catalog.py
-      - app/domain/catalog.py
       - app/main.py
       - tests/integration/conftest.py
-      - tests/integration/test_catalog_api.py
+      - tests/integration/test_catalog_queries_api.py
     allowed_commands:
       - tests.unit
       - lint.check
@@ -772,16 +756,62 @@ tasks:
     creates_pull_request: true
 
   - id: CORE-TASK-017
+    title: 实现新建商品与加规格的目录写命令
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.7 的 2.2、2.6 第 1、2、3 条与 2.7，在 CORE-TASK-016 的 app/api/catalog.py 与 app/services/catalog.py 上加 POST /v1/products（操作类型 products.create）
+      与 POST /v1/products/{product_id}/skus（skus.create）。表用 CORE-TASK-012 的，规则用 CORE-TASK-013 的纯函数，经 run_idempotent 并声明 CORE-TASK-015 的目录写锁，返回用 CORE-TASK-016 的表示函数。
+      服务层的建 SKU（SKU 行、归属行、变更记录）与写变更记录的函数写成可复用的，供之后的修改与批量导入任务调用（导入建的变更记录带 import_id）。
+      一，共同：authorize 要求 catalog.write 且 write 为真，角色要求 catalog_admin，有请求体；变更记录的 credential_id、actor_ref、actor_role、request_id、idempotency_key 取自本请求，
+      reason 取正文规范化后的值，version 为对象改动后的版本，changes 按 CORE-TASK-013 第三条。
+      二，新建商品：正文 name、skus（批量数组，1 到 100 个，超过 100 为 413，空数组 422）、可选 reason；每个 SKU 对象含 sku_code、name，可带 barcode、reference_price；未知字段 422。
+      字段不合规 422（details 指出字段位置）；同一请求里 sku_code 比较键重复或非空条码比较键重复 422。与现有目录的冲突：逐个 SKU 按 CORE-TASK-013 的编码归属判定查归属表、按比较键查现有 SKU 的当前条码，
+      收集全部冲突，有冲突时 409（顶层错误码与 details.conflicts 按 CORE-TASK-013 第五条），一个都不建。否则建商品（前缀 prd_，active，版本 1）与各 SKU（前缀 sku_，active，版本 1，
+      先插 SKU 行再插归属行），写一条 product_created，再按请求顺序每个 SKU 写一条 sku_created，返回 201 与商品的表示。
+      三，加规格：正文是一个 SKU 对象，另可带 reason；商品不存在 404 PRODUCT_NOT_FOUND，属于别的租户时响应完全相同并经执行器登记一条 cross_tenant 安全事件；
+      商品 inactive 时照样可以加；不改商品的版本；冲突同上（冲突项不带 index）；写一条 sku_created，返回 201 与 SKU 的表示。
+      四，万一写入仍撞上唯一约束（冲突查询之后才被占用等），按撞上的约束报 409、不返回 500：先插 SKU 行，撞 skus 的编码唯一约束为 SKU_CODE_TAKEN（是别的 SKU 的当前编码）；
+      SKU 行插入成功而撞归属表主键为 SKU_CODE_RETIRED（编码已登记、但不是任何 SKU 的当前编码）；撞条码唯一约束为 BARCODE_TAKEN。这种 409 的 details.conflicts 只列撞上的那一项
+      （field、value、code，新建商品时带该 SKU 在 skus 里的 index），不再补查其他冲突。
+      明确不做：修改、停用、重新启用（下一任务）、批量导入、变更流接口、预留对商品状态的检查（随预留任务做）。
+    status: ready
+    depends_on:
+      - CORE-TASK-012
+      - CORE-TASK-013
+      - CORE-TASK-015
+      - CORE-TASK-016
+    acceptance_criteria:
+      - 写命令加在 app/api/catalog.py，数据库写入加在 app/services/catalog.py；CORE-TASK-016 的测试照常通过
+      - 集成测试在真 MySQL 上验证新建商品：201 与表示；库里的商品、SKU、归属行与表示一致；变更记录先一条 product_created、再按请求顺序每个 SKU 一条 sku_created，before 全为 null，带凭据、操作者、角色、请求 ID、幂等键与原因；条码为空白串时存 NULL；同键重放不重复建
+      - 集成测试验证新建被拒：skus 为空 422、101 个 413、字段不合规 422、请求内编码只差大小写的重复 422、非空条码重复 422；与现有 SKU 当前编码相同 409 SKU_CODE_TAKEN，与退役编码相同 409 SKU_CODE_RETIRED（测试在库里造改过编码的 SKU 与归属行），条码已被使用 409 BARCODE_TAKEN；多处冲突时顶层码与 details.conflicts 按顺序列全；被拒时库里没有新商品、SKU、归属行与变更记录
+      - 集成测试验证加规格：inactive 的商品照样能加且商品版本不变；商品不存在与属于别的租户得完全相同的 404 PRODUCT_NOT_FOUND，跨租户记一条 cross_tenant；冲突项不带 index
+      - 集成测试验证撞约束：测试让冲突查询漏报时，撞当前编码、退役编码与条码分别得 409 SKU_CODE_TAKEN、SKU_CODE_RETIRED、BARCODE_TAKEN 而不是 500，details.conflicts 只有撞上的那一项，且什么也没建
+      - 集成测试验证授权：缺 catalog.write 为 403、缺操作者头为 400、角色不是 catalog_admin 为 403
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/catalog.py
+      - app/services/catalog.py
+      - app/domain/catalog.py
+      - tests/integration/conftest.py
+      - tests/integration/test_catalog_create_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-018
     title: 实现商品与 SKU 的修改、停用与重新启用接口
     purpose: >-
-      按契约 docs/CONTRACT_V1.md 0.7 的 2.2、2.4 中已合并 SKU 的规则、2.6 第 4、5 条与 2.7，在 CORE-TASK-016 的 app/api/catalog.py 与 app/services/catalog.py 上加：
+      按契约 docs/CONTRACT_V1.md 0.7 的 2.2、2.4 中已合并 SKU 的规则、2.6 第 4、5 条与 2.7，在 CORE-TASK-016、017 的 app/api/catalog.py 与 app/services/catalog.py 上加：
       PATCH /v1/products/{product_id}（products.update）、PATCH /v1/skus/{sku_id}（skus.update）、POST /v1/products/{product_id}/deactivate 与 /reactivate（products.deactivate、products.reactivate）、
       POST /v1/skus/{sku_id}/deactivate 与 /reactivate（skus.deactivate、skus.reactivate）。都要求 catalog.write 与 catalog_admin，经 run_idempotent 并声明目录写锁；规则用 CORE-TASK-013 的纯函数。
       一，修改：正文 expected_version（必填，正整数）与可选 reason；商品另可带 name，SKU 另可带 sku_code、barcode、name、reference_price。除 expected_version 与 reason 外至少带一个字段，否则 422；
       name 或 sku_code 为 null 422；barcode、reference_price 为 null 是清空；其他字段（status、product_id、merged_into_sku_id 等）是未知字段，422。
       在事务里用 SELECT FOR UPDATE 按 ID 读要改的行，依次判定：不存在 404 PRODUCT_NOT_FOUND 或 SKU_NOT_FOUND，属于别的租户时响应完全相同并经执行器登记 cross_tenant；
       已合并的 SKU 不是“只清空条码”的修改时 409 SKU_MERGED；版本不符 409 VERSION_CONFLICT，details.current_version 为当前版本；按 CORE-TASK-013 算改动字段，全都相同时返回 200 与当前表示，
-      不加版本、不写变更记录与编码历史；改动的编码或条码与别的 SKU 冲突时 409（同 CORE-TASK-016，冲突项不带 index）；否则写入：改字段、版本加 1、updated_at 写数据库当前时间，
+      不加版本、不写变更记录与编码历史；改动的编码或条码与别的 SKU 冲突时 409（同 CORE-TASK-017，冲突项不带 index）；否则写入：改字段、版本加 1、updated_at 写数据库当前时间，
       写一条 product_updated 或 sku_updated，changes 只含改动字段。改了 sku_code 时照 2.2：按编码归属判定决定是否插入归属行，把旧值、新值、X-Actor-Ref 与正文 reason 写进 sku_code_history。
       inactive 的商品与 SKU 也可以改。返回 200 与改后的表示。
       二，停用与重新启用：没有请求体（非空请求体 422）。事务里 SELECT FOR UPDATE 读行；不存在与跨租户同上；重新启用已合并的 SKU 409 SKU_MERGED；已是目标状态时返回 200 与当前表示，
@@ -790,9 +820,9 @@ tasks:
       明确不做：预留对商品与 SKU 状态的检查（随预留任务做）、SKU 合并、删除、批量导入、变更流接口。
     status: ready
     depends_on:
-      - CORE-TASK-016
+      - CORE-TASK-017
     acceptance_criteria:
-      - 接口加在 app/api/catalog.py，数据库读写加在 app/services/catalog.py；CORE-TASK-016 的测试照常通过
+      - 接口加在 app/api/catalog.py，数据库读写加在 app/services/catalog.py；CORE-TASK-016、017 的测试照常通过
       - 集成测试在真 MySQL 上验证修改成功：商品与 SKU 的版本加 1、updated_at 更新，一条 product_updated 或 sku_updated 只含改动字段的前后值，同时改名称与参考价也只有一条；全都与当前值相同时 200、不加版本、没有记录；只改编码大小写算改并写编码历史
       - 集成测试验证改编码与条码：旧值进 sku_code_history（actor_ref 取 X-Actor-Ref、reason 取正文），新编码登记归属；改回自己用过的编码不再插入归属行；改成别的 SKU 的当前编码或退役编码分别 409 SKU_CODE_TAKEN 与 SKU_CODE_RETIRED；条码被占 409 BARCODE_TAKEN；清空条码与参考价可以，清空后别的 SKU 能用这个条码
       - 集成测试验证判定顺序：不存在与跨租户得完全相同的 404，跨租户记 cross_tenant；版本不符 409 VERSION_CONFLICT 带当前版本且什么也不改；版本不符同时编码冲突时报 VERSION_CONFLICT；两个 expected_version 相同的修改换键先后提交，后者 409 VERSION_CONFLICT；缺 expected_version、只带 expected_version 与 reason、name 为 null、带 status 都为 422
@@ -813,11 +843,11 @@ tasks:
     creates_branch: true
     creates_pull_request: true
 
-  - id: CORE-TASK-018
+  - id: CORE-TASK-019
     title: 实现商品批量导入的预览、确认与查询接口
     purpose: >-
       按契约 docs/CONTRACT_V1.md 0.7 的 2.3、2.7 与第 10 节第 4 条的 scope 表，实现 POST /v1/catalog-imports（catalog_imports.preview）、POST /v1/catalog-imports/{import_id}/confirm（catalog_imports.confirm）
-      与 GET /v1/catalog-imports/{import_id}。表用 CORE-TASK-012 的 catalog_imports，判定用 CORE-TASK-014 的纯函数，建商品、SKU 与变更记录复用 CORE-TASK-016 的服务层函数（变更记录带 import_id）。
+      与 GET /v1/catalog-imports/{import_id}。表用 CORE-TASK-012 的 catalog_imports，判定用 CORE-TASK-014 的纯函数，建商品、SKU 与变更记录复用 CORE-TASK-017 的服务层函数（变更记录带 import_id）。
       接口放新文件 app/api/catalog_imports.py（在 app/main.py 挂上），数据库读写放新文件 app/services/catalog_imports.py。
       一，预览：要求 catalog.write 与 catalog_admin，经 run_idempotent，不声明目录写锁（预览不写目录）。正文顶层只有 rows，它是 1 到 100 个元素的数组（批量数组，超过 100 为 413），
       每个元素是 JSON 对象；顶层多字段、rows 不是数组、为空数组或元素不是对象都整单 422；行内字段的问题不整单拒绝，由 CORE-TASK-014 记为 invalid_format。
@@ -837,7 +867,7 @@ tasks:
     depends_on:
       - CORE-TASK-012
       - CORE-TASK-014
-      - CORE-TASK-016
+      - CORE-TASK-017
     acceptance_criteria:
       - 接口放 app/api/catalog_imports.py 并在 app/main.py 挂上，数据库读写放 app/services/catalog_imports.py
       - 集成测试在真 MySQL 上验证预览：201、import_id 前缀 imp_、status previewed、expires_at 为数据库时间加 24 小时（允许几秒误差）、逐行结果与汇总按 CORE-TASK-014；库里一行导入记录带凭据、操作者与请求 ID；目录没有新行；另一个连接持有本租户目录锁时预览照常成功
@@ -861,7 +891,7 @@ tasks:
     creates_branch: true
     creates_pull_request: true
 
-  - id: CORE-TASK-019
+  - id: CORE-TASK-020
     title: 实现目录变更流的拉取接口
     purpose: >-
       按契约 docs/CONTRACT_V1.md 0.7 的 2.5 与 2.7，实现 GET /v1/catalog-changes，要求 catalog.read，不要求角色。接口放新文件 app/api/catalog_changes.py（在 app/main.py 挂上），
@@ -872,16 +902,16 @@ tasks:
       每条为 cursor、event_type、object_type、object_id、product_id、version、changes（存的 JSON 原样）、actor_ref、reason、import_id、request_id、occurred_at（取 created_at）；
       不输出 credential_id、actor_role 与 idempotency_key。
       明确不做：推送、按对象或事件类型筛选、Core 侧保存消费进度。
-      暂不可开始：设计预审发现按自增 id 的游标在整机恢复丢失最近写入后会让新记录复用网店已保存游标之前的 id、被跳过，需先改契约并经 Kelvin 批准，之后按新契约改写本任务再改回 ready。
+      暂不可开始：设计预审发现按自增 id 的游标在整机恢复丢失最近写入后会让新记录复用网店已保存游标之前的 id、被跳过，Kelvin 2026-11-14 定在恢复流程里抬高自增起点，需先把这条写进契约并经 Kelvin 批准，之后按新契约核对本任务再改回 ready。
     status: blocked
     depends_on:
       - CORE-TASK-012
       - CORE-TASK-013
-      - CORE-TASK-017
+      - CORE-TASK-018
     acceptance_criteria:
       - 接口放 app/api/catalog_changes.py 并在 app/main.py 挂上
       - 集成测试在真 MySQL 上验证：不带 after 从头按 id 升序返回本租户的记录、看不到别的租户的；用较小的 limit 翻页，按 next_cursor 接着拉不重不漏；没有新记录时 next_cursor 原样返回 after，没带 after 且没有记录时为 null；用旧游标重拉得到同样的记录
-      - 集成测试验证字段：每条字段按 purpose 第三条，不含 credential_id、actor_role 与 idempotency_key；经 CORE-TASK-016、017 的接口产生的记录里，新建商品是一条 product_created 后接各 SKU 的 sku_created，同时改名称与参考价只有一条 sku_updated、changes 含两个字段，停用记 status 的前后值
+      - 集成测试验证字段：每条字段按 purpose 第三条，不含 credential_id、actor_role 与 idempotency_key；经 CORE-TASK-017、018 的接口产生的记录里，新建商品是一条 product_created 后接各 SKU 的 sku_created，同时改名称与参考价只有一条 sku_updated、changes 含两个字段，停用记 status 的前后值
       - 集成测试验证参数：after 为 0、带前导零、不是数字或超过上限，limit 为 0、101、带符号或不是数字，同一参数出现两次，带未知参数，都为 422；缺 catalog.read 为 403；不带操作者头照常 200
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
       - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
