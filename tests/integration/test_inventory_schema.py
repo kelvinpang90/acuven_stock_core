@@ -19,7 +19,7 @@ from app.models.inventory import (
     StockBalance,
     StockPool,
 )
-from tests.integration.conftest import assert_rejected_by, new_id
+from tests.integration.conftest import add_credential, assert_rejected_by, new_id
 
 # (tenant_id, pool_id, sku_id)：一个余额行，也是流水指向它的复合外键。
 Balance = tuple[str, str, str]
@@ -156,11 +156,11 @@ def add_entry(db: Connection, balance: Balance, version: int, **overrides: objec
     return entry_id
 
 
-def idempotency_insert(tenant_id: str, **overrides: object) -> Executable:
+def idempotency_insert(tenant_id: str, credential_id: str, **overrides: object) -> Executable:
     values = {
         "idempotency_record_id": new_id("idem"),
         "tenant_id": tenant_id,
-        "credential_id": "cred_01",
+        "credential_id": credential_id,
         "operation": "reservations.create",
         "idempotency_key": "shop:order:1001:reserve:1",
         "request_hash": "0" * 64,
@@ -407,6 +407,20 @@ def test_entry_channel_must_belong_to_the_same_tenant(db: Connection):
     add_entry(db, balance, 1, channel_id=add_channel(db, tenant, pool))
 
 
+def test_entry_credential_is_optional_but_must_belong_to_the_same_tenant(db: Connection):
+    balance = add_balance(db)
+    for credential in [new_id("cred"), add_credential(db, add_tenant(db))]:
+        assert_rejected_by(
+            db,
+            entry_insert(balance, 1, credential_id=credential),
+            "fk_ledger_entries_tenant_id_credentials",
+        )
+    tenant, _, _ = balance
+    add_entry(db, balance, 1, credential_id=add_credential(db, tenant))
+    # Core 自己的到期关闭没有凭据。
+    add_entry(db, balance, 2, credential_id=None)
+
+
 def test_source_type_and_source_ref_come_together(db: Connection):
     balance = add_balance(db)
     add_entry(db, balance, 1, source_type="receipt", source_ref="rcv-2026-11-12-01")
@@ -428,17 +442,36 @@ IDEMPOTENCY_SCOPE_UNIQUE = "uq_idempotency_records_tenant_id_credential_id_opera
 
 def test_idempotency_key_is_unique_per_tenant_credential_and_operation(db: Connection):
     tenant = add_tenant(db)
-    db.execute(idempotency_insert(tenant))
-    assert_rejected_by(db, idempotency_insert(tenant), IDEMPOTENCY_SCOPE_UNIQUE)
-    db.execute(idempotency_insert(tenant, operation="sale_commits.create"))
-    db.execute(idempotency_insert(tenant, credential_id="cred_02"))
-    db.execute(idempotency_insert(add_tenant(db)))
+    credential = add_credential(db, tenant)
+    db.execute(idempotency_insert(tenant, credential))
+    assert_rejected_by(db, idempotency_insert(tenant, credential), IDEMPOTENCY_SCOPE_UNIQUE)
+    db.execute(idempotency_insert(tenant, credential, operation="sale_commits.create"))
+    db.execute(idempotency_insert(tenant, add_credential(db, tenant)))
+    other_tenant = add_tenant(db)
+    db.execute(idempotency_insert(other_tenant, add_credential(db, other_tenant)))
 
 
 def test_only_settled_responses_are_stored(db: Connection):
     tenant = add_tenant(db)
+    credential = add_credential(db, tenant)
     for status in [200, 409, 422, 499]:
-        db.execute(idempotency_insert(tenant, idempotency_key=f"k{status}", response_status=status))
+        settled = idempotency_insert(
+            tenant, credential, idempotency_key=f"k{status}", response_status=status
+        )
+        db.execute(settled)
     for status in [500, 503, 429, 199]:
-        rejected = idempotency_insert(tenant, idempotency_key=f"k{status}", response_status=status)
+        rejected = idempotency_insert(
+            tenant, credential, idempotency_key=f"k{status}", response_status=status
+        )
         assert_rejected_by(db, rejected, "ck_idempotency_records_response_status")
+
+
+def test_idempotency_record_credential_must_exist_in_the_same_tenant(db: Connection):
+    tenant = add_tenant(db)
+    other_tenant = add_tenant(db)
+    for credential in [new_id("cred"), add_credential(db, other_tenant)]:
+        assert_rejected_by(
+            db,
+            idempotency_insert(tenant, credential),
+            "fk_idempotency_records_tenant_id_credentials",
+        )
