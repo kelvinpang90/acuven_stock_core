@@ -5,12 +5,13 @@ from uuid import uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import Connection, Engine
+from sqlalchemy import Connection, Engine, insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql.expression import Executable
 
 from alembic import command
 from app.db import make_engine
+from app.models.service_auth import Credential
 
 # 只指向 CI 的一次性 MySQL 服务容器；本地没设时，用到下面夹具的测试跳过。
 TEST_DATABASE_URL = os.environ.get("CORE_TEST_DATABASE_URL", "")
@@ -59,3 +60,21 @@ def assert_rejected_by(db: Connection, statement: Executable, constraint: str) -
     with pytest.raises(DBAPIError) as caught, db.begin_nested():
         db.execute(statement)
     assert constraint in str(caught.value.orig)
+
+
+def credential_insert(tenant_id: str, **overrides: object) -> Executable:
+    values = {
+        "credential_id": new_id("cred"),
+        "tenant_id": tenant_id,
+        "name": "Shop",
+        "scopes": ["stock.read", "stock.write"],
+        "status": "active",
+    }
+    return insert(Credential).values(values | overrides)
+
+
+def add_credential(db: Connection, tenant_id: str, **overrides: object) -> str:
+    """幂等记录与流水的 credential_id 要指向同租户的凭据；同一租户可以建多个。"""
+    credential_id = new_id("cred")
+    db.execute(credential_insert(tenant_id, credential_id=credential_id, **overrides))
+    return credential_id

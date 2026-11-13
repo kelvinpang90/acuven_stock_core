@@ -194,6 +194,10 @@ class LedgerEntry(Base):
             ["tenant_id", "corrects_entry_id"],
             ["ledger_entries.tenant_id", "ledger_entries.entry_id"],
         ),
+        # Core 自己的到期关闭没有凭据，credential_id 为空时不检查。
+        ForeignKeyConstraint(
+            ["tenant_id", "credential_id"], ["credentials.tenant_id", "credentials.credential_id"]
+        ),
         # 复合外键 (tenant_id, entry_id) 的引用目标。
         UniqueConstraint("tenant_id", "entry_id"),
         UniqueConstraint("tenant_id", "pool_id", "sku_id", "balance_version_after"),
@@ -232,7 +236,6 @@ class LedgerEntry(Base):
     command_id: Mapped[str] = mapped_column(ID, index=True)
     # Core 自己的到期关闭没有请求，也就没有幂等键。
     idempotency_key: Mapped[str | None] = mapped_column(REF)
-    # 服务凭据表随下一任务建，届时再加外键。
     credential_id: Mapped[str | None] = mapped_column(ID)
     actor_ref: Mapped[str | None] = mapped_column(REF)
     actor_role: Mapped[str | None] = mapped_column(CODE32)
@@ -252,6 +255,9 @@ class IdempotencyRecord(Base):
 
     __tablename__ = "idempotency_records"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "credential_id"], ["credentials.tenant_id", "credentials.credential_id"]
+        ),
         # 契约 7.1 的作用域。约束名超过 64 字符，建表时按命名约定截断加摘要。
         UniqueConstraint("tenant_id", "credential_id", "operation", "idempotency_key"),
         CheckConstraint(
@@ -263,7 +269,6 @@ class IdempotencyRecord(Base):
 
     idempotency_record_id: Mapped[str] = mapped_column(ID, primary_key=True)
     tenant_id: Mapped[str] = mapped_column(ID, ForeignKey("tenants.tenant_id"))
-    # 服务凭据表随下一任务建，届时再加外键。
     credential_id: Mapped[str] = mapped_column(ID)
     operation: Mapped[str] = mapped_column(String(64, collation=EXACT_COLLATION))
     idempotency_key: Mapped[str] = mapped_column(REF)
