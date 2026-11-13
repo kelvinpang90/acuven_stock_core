@@ -5,13 +5,16 @@
 安全事件总在业务事务之外另开短事务写入，不随业务事务回滚；
 写入失败只记进程日志，不改变对调用方的响应。
 不记 Authorization 头、令牌与请求体：调用方只把契约 7.2 列出的内容放进 details。
+
+满 1 年的事件由 purge_expired_security_events 整批删除（契约 7.1 保留期、7.2），
+定时任务在 app/main.py 接入。
 """
 
 import logging
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from sqlalchemy import Connection, Engine, insert
+from sqlalchemy import Connection, Engine, insert, text
 
 from app.domain.ids import new_id
 from app.domain.requests import truncate_user_agent
@@ -22,8 +25,20 @@ FORBIDDEN = "forbidden"
 CROSS_TENANT = "cross_tenant"
 
 PATH_MAX_LENGTH = 512
+PURGE_BATCH_SIZE = 1000
 
 _log = logging.getLogger(__name__)
+# 清理结果写到 app.api 的子日志器：app/api/requests.py 给 app.api 挂了输出、级别 INFO。
+# 不给本模块的日志器挂处理器：命令行也 import 本模块，挂上会把写入失败的堆栈打到标准错误。
+_purge_log = logging.getLogger("app.api.retention")
+
+# 按数据库时间：恰好满 1 年的也删。只删 security_events。
+_PURGE_BATCH = text(
+    "DELETE FROM security_events"
+    " WHERE occurred_at <= CURRENT_TIMESTAMP(6) - INTERVAL 1 YEAR"
+    " ORDER BY occurred_at"
+    " LIMIT :batch_size"
+)
 
 
 @dataclass(frozen=True)
@@ -79,3 +94,21 @@ def record_security_event(
         )
         return False
     return True
+
+
+def purge_expired_security_events(connection: Connection) -> int:
+    """删除 occurred_at 不晚于数据库当前时间减 1 年的事件，返回删除总数。
+
+    每批最多 PURGE_BATCH_SIZE 行、每批一个短事务，某批不足一批为止；各批都在 connection 上执行。
+    传入时其上不能有打开的事务（与 record_security_event 的约定一致）。
+    多个进程同时清理只是重复删除同一批，结果不变。
+    """
+    total = 0
+    while True:
+        with connection.begin():
+            deleted = connection.execute(_PURGE_BATCH, {"batch_size": PURGE_BATCH_SIZE}).rowcount
+        total += deleted
+        if deleted < PURGE_BATCH_SIZE:
+            break
+    _purge_log.info("purged %d security events older than 1 year", total)
+    return total
