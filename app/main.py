@@ -3,6 +3,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.errors import install_error_handlers
+from app.api.requests import RequestMiddleware
 from app.config import Settings
 from app.db import make_engine
 from app.domain.environment import health_payload
@@ -12,6 +14,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     engine = make_engine(settings.database_url) if settings.database_url else None
     app = FastAPI(title="Acuven Stock Core", docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(RequestMiddleware)
+    install_error_handlers(app)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
