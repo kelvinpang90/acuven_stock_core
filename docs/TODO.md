@@ -26,7 +26,6 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-011` 实现安全事件满一年的定时清理
 
 ### 已阻塞
 
