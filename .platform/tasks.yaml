@@ -214,7 +214,7 @@ tasks:
       命名锁的锁名是数据库名与 tenant_id、credential_id、操作类型、幂等键五项以换行符连接后 UTF-8 的 SHA-256 小写十六进制，64 个字符；
       已有记录与本次摘要的比较返回执行、重放或冲突三种决定；结果是否作为确定结果保存：200 到 499，但 429 与错误码为 REQUEST_IN_PROGRESS 或 IDEMPOTENCY_CONFLICT 的 409 除外。
       明确不做：建表、HTTP 接口、中间件、命令行、读写数据库。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 规则分放 app/domain/ids.py、app/domain/requests.py、app/domain/service_auth.py、app/domain/idempotency.py，单元测试放对应的 tests/unit 文件，用标准库 unittest
