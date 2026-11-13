@@ -11,9 +11,11 @@
       没有请求体的接口挂 no_body。
   8–9 步（角色、池授权）放在第 7 步的参数之后。
   4–6、8–9 步的依赖见 app/api/auth.py。
+  10 步：写接口在函数体里调幂等执行器，见 app/services/idempotency.py。
 
 数据库连接：一个请求用一个连接（request_connection），第一次用时从连接池取，
 请求结束时由 RequestMiddleware 归还；取不到时 503 UNAVAILABLE。
+连接上可能还留着会话状态（如释放失败的命名锁）时用 invalidate_connection 作废，不放回池里。
 
 每个请求结束时在 app.api.access 写一行 JSON 日志；不记 Authorization 头、令牌与请求体。
 """
@@ -111,6 +113,21 @@ def discard_connection(request: Request) -> None:
         connection.close()
     except SQLAlchemyError:
         _log.warning("closing a failed connection failed", exc_info=True)
+
+
+def invalidate_connection(request: Request) -> None:
+    """把本请求的连接从连接池作废，之后需要时另取一个。
+
+    连接断开后 MySQL 释放它的会话状态（如命名锁）。
+    """
+    connection = current_connection(request)
+    if connection is None:
+        return
+    try:
+        connection.invalidate()
+    except SQLAlchemyError:
+        _log.warning("invalidating a connection failed", exc_info=True)
+    discard_connection(request)
 
 
 async def _release_connection(scope: Scope) -> None:
