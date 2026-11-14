@@ -819,7 +819,7 @@ tasks:
       不加版本、不写记录（停用已合并的 SKU 也按这条）；否则改状态、版本加 1、updated_at 写数据库当前时间，写一条 product_deactivated、product_reactivated、sku_deactivated 或 sku_reactivated，
       changes 为 status 的前后值，reason 为空。停用商品不改它的 SKU 的状态；所属商品 inactive 时照样可以重新启用 SKU；停用不检查库存与未结订单。返回 200 与改后的表示。
       明确不做：预留对商品与 SKU 状态的检查（随预留任务做）、SKU 合并、删除、批量导入、变更流接口。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-017
     acceptance_criteria:
