@@ -732,7 +732,7 @@ tasks:
       reference_price（null 或含 amount_minor 与 currency 的对象）、status、product_status（所属商品的状态）、merged_into_sku_id、version、created_at、updated_at。
       时间为 UTC 的 RFC 3339 字符串，微秒精度，以 Z 结尾；格式化函数放在 app/api/catalog.py，之后的接口照用。
       明确不做：任何写命令（下一任务起）、批量导入、变更流接口。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-013
     acceptance_criteria:
