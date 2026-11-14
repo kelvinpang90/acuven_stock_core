@@ -664,7 +664,7 @@ tasks:
       三，确认计划：输入预览的逐行结果与按当前目录重查得到的冲突（哪些 ok 行的编码或条码现已被占用）；按组在 rows 里首次出现的顺序列出要建的组（整组都没有冲突的 ok 组，名称取 product_name，各 SKU 名称取 sku_name）；
       逐行结果为 created（由服务层建好后填 product_id 与 sku_id）、skipped（预览不合格，带预览结果）或 failed（重查冲突的行为 conflicts_existing，同组别的行为 group_blocked）。
       明确不做：数据库、接口、存放格式。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-013
     acceptance_criteria:
