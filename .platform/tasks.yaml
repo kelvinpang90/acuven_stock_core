@@ -774,7 +774,7 @@ tasks:
       SKU 行插入成功而撞归属表主键为 SKU_CODE_RETIRED（编码已登记、但不是任何 SKU 的当前编码）；撞条码唯一约束为 BARCODE_TAKEN。这种 409 的 details.conflicts 只列撞上的那一项
       （field、value、code，新建商品时带该 SKU 在 skus 里的 index），不再补查其他冲突。
       明确不做：修改、停用、重新启用（下一任务）、批量导入、变更流接口、预留对商品状态的检查（随预留任务做）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-012
       - CORE-TASK-013
