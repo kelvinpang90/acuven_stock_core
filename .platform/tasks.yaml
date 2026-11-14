@@ -586,7 +586,7 @@ tasks:
       索引 (tenant_id, id) 与 (tenant_id, object_id, id)。没有 updated_at。
       超过 64 字符的约束名照先例由命名约定生成，迁移里用 op.f 引用。catalog_imports 的两个凭据外键都以 tenant_id 开头、指向 credentials，按命名约定会同名，
       所以确认人的外键在模型与迁移里显式命名为 fk_catalog_imports_confirmed_credential_id_credentials（预览人的外键照约定命名）。明确不做：写这两张表的代码、目录写锁、接口；不改已有表。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 两张表的模型加在 app/models/catalog.py（该模块已在 alembic/env.py 登记，不改 env.py）；迁移文件放 alembic/versions，revision 0004 接在 0003 之后，upgrade 与 downgrade 都写全；约束名遵循 app/db.py 的命名约定
