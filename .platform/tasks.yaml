@@ -575,7 +575,8 @@ tasks:
       tenant_id 外键到 tenants；表间引用用 tenant_id 加 ID 的复合外键，被引用的表另设 tenant_id 加 ID 的唯一约束作引用目标；状态列 VARCHAR(16) 加检查约束；
       时间列 DATETIME(6)，created_at 默认 CURRENT_TIMESTAMP(6)；request_id 与 idempotency_key 与已有表同型（VARCHAR(128) utf8mb4_bin）；操作者 actor_ref 为 VARCHAR(128) utf8mb4_bin。
       一，catalog_imports（前缀 imp_，一次导入一行，永久保留）：import_id 主键；tenant_id 非空；tenant_id 加 import_id 唯一作引用目标；status 取 previewed 或 confirmed（检查约束）；
-      expires_at 非空；rows 为 JSON 非空，检查约束要求是数组（rows 是 MySQL 8 的保留字，检查约束文本与手写的 SQL 里要加反引号）；result 为 JSON 可空；预览的 credential_id 非空，以复合外键指向同租户的凭据；actor_ref 非空（预览要求 catalog_admin 角色，必有操作者）；
+      expires_at 非空；rows 为 JSON 非空，检查约束要求是数组（rows 是 MySQL 8 的保留字，检查约束文本与手写的 SQL 里要加反引号；SQLAlchemy 生成的 SQL 会自动给它加反引号，模型里写 mapped_column(JSON) 即可，
+      不传 quote 参数——只传 quote 不传列名时，导入模型就报错，集成测试全部起不来）；result 为 JSON 可空；预览的 credential_id 非空，以复合外键指向同租户的凭据；actor_ref 非空（预览要求 catalog_admin 角色，必有操作者）；
       request_id 非空；created_at；确认的 confirmed_credential_id（可空，非空时复合外键指向同租户的凭据）、confirmed_actor_ref、confirmed_request_id、confirmed_at 都可空；
       检查约束：status 为 previewed 时 result 与四个确认列都为空，为 confirmed 时都非空。不设 updated_at（契约 2.3 的列清单没有它，确认时间记在 confirmed_at）。
       二，catalog_changes（只追加，永久保留）：id 为 BIGINT 自增主键；tenant_id 非空；event_type 为 VARCHAR(32) utf8mb4_bin 非空，不加取值检查约束（契约 2.7，由应用校验）；
