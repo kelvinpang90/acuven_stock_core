@@ -8,6 +8,10 @@ read_* 与 find_* 都按租户过滤，不管事务：调用方在自己的连�
 写入函数在调用方已开的事务里运行（幂等执行器的事务，已取目录写锁），自己不提交、不回滚；
 与现有目录冲突抛 CatalogConflict，由调用方撤销已做的写入。
 sku_conflicts、create_sku 与 record_change 供之后的修改与批量导入共用。
+
+修改、停用与重新启用（§2.6 第 4、5 条）：调用方先用 lock_product、lock_sku 在事务里
+SELECT … FOR UPDATE 读要改的行，判定完不存在、合并、版本与“改没改”之后，
+把改动字段交给 update_product、update_sku 写入。
 """
 
 import re
@@ -15,7 +19,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import Connection, and_, insert, select
+from sqlalchemy import Connection, and_, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.domain.catalog import (
@@ -23,14 +27,18 @@ from app.domain.catalog import (
     BARCODE,
     BARCODE_TAKEN,
     CLAIM_INSERT,
+    CLAIM_OWNED,
     EVENT_TYPES,
+    NAME,
     PRODUCT,
     PRODUCT_CREATED,
+    REFERENCE_PRICE,
     SKU,
     SKU_CODE,
     SKU_CODE_RETIRED,
     SKU_CODE_TAKEN,
     SKU_CREATED,
+    STATUS,
     Conflict,
     code_key,
     decide_code_claim,
@@ -38,7 +46,7 @@ from app.domain.catalog import (
     sku_created_changes,
 )
 from app.domain.ids import new_id
-from app.models.catalog import CatalogChange, Product, Sku, SkuCodeClaim
+from app.models.catalog import NOW, CatalogChange, Product, Sku, SkuCodeClaim, SkuCodeHistory
 
 _DUPLICATE_ENTRY = 1062  # MySQL ER_DUP_ENTRY
 # 唯一约束名（app/db.py 的命名约定）；MySQL 8 的报错写成 '表名.约束名'。
@@ -113,19 +121,22 @@ def _sku_query():
     )
 
 
-def _sku_record(row) -> SkuRecord:
+def _reference_price(row) -> dict | None:
     amount = row["reference_price_amount_minor"]
     # 数据库保证金额与币种同时有或同时无。
-    price = None
-    if amount is not None:
-        price = {"amount_minor": amount, "currency": row["reference_price_currency"]}
+    if amount is None:
+        return None
+    return {"amount_minor": amount, "currency": row["reference_price_currency"]}
+
+
+def _sku_record(row) -> SkuRecord:
     return SkuRecord(
         sku_id=row["sku_id"],
         product_id=row["product_id"],
         sku_code=row["sku_code"],
         barcode=row["barcode"],
         name=row["name"],
-        reference_price=price,
+        reference_price=_reference_price(row),
         status=row["status"],
         product_status=row["product_status"],
         merged_into_sku_id=row["merged_into_sku_id"],
@@ -251,6 +262,39 @@ def _claim_owner(connection: Connection, tenant_id: str, sku_code: str) -> tuple
     return None
 
 
+def _locked_claim_owner(
+    connection: Connection, tenant_id: str, sku_code: str
+) -> tuple[str, str] | None:
+    """同 _claim_owner，但用加锁读（SELECT … FOR SHARE）直接查归属行，再查那个 SKU 的当前编码。
+
+    改编码的写入用它，不经 sku_update_conflicts。
+    """
+    statement = (
+        select(SkuCodeClaim.code, SkuCodeClaim.sku_id)
+        .where(SkuCodeClaim.tenant_id == tenant_id, SkuCodeClaim.code == sku_code)
+        .with_for_update(read=True)
+    )
+    key = code_key(sku_code)
+    for code, sku_id in connection.execute(statement).all():
+        if code_key(code) == key:
+            current = (
+                select(Sku.sku_code)
+                .where(Sku.tenant_id == tenant_id, Sku.sku_id == sku_id)
+                .with_for_update(read=True)
+            )
+            return sku_id, connection.execute(current).scalar_one()
+    return None
+
+
+def _decide_claim(
+    owner: tuple[str, str] | None, sku_code: str, requesting_sku_id: str | None
+) -> str:
+    """把 _claim_owner 的结果交给 §2.2 的编码归属判定。"""
+    owner_sku_id, current_code = owner if owner is not None else (None, None)
+    matches = current_code is not None and code_key(current_code) == code_key(sku_code)
+    return decide_code_claim(owner_sku_id, matches, requesting_sku_id)
+
+
 def sku_conflicts(
     connection: Connection, tenant_id: str, sku: SkuFields, index: int | None = None
 ) -> list[Conflict]:
@@ -261,9 +305,7 @@ def sku_conflicts(
     """
     conflicts = []
     owner = _claim_owner(connection, tenant_id, sku.sku_code)
-    owner_sku_id, current_code = owner if owner is not None else (None, None)
-    matches = current_code is not None and code_key(current_code) == code_key(sku.sku_code)
-    decision = decide_code_claim(owner_sku_id, matches, None)
+    decision = _decide_claim(owner, sku.sku_code, None)
     if decision != CLAIM_INSERT:
         conflicts.append(Conflict(SKU_CODE, sku.sku_code, decision, index))
     if sku.barcode is not None:
@@ -433,3 +475,257 @@ def add_sku(
     if conflicts:
         raise CatalogConflict(conflicts)
     return create_sku(connection, tenant_id, product_id, sku, author)
+
+
+# --- 修改、停用与重新启用 ---
+
+
+@dataclass(frozen=True)
+class LockedProduct:
+    """在事务里加了排他锁的商品行。"""
+
+    product_id: str
+    name: str
+    status: str
+    version: int
+
+    def current(self) -> dict:
+        """可改字段的当前值，供 diff_fields 与 status_changes 比较。"""
+        return {NAME: self.name, STATUS: self.status}
+
+
+@dataclass(frozen=True)
+class LockedSku:
+    """在事务里加了排他锁的 SKU 行（不含所属商品）。"""
+
+    sku_id: str
+    product_id: str
+    sku_code: str
+    barcode: str | None
+    name: str
+    reference_price: dict | None
+    status: str
+    merged_into_sku_id: str | None
+    version: int
+
+    def current(self) -> dict:
+        return {
+            SKU_CODE: self.sku_code,
+            BARCODE: self.barcode,
+            NAME: self.name,
+            REFERENCE_PRICE: self.reference_price,
+            STATUS: self.status,
+        }
+
+
+def lock_product(connection: Connection, tenant_id: str, product_id: str) -> LockedProduct | None:
+    """SELECT … FOR UPDATE 读本租户的商品；不存在或属于别的租户为 None（后者不加锁）。"""
+    statement = (
+        select(Product.product_id, Product.name, Product.status, Product.version)
+        .where(Product.tenant_id == tenant_id, Product.product_id == product_id)
+        .with_for_update()
+    )
+    row = connection.execute(statement).mappings().first()
+    return None if row is None else LockedProduct(**row)
+
+
+def lock_sku(connection: Connection, tenant_id: str, sku_id: str) -> LockedSku | None:
+    """同 lock_product，读 SKU 行；已合并的照常返回。"""
+    statement = (
+        select(
+            Sku.sku_id,
+            Sku.product_id,
+            Sku.sku_code,
+            Sku.barcode,
+            Sku.name,
+            Sku.reference_price_amount_minor,
+            Sku.reference_price_currency,
+            Sku.status,
+            Sku.merged_into_sku_id,
+            Sku.version,
+        )
+        .where(Sku.tenant_id == tenant_id, Sku.sku_id == sku_id)
+        .with_for_update()
+    )
+    row = connection.execute(statement).mappings().first()
+    if row is None:
+        return None
+    return LockedSku(
+        sku_id=row["sku_id"],
+        product_id=row["product_id"],
+        sku_code=row["sku_code"],
+        barcode=row["barcode"],
+        name=row["name"],
+        reference_price=_reference_price(row),
+        status=row["status"],
+        merged_into_sku_id=row["merged_into_sku_id"],
+        version=row["version"],
+    )
+
+
+def _after(changes: dict, field: str):
+    """改动字段里 field 的新值；没改这个字段为 None。"""
+    change = changes.get(field)
+    return None if change is None else change["after"]
+
+
+def sku_update_conflicts(
+    connection: Connection, tenant_id: str, sku_id: str, changes: dict
+) -> list[Conflict]:
+    """修改这个 SKU 会与本租户别的 SKU 的哪些冲突（§2.2）；各项不带 index。
+
+    只看改动字段里的 sku_code 与非空 barcode。编码按归属判定，登记给自己的不算冲突；
+    条码与别的 SKU 的当前条码比较键相同为 BARCODE_TAKEN。
+    """
+    conflicts = []
+    sku_code = _after(changes, SKU_CODE)
+    if sku_code is not None:
+        owner = _claim_owner(connection, tenant_id, sku_code)
+        decision = _decide_claim(owner, sku_code, sku_id)
+        if decision not in (CLAIM_INSERT, CLAIM_OWNED):
+            conflicts.append(Conflict(SKU_CODE, sku_code, decision))
+    barcode = _after(changes, BARCODE)
+    if barcode is not None:
+        found = find_sku_by_barcode(connection, tenant_id, barcode)
+        if found is not None and found.sku_id != sku_id:
+            conflicts.append(Conflict(BARCODE, barcode, BARCODE_TAKEN))
+    return conflicts
+
+
+def _claim_code(connection: Connection, tenant_id: str, sku_id: str, sku_code: str) -> None:
+    """改编码时按 §2.2 的归属判定登记新编码：已归属自己不插入，否则插入归属行。
+
+    插入撞上归属表主键时加锁重查，按判定抛 SKU_CODE_TAKEN 或 SKU_CODE_RETIRED 的
+    CatalogConflict；重查仍找不到归属行时不猜，抛 RuntimeError（按 500 处理）。
+    """
+    owner = _locked_claim_owner(connection, tenant_id, sku_code)
+    if _decide_claim(owner, sku_code, sku_id) == CLAIM_OWNED:
+        return
+    try:
+        connection.execute(
+            insert(SkuCodeClaim).values(tenant_id=tenant_id, code=sku_code, sku_id=sku_id)
+        )
+        return
+    except IntegrityError as error:
+        if _duplicate_key(error) is None:
+            raise
+    owner = _locked_claim_owner(connection, tenant_id, sku_code)
+    if owner is None:
+        raise RuntimeError("sku_code_claims rejected a code that has no claim row")
+    decision = _decide_claim(owner, sku_code, sku_id)
+    if decision == CLAIM_OWNED:
+        return
+    raise CatalogConflict([Conflict(SKU_CODE, sku_code, decision)])
+
+
+def _sku_columns(changes: dict) -> dict:
+    """改动字段对应的 skus 列；reference_price 拆成金额与币种两列。"""
+    values = {}
+    for field, change in changes.items():
+        after = change["after"]
+        if field == REFERENCE_PRICE:
+            price = after or {"amount_minor": None, "currency": None}
+            values["reference_price_amount_minor"] = price["amount_minor"]
+            values["reference_price_currency"] = price["currency"]
+        else:
+            values[field] = after
+    return values
+
+
+def update_product(
+    connection: Connection,
+    tenant_id: str,
+    product: LockedProduct,
+    changes: dict,
+    author: ChangeAuthor,
+    event_type: str,
+) -> None:
+    """把改动字段（name 或 status）写进加了锁的商品行，再写一条 event_type 的变更记录。
+
+    版本加 1、updated_at 取数据库当前时间；changes 不能为空。不改它的 SKU。
+    """
+    version = product.version + 1
+    connection.execute(
+        update(Product)
+        .where(Product.tenant_id == tenant_id, Product.product_id == product.product_id)
+        .values(
+            **{field: change["after"] for field, change in changes.items()},
+            version=version,
+            updated_at=NOW,
+        )
+    )
+    record_change(
+        connection,
+        tenant_id,
+        author,
+        event_type=event_type,
+        object_type=PRODUCT,
+        object_id=product.product_id,
+        product_id=product.product_id,
+        version=version,
+        changes=changes,
+    )
+
+
+def update_sku(
+    connection: Connection,
+    tenant_id: str,
+    sku: LockedSku,
+    changes: dict,
+    author: ChangeAuthor,
+    event_type: str,
+) -> None:
+    """把改动字段写进加了锁的 SKU 行（§2.2、§2.6 第 4、5 条）；changes 不能为空。
+
+    先用 sku_update_conflicts 查冲突，有就抛 CatalogConflict，什么也不写。
+    改了 sku_code 时先登记新编码；再改 SKU 行（版本加 1、updated_at 取数据库当前时间）；
+    再把旧值、新值、操作者与原因写进 sku_code_history；最后写一条 event_type 的变更记录。
+    写入仍撞上唯一约束时抛 CatalogConflict，只列撞上的那一项：撞 skus 的编码约束为
+    SKU_CODE_TAKEN、条码约束为 BARCODE_TAKEN，撞归属表主键见 _claim_code。
+    已做的写入由调用方撤销。
+    """
+    conflicts = sku_update_conflicts(connection, tenant_id, sku.sku_id, changes)
+    if conflicts:
+        raise CatalogConflict(conflicts)
+    sku_code = _after(changes, SKU_CODE)
+    barcode = _after(changes, BARCODE)
+    if sku_code is not None:
+        _claim_code(connection, tenant_id, sku.sku_id, sku_code)
+    version = sku.version + 1
+    try:
+        connection.execute(
+            update(Sku)
+            .where(Sku.tenant_id == tenant_id, Sku.sku_id == sku.sku_id)
+            .values(**_sku_columns(changes), version=version, updated_at=NOW)
+        )
+    except IntegrityError as error:
+        key = _duplicate_key(error)
+        if key == _SKU_CODE_UNIQUE and sku_code is not None:
+            conflict = Conflict(SKU_CODE, sku_code, SKU_CODE_TAKEN)
+        elif key == _BARCODE_UNIQUE and barcode is not None:
+            conflict = Conflict(BARCODE, barcode, BARCODE_TAKEN)
+        else:
+            raise
+        raise CatalogConflict([conflict]) from None
+    if sku_code is not None:
+        connection.execute(
+            insert(SkuCodeHistory).values(
+                tenant_id=tenant_id,
+                sku_id=sku.sku_id,
+                old_code=sku.sku_code,
+                new_code=sku_code,
+                actor_ref=author.actor_ref,
+                reason=author.reason,
+            )
+        )
+    record_change(
+        connection,
+        tenant_id,
+        author,
+        event_type=event_type,
+        object_type=SKU,
+        object_id=sku.sku_id,
+        product_id=sku.product_id,
+        version=version,
+        changes=changes,
+    )
