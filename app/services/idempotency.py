@@ -44,6 +44,22 @@
 - 接口函数原样返回 run_idempotent 的结果：首次结果、重放或冲突；
   重放带 Idempotency-Replayed: true，X-Request-ID 头是本次的。
   保存的响应体是首次返回的完整响应体（含当时的 request_id）；首次的响应头不保存。
+
+目录写锁（契约 §2.7、§7.1 执行顺序第 3 步）：
+
+- 写目录的命令调用 run_idempotent(..., catalog_lock=True)；
+  不写目录的命令不传（默认 False），行为不变。
+  凡是写目录变更记录（catalog_changes）的路径都要这样声明。
+- 声明了的命令在取到幂等锁之后、开事务之前，在同一连接上、没有打开事务时
+  GET_LOCK(目录锁名, CATALOG_LOCK_WAIT_SECONDS) 取本租户的目录写锁；锁名用
+  app/domain/catalog.py 的 catalog_lock_name，数据库名的取法与幂等锁名相同。
+  取到之后才开事务，读快照建立在目录锁之后。
+- 返回 0（等待超时）、NULL 或数据库出错：503 UNAVAILABLE，什么也不写、
+  不保存幂等记录，同键重试会重新执行。
+  幂等锁返回 0 时照旧立即 409 REQUEST_IN_PROGRESS，不去取目录锁。
+- 目录写锁与幂等锁都由 RELEASE_ALL_LOCKS() 一并释放，无论命令成功、业务拒绝、抛异常还是 503。
+- 开事务前的先后固定为：幂等锁 → 目录写锁（只有写目录的命令）→ 余额行预建的短事务
+  （§4.1，只有要锁余额行的命令）→ 开业务事务。不在打开事务或持有行锁时带等待地 GET_LOCK。
 """
 
 import json
@@ -68,6 +84,7 @@ from app.api.requests import (
     request_connection,
     unavailable,
 )
+from app.domain.catalog import catalog_lock_name
 from app.domain.idempotency import (
     IDEMPOTENCY_CONFLICT,
     REQUEST_IN_PROGRESS,
@@ -84,6 +101,8 @@ from app.services.security_events import SecurityEventRecord, record_security_ev
 REPLAYED = "Idempotency-Replayed"
 # 安全事件类型（契约 §7.2）。
 IDEMPOTENCY_CONFLICT_EVENT = "idempotency_conflict"
+# 取目录写锁最多等待的秒数（§2.7）；测试可以换成更短的值。
+CATALOG_LOCK_WAIT_SECONDS = 5
 
 _OPERATION = re.compile(r"[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)+")
 _OPERATION_MAX_LENGTH = 64
@@ -155,8 +174,12 @@ def run_idempotent(
     operation: str,
     body: ParsedBody | None,
     command: Callable[[Execution], CommandResult],
+    catalog_lock: bool = False,
 ) -> Response:
-    """第 10 步：取命名锁，重放、冲突或执行命令，释放锁，再写安全事件。"""
+    """第 10 步：取命名锁，重放、冲突或执行命令，释放锁，再写安全事件。
+
+    catalog_lock 为真时（写目录的命令）取到幂等锁之后、开事务之前再取本租户的目录写锁。
+    """
     if (
         not isinstance(operation, str)
         or len(operation) > _OPERATION_MAX_LENGTH
@@ -175,8 +198,9 @@ def run_idempotent(
     digest = request_digest(dict(request.path_params), None if body is None else body.raw)
 
     connection = _idle_connection(request)
+    database = connection.engine.url.database or ""
     name = lock_name(
-        connection.engine.url.database or "",
+        database,
         scope.tenant_id,
         scope.credential_id,
         scope.operation,
@@ -184,6 +208,8 @@ def run_idempotent(
     )
     try:
         _acquire(request, connection, name)
+        if catalog_lock:
+            _acquire_catalog(request, connection, catalog_lock_name(database, scope.tenant_id))
         response, events = _execute(request, connection, scope, digest, command)
     finally:
         _release_locks(request, connection)
@@ -226,6 +252,29 @@ def _acquire(request: Request, connection: Connection, name: str) -> None:
             headers={"Retry-After": "1"},
         )
     raise unavailable()
+
+
+def _acquire_catalog(request: Request, connection: Connection, name: str) -> None:
+    """GET_LOCK(目录锁名, 等待秒数)：1 取到；0（超时）、NULL 或出错 503。都不写任何东西。
+
+    调用时连接上没有打开的事务：_acquire 已结束它的语句隐式开的事务。
+    """
+    try:
+        acquired = connection.execute(
+            text("SELECT GET_LOCK(:name, :timeout)"),
+            {"name": name, "timeout": CATALOG_LOCK_WAIT_SECONDS},
+        ).scalar()
+        # 同 _acquire：之后的事务在取到目录锁之后才建立读快照（§2.7）。
+        connection.rollback()
+    except SQLAlchemyError:
+        _log.warning(
+            "GET_LOCK on the catalog failed (request_id=%s)",
+            request.state.request_id,
+            exc_info=True,
+        )
+        raise unavailable() from None
+    if acquired != 1:
+        raise unavailable()
 
 
 def _release_locks(request: Request, connection: Connection) -> None:
