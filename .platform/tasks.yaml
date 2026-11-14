@@ -942,13 +942,13 @@ tasks:
       锁文件默认取方案约定的发行版标准锁目录下的路径（可用 ACUVEN_DEPLOY_LOCK 覆盖），等锁最多 300 秒（可用 ACUVEN_DEPLOY_LOCK_WAIT 覆盖）；
       锁空闲直接持锁，被占时日志写明持锁方并等待，等不到就在改动任何东西之前非零退出；持锁后写一行 holding the host deploy lock。
       锁路径写进公开仓库是 Kelvin 2026-11-14 批准的例外（不写服务器绝对路径规则的例外），PR 正文写明。
-      二，.github/workflows/deploy.yml：deploy job 的 timeout-minutes 从 12 改为 17（等锁 5 分钟加部署与回滚约 7 分钟加健康检查 5 分钟），文件头 D5 注释的合计 22 分钟改为 27 分钟；不动 on 与触发器形状。
+      二，.github/workflows/deploy.yml：deploy job 的 timeout-minutes 从 12 改为 17（等锁 5 分钟加部署与回滚约 7 分钟加健康检查 5 分钟），文件头 D5 注释的合计 22 分钟改为 27 分钟；Deploy 步骤的 ssh-action 加 command_timeout 13m（默认 10 分钟会在等锁加部署回滚的最坏情况下中途切断 SSH，方案第 8 节第 11 条）；不动 on 与触发器形状。
       明确不做：pull 失败重试、生产审批闸门、vps_infra 的共享脚本、改健康检查、改别的项目。由人工会话实施（方案第 8 节决定 6），不交给 Worker。
     status: ready
     depends_on: []
     acceptance_criteria:
       - deploy/deploy.sh 的锁片段与方案第 5.1 节逐字一致（项目名为 stock_core），位于 CORE_API_IMAGE 赋值之后、建内部网络之前；锁之后的部署顺序与失败语义不变
-      - deploy.yml 的 deploy job 为 17 分钟、build job 仍为 10 分钟，D5 注释写合计 27 分钟；on 段不变
+      - deploy.yml 的 deploy job 为 17 分钟、build job 仍为 10 分钟，D5 注释写合计 27 分钟；Deploy 步骤的 command_timeout 为 13m；on 段不变
       - 在 Linux 上用真 flock 验证两条路径并写进 PR 描述：锁被占时日志出现等待并在锁释放后继续；等锁超时时非零退出且没有执行任何 docker 命令
       - PR 正文写明锁路径进公开仓库是 Kelvin 2026-11-14 批准的例外
       - 合并后 main 上的 Deploy 成功，日志里出现 holding the host deploy lock
