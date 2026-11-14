@@ -1,45 +1,78 @@
-"""商品与 SKU 的查询接口（契约 §2.1、§2.4、§2.6 第 6、7 条、§7.2）。
+"""商品与 SKU 的查询与新建接口（契约 §2.1、§2.4、§2.6 第 1–3、6、7 条、§2.7、§7.2）。
 
 读接口要求 catalog.read、不要求角色；带了操作者头照样校验格式（authorize 里做）。
-查库在 app/services/catalog.py。product_representation、sku_representation 与 format_timestamp
+写命令要求 catalog.write 与 catalog_admin 角色，经幂等执行器并取目录写锁；
+字段取值与请求内的编码、条码重复在第 7 步拒绝（取锁之前，不保存）。
+查库与写库在 app/services/catalog.py。
+product_representation、sku_representation 与 format_timestamp
 供之后的目录写命令、批量导入与变更流共用。
 """
 
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from pydantic import Field, field_validator
 from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.auth import authorize, cross_tenant_not_found, get_access
+from app.api.auth import authorize, cross_tenant_not_found, get_access, require_role
 from app.api.errors import ApiError, invalid_request, ok
-from app.api.requests import MAX_BATCH_ITEMS, discard_connection, request_connection, unavailable
+from app.api.requests import (
+    MAX_BATCH_ITEMS,
+    ParsedBody,
+    RequestBody,
+    discard_connection,
+    json_body,
+    request_connection,
+    unavailable,
+)
 from app.domain.catalog import (
     BARCODE,
     PRODUCT,
     SKU,
     SKU_CODE,
     InvalidField,
+    code_key,
+    conflict_code,
     normalize_barcode,
+    normalize_name,
+    normalize_reason,
+    normalize_reference_price,
     normalize_sku_code,
+    sort_conflicts,
 )
-from app.domain.service_auth import CATALOG_READ
+from app.domain.requests import CATALOG_ADMIN, Actor
+from app.domain.service_auth import CATALOG_READ, CATALOG_WRITE
 from app.services import catalog
-from app.services.catalog import ProductRecord, SkuRecord
+from app.services.catalog import (
+    CatalogConflict,
+    ChangeAuthor,
+    ProductRecord,
+    SkuFields,
+    SkuRecord,
+)
+from app.services.idempotency import CommandResult, Execution, run_idempotent
+from app.services.security_events import CROSS_TENANT
 
 PRODUCT_NOT_FOUND = "PRODUCT_NOT_FOUND"
 SKU_NOT_FOUND = "SKU_NOT_FOUND"
 
+PRODUCTS_CREATE = "products.create"
+SKUS_CREATE = "skus.create"
+
 IDS = "ids"
 LIST_PARAMETERS = (SKU_CODE, BARCODE, IDS)
+SKUS = "skus"
 
 _log = logging.getLogger("app.api")
 
 router = APIRouter()
 _READ = [Depends(authorize(CATALOG_READ))]
+_WRITE = [Depends(authorize(CATALOG_WRITE, write=True))]
 
 
 # --- 表示（§2.6 第 7 条） ---
@@ -222,3 +255,195 @@ def list_skus(request: Request) -> JSONResponse:
         found = _read(request, lambda connection: find(connection, tenant_id, code))
         skus = [] if found is None else [found]
     return ok(request, {"skus": [sku_representation(sku) for sku in skus]})
+
+
+# --- 新建的请求体（§2.6 第 1–3 条） ---
+
+
+class NewSku(RequestBody):
+    """一个 SKU 对象；校验时按 §2.6 第 1 条规范化，不合规的字段按位置 422。"""
+
+    sku_code: str
+    name: str
+    barcode: str | None = None
+    reference_price: dict | None = None
+
+    @field_validator("sku_code")
+    @classmethod
+    def check_sku_code(cls, value: str) -> str:
+        return normalize_sku_code(value)
+
+    @field_validator("name")
+    @classmethod
+    def check_name(cls, value: str) -> str:
+        return normalize_name(value)
+
+    @field_validator("barcode")
+    @classmethod
+    def check_barcode(cls, value: str | None) -> str | None:
+        return normalize_barcode(value)
+
+    @field_validator("reference_price")
+    @classmethod
+    def check_reference_price(cls, value: dict | None) -> dict | None:
+        return normalize_reference_price(value)
+
+
+class AddedSku(NewSku):
+    """加规格的正文：一个 SKU 对象，另可带 reason。"""
+
+    reason: str | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def check_reason(cls, value: str | None) -> str | None:
+        return normalize_reason(value)
+
+
+class NewProduct(RequestBody):
+    """新建商品的正文；skus 是 1–100 个的批量数组（超过 100 为 413）。"""
+
+    batch_fields = (SKUS,)
+
+    name: str
+    skus: list[NewSku] = Field(min_length=1)
+    reason: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def check_name(cls, value: str) -> str:
+        return normalize_name(value)
+
+    @field_validator("reason")
+    @classmethod
+    def check_reason(cls, value: str | None) -> str | None:
+        return normalize_reason(value)
+
+
+new_product_body = json_body(NewProduct)
+added_sku_body = json_body(AddedSku)
+
+
+def checked_new_product(
+    body: Annotated[ParsedBody[NewProduct], Depends(new_product_body)],
+) -> ParsedBody[NewProduct]:
+    """第 7 步的最后一小步：同一请求里 sku_code 或非空 barcode 的比较键重复 422。
+
+    每个与前面某项重复的位置列一条，取锁之前拒绝、不保存。
+    """
+    errors = []
+    for field in (SKU_CODE, BARCODE):
+        seen = set()
+        for index, sku in enumerate(body.model.skus):
+            value = getattr(sku, field)
+            if value is None:
+                continue
+            key = code_key(value)
+            if key in seen:
+                errors.append({"loc": [SKUS, index, field], "type": "duplicate"})
+            seen.add(key)
+    if errors:
+        raise invalid_request("duplicate sku_code or barcode in skus", {"errors": errors})
+    return body
+
+
+CatalogAdmin = Annotated[Actor, Depends(require_role(CATALOG_ADMIN))]
+
+
+# --- 新建的命令（在幂等执行器的事务里运行） ---
+
+
+def _sku_fields(sku: NewSku) -> SkuFields:
+    return SkuFields(
+        sku_code=sku.sku_code,
+        barcode=sku.barcode,
+        name=sku.name,
+        reference_price=sku.reference_price,
+    )
+
+
+def _author(execution: Execution, actor: Actor, reason: str | None) -> ChangeAuthor:
+    """变更记录的凭据、操作者、角色、请求 ID 与幂等键取自本请求，原因取正文。"""
+    access = execution.access
+    return ChangeAuthor(
+        credential_id=access.principal.credential_id,
+        actor_ref=actor.ref,
+        actor_role=actor.role,
+        request_id=execution.request.state.request_id,
+        idempotency_key=access.idempotency_key,
+        reason=reason,
+    )
+
+
+def _conflict(error: CatalogConflict) -> ApiError:
+    """409 的顶层错误码与 details.conflicts（§2.6 第 2 条）。"""
+    conflicts = sort_conflicts(error.conflicts)
+    details = {"conflicts": [conflict.as_dict() for conflict in conflicts]}
+    message = "conflicts with the existing catalog"
+    return ApiError(409, conflict_code(conflicts), message, details=details)
+
+
+def _create_product(execution: Execution, actor: Actor, body: NewProduct) -> CommandResult:
+    connection = execution.connection
+    tenant_id = execution.access.principal.tenant_id
+    skus = [_sku_fields(sku) for sku in body.skus]
+    author = _author(execution, actor, body.reason)
+    try:
+        product_id = catalog.create_product(connection, tenant_id, body.name, skus, author)
+    except CatalogConflict as error:
+        raise _conflict(error) from None
+    product = catalog.read_product(connection, tenant_id, product_id)
+    return CommandResult(product_representation(product), 201)
+
+
+def _add_sku(execution: Execution, actor: Actor, product_id: str, body: AddedSku) -> CommandResult:
+    """商品不存在与属于别的租户同一个 404，后者另登记 cross_tenant。
+
+    inactive 的商品照样能加。
+    """
+    connection = execution.connection
+    tenant_id = execution.access.principal.tenant_id
+    owner = catalog.product_owner(connection, product_id)
+    if owner != tenant_id:
+        if owner is not None:
+            details = {"object_type": PRODUCT, "id": product_id}
+            execution.record_security_event(CROSS_TENANT, details)
+        raise ApiError(404, PRODUCT_NOT_FOUND, f"{PRODUCT} not found")
+    author = _author(execution, actor, body.reason)
+    try:
+        sku_id = catalog.add_sku(connection, tenant_id, product_id, _sku_fields(body), author)
+    except CatalogConflict as error:
+        raise _conflict(error) from None
+    sku = catalog.read_sku(connection, tenant_id, sku_id)
+    return CommandResult(sku_representation(sku), 201)
+
+
+@router.post("/v1/products", dependencies=_WRITE)
+def create_product(
+    request: Request,
+    body: Annotated[ParsedBody[NewProduct], Depends(checked_new_product)],
+    actor: CatalogAdmin,
+) -> Response:
+    return run_idempotent(
+        request,
+        operation=PRODUCTS_CREATE,
+        body=body,
+        command=lambda execution: _create_product(execution, actor, body.model),
+        catalog_lock=True,
+    )
+
+
+@router.post("/v1/products/{product_id}/skus", dependencies=_WRITE)
+def create_sku(
+    request: Request,
+    product_id: str,
+    body: Annotated[ParsedBody[AddedSku], Depends(added_sku_body)],
+    actor: CatalogAdmin,
+) -> Response:
+    return run_idempotent(
+        request,
+        operation=SKUS_CREATE,
+        body=body,
+        command=lambda execution: _add_sku(execution, actor, product_id, body.model),
+        catalog_lock=True,
+    )
