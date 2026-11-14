@@ -11,7 +11,7 @@
 #            不健康、回滚（无论回滚是否成功）、中断都以失败结束。没有 continue-on-error。
 #            Core 没有公网入口，健康检查经 SSH 在服务器上进容器取 /healthz（deploy/healthcheck.sh）。
 #   D4 并发：不取消进行中的部署（被取消的运行按失败处理）。
-#   D5 期限：两个 job 的 timeout-minutes 合计 22 分钟，30 分钟内给出结论；不用需要人工批准的 environment。
+#   D5 期限：两个 job 的 timeout-minutes 合计 27 分钟，30 分钟内给出结论；不用需要人工批准的 environment。
 # OpenClaw 只读结论：不部署、不回滚、不重跑，也不登录生产。
 #
 # 本文件不写主机名、IP、域名、路径、密钥：连接信息与部署目录放 GitHub secrets。
@@ -104,7 +104,7 @@ jobs:
     name: deploy
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 17
     permissions:
       contents: read
       packages: read
@@ -121,6 +121,12 @@ jobs:
 
       # 所有值经 envs 传给远端脚本，不拼进脚本文本。
       # 远端先检出 DEPLOY_SHA，再跑那个提交里的 deploy/deploy.sh（D2）；它失败即非零退出（D3）。
+      # command_timeout：ssh-action v1.0.3 默认 10 分钟。deploy.sh 最坏要等主机部署锁 5 分钟，再加部署与回滚
+      # 约 7 分钟（约 12 分钟），默认值会在部署中途切断 SSH；设为 13 分钟，留 1 分钟余量。
+      # 走到回滚时 deploy.sh 以非零退出，后面的上线后健康检查不运行。成功路径是等锁 5 分钟 + 拉取与迁移 +
+      # 等健康最多 3 分钟，再加健康检查：此时容器已健康，通常第一次就通过；healthcheck.sh 的上限是 30 次、
+      # 每次等 10 秒加取 healthz 最多 5 秒（约 7.5 分钟），只在异常时用满。那时 job 的 17 分钟可能先到，
+      # 切断的是只读的健康检查，结论照样是失败，不会切断进行中的部署。
       - name: Deploy
         uses: appleboy/ssh-action@v1.0.3
         env:
@@ -135,6 +141,7 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
           fingerprint: ${{ secrets.VPS_FINGERPRINT }}
+          command_timeout: 13m
           envs: DEPLOY_SHA,IMAGE_REPO,APP_DIR,GHCR_USER,GHCR_TOKEN
           script: |
             set -euo pipefail
