@@ -627,7 +627,7 @@ tasks:
       八，变更流（2.5）：八个事件类型常量；游标是变更记录 id 的十进制字符串，调用方当不透明值；解析游标只接受正整数的十进制表示：1 到 19 位数字、首位为 1 到 9、不超过 9223372036854775807（0 不合格）；
       limit 不带为 100，带时只接受无符号、无前导零、1 到 100 的十进制数字串；不合格都抛异常（接口转 422）。
       明确不做：数据库、接口、批量导入的逐行判定（下一任务）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 规则放 app/domain/catalog.py，只 import 标准库与 app/domain 内的模块；单元测试放 tests/unit/test_catalog.py
