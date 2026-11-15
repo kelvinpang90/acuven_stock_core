@@ -1257,7 +1257,7 @@ tasks:
       from、to 按 recorded_at 筛选（含 from、不含 to），after 为游标时只返回版本大于它的，limit 默认 100；返回 entries 与 next_cursor
       （最后一条的游标；没有记录时原样返回请求里的 after，没带为 null）。参数不合规 422。
       明确不做：GET /v1/availability（随预留任务做）、期初导入与盘点单的查询（随各自任务做）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-024
       - CORE-TASK-026
