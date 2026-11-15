@@ -1,12 +1,14 @@
-"""盘点单的开单、提交实数、取消与查询接口。
+"""盘点单的开单、提交实数、确认、取消与查询接口。
 
-契约第 6 节、§6.2、§6.6、§7.2、§10 第 3、4 条。确认落账另做。
-三个写命令要求 stock.write 与 stock_operator 或 stock_admin 角色，经幂等执行器，
+契约第 6 节、§6.2、§6.6、§7.2、§10 第 3、4 条。
+四个写命令要求 stock.write，经幂等执行器，
 业务事务以 READ COMMITTED 开启（app/services/counts.py 说明原因）。
-池授权：开单按正文的 pool_id；提交与取消按盘点单所属的池，
+开单、提交、取消接受 stock_operator 与 stock_admin；确认只接受 stock_admin。
+池授权：开单按正文的 pool_id；提交、确认与取消按盘点单所属的池，
 盘点单不存在或属于别的租户 404 COUNT_NOT_FOUND（后者记 cross_tenant，都不保存）。
 提交的 skus 是 1–100 个的批量数组（超过 413），sku_id 重复 422；
-余额行按盘点单的池与正文的 SKU 预建。取消没有请求体。
+余额行按盘点单的池与正文的 SKU 预建。确认的正文是 reason_code（必填）与可选的 note，
+不预建余额行（盘点行的余额行在提交时已建好）。取消没有请求体。
 两个查询要求 stock.read、不要求角色，不做池授权，只限定在本租户。
 查库与写库在 app/services/counts.py。
 """
@@ -42,13 +44,14 @@ from app.api.requests import (
 from app.domain.catalog import InvalidField
 from app.domain.requests import STOCK_ADMIN, STOCK_OPERATOR, Actor, is_reference
 from app.domain.service_auth import STOCK_READ, STOCK_WRITE
-from app.domain.stock import normalize_note, parse_non_negative_quantity
+from app.domain.stock import normalize_note, normalize_reason_code, parse_non_negative_quantity
 from app.services import counts
 from app.services.counts import COUNT, COUNT_NOT_FOUND, CountSku
 from app.services.idempotency import CommandResult, Execution, run_idempotent
 
 COUNTS_CREATE = "counts.create"
 COUNTS_SUBMIT = "counts.submit"
+COUNTS_CONFIRM = "counts.confirm"
 COUNTS_CANCEL = "counts.cancel"
 
 COUNT_REF = "count_ref"
@@ -63,6 +66,7 @@ _WRITE = [Depends(authorize(STOCK_WRITE, write=True))]
 _WRITE_WITHOUT_BODY = [*_WRITE, Depends(no_body)]
 
 OperatorOrAdmin = Annotated[Actor, Depends(require_role(STOCK_OPERATOR, STOCK_ADMIN))]
+Admin = Annotated[Actor, Depends(require_role(STOCK_ADMIN))]
 
 
 # --- 请求体（§6.2 第 5 条、§6.6） ---
@@ -117,10 +121,29 @@ class CountSubmission(RequestBody):
         return [CountSku(sku.sku_id, sku.shelf_count, sku.unsellable_count) for sku in self.skus]
 
 
+class CountConfirmation(RequestBody):
+    """note 的默认 None 只表示没带：给 null 与没带相同；reason_code 给 null 照样 422。"""
+
+    reason_code: str
+    note: str | None = None
+
+    @field_validator("reason_code")
+    @classmethod
+    def check_reason_code(cls, value: str) -> str:
+        return normalize_reason_code(value)
+
+    @field_validator("note")
+    @classmethod
+    def check_note(cls, value: str | None) -> str | None:
+        return normalize_note(value)
+
+
 opening_body = json_body(CountOpening)
 submission_body = json_body(CountSubmission)
+confirmation_body = json_body(CountConfirmation)
 OpeningBody = Annotated[ParsedBody[CountOpening], Depends(opening_body)]
 SubmissionBody = Annotated[ParsedBody[CountSubmission], Depends(submission_body)]
+ConfirmationBody = Annotated[ParsedBody[CountConfirmation], Depends(confirmation_body)]
 
 
 def _opening_pool(body: OpeningBody) -> str:
@@ -185,6 +208,27 @@ def submit_count(
         command=command,
         balance_rows=balance_rows,
         read_committed=True,
+    )
+
+
+# --- 确认 ---
+
+
+@router.post("/v1/counts/{count_id}/confirm", dependencies=_WRITE)
+def confirm_count(
+    request: Request,
+    count_id: str,
+    body: ConfirmationBody,
+    actor: Admin,
+    pool_id: Annotated[str, Depends(_count_pool)],
+) -> Response:
+    model = body.model
+
+    def command(execution: Execution) -> CommandResult:
+        return counts.confirm_count(execution, count_id, model.reason_code, model.note)
+
+    return run_idempotent(
+        request, operation=COUNTS_CONFIRM, body=body, command=command, read_committed=True
     )
 
 
