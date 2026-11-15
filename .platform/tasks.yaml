@@ -962,3 +962,497 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-022
+    title: 建立期初导入、库存单据、盘点单三类表并给余额行与池加列
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 4.1（余额行的两个判定列）、6.2 第 7 条、6.3、6.6 的存放与 6.7（流水表唯一约束），
+      在 app/models/inventory.py 改模型，写第五个 Alembic 迁移（revision 0005，接在 0004 之后），为之后的库存管理命令打底。
+      沿用 CORE-TASK-002、012 的列约定：稳定 ID 为类型前缀加 ULID、VARCHAR(32)、utf8mb4_bin；tenant_id 外键到 tenants；
+      表间引用用 tenant_id 加 ID 的复合外键，被引用的表另设 tenant_id 加 ID 的唯一约束作引用目标；状态列 VARCHAR(16) 加检查约束；
+      时间列 DATETIME(6)，created_at 默认 CURRENT_TIMESTAMP(6)；request_id、actor_ref、业务引用为 VARCHAR(128) utf8mb4_bin；
+      reason_code 与 actor_role 为 VARCHAR(32) utf8mb4_bin；note 为 VARCHAR(500)；request_hash 为 CHAR(64) utf8mb4_bin。
+      一，改 stock_balances：加 last_book_only_version，BIGINT 非空默认 0，检查约束不小于 0 且不大于 balance_version；
+      加 opening_entry_id，VARCHAR(32) utf8mb4_bin 可空，不加外键（契约 4.1：流水表已有外键指向余额行，反向引用会成环）。
+      二，改 stock_pools：加 went_live_at（DATETIME(6)）、went_live_credential_id（复合外键指向同租户的凭据）、went_live_actor_ref、
+      went_live_request_id，都可空；检查约束：四列要么全空要么全非空，且 status 为 live 当且仅当 went_live_at 非空。
+      三，改 ledger_entries：加唯一约束 (tenant_id, corrects_entry_id)，一条流水最多被更正一次；MySQL 唯一索引允许多个 NULL。
+      四，新表 stock_imports（前缀 simp_，一次期初导入一行，永久保留）：列与检查约束照 CORE-TASK-012 的 catalog_imports
+      （import_id 主键、tenant_id、status 取 previewed 或 confirmed、expires_at、rows 为 JSON 数组、result 为 JSON 可空、
+      预览的 credential_id 与 actor_ref 与 request_id 非空、created_at、确认的四列可空；status 为 previewed 时 result 与确认四列都空，
+      为 confirmed 时都非空），另加 pool_id 非空，以复合外键指向同租户的池；tenant_id 加 import_id 唯一作引用目标。
+      五，新表 stock_documents（只追加，永久保留）：document_id 主键；tenant_id；channel_id 与 pool_id 非空，各以复合外键指向同租户的
+      销售入口与池；document_type 检查约束取 receipt、unavailable_adjustment、correction；document_ref 非空；request_hash 非空；
+      result 为 JSON 非空，检查约束要求是对象；credential_id 非空（复合外键）；actor_ref、actor_role 非空（三种命令都要求角色）；
+      request_id 非空；created_at；唯一约束 (tenant_id, channel_id, document_type, document_ref)。
+      六，新表 stock_counts（前缀 cnt_）：count_id 主键；tenant_id；channel_id、pool_id 非空（复合外键）；count_ref 非空；
+      status 取 open、confirmed、cancelled；note 可空；request_hash 非空；开单的 credential_id、actor_ref、request_id 非空、created_at；
+      确认的 confirmed_credential_id、confirmed_actor_ref、confirmed_request_id、confirmed_at、confirmed_reason_code 与 confirm_note；
+      取消的 cancelled_credential_id、cancelled_actor_ref、cancelled_request_id、cancelled_at。检查约束：open 时确认与取消各列全空；
+      confirmed 时确认五列（不含 confirm_note）非空、取消四列全空；cancelled 时取消四列非空、确认各列全空。
+      唯一约束 (tenant_id, channel_id, count_ref) 与 (tenant_id, count_id)。
+      七，新表 stock_count_lines：主键 (count_id, sku_id)；tenant_id、pool_id 非空；shelf_count、unsellable_count 为 BIGINT，
+      检查约束 0 到 1000000；快照五列 snapshot_stock_balance、snapshot_reserved、snapshot_unavailable、snapshot_paid_pending_dispatch、
+      snapshot_balance_version，检查约束照余额行的不变量（四个量非负、reserved 加 unavailable 不超过 stock_balance、版本不小于 0）；
+      d_shelf、d_u 为 BIGINT 非空，检查约束 d_shelf 等于 shelf_count 减 (snapshot_stock_balance 减 snapshot_unavailable 加
+      snapshot_paid_pending_dispatch)、d_u 等于 unsellable_count 减 snapshot_unavailable（契约 6 的公式）；提交的 actor_ref、request_id、
+      submitted_at 非空；entry_id 可空。外键：(tenant_id, count_id) 指向 stock_counts，(tenant_id, pool_id, sku_id) 指向 stock_balances，
+      (tenant_id, entry_id) 指向 ledger_entries。
+      多个以 tenant_id 开头、指向凭据表的外键按命名约定会同名：stock_counts 的确认人与取消人外键在模型与迁移里显式命名
+      （如 fk_stock_counts_confirmed_credential_id_credentials、fk_stock_counts_cancelled_credential_id_credentials），
+      开单人的照约定命名；stock_imports 照 CORE-TASK-012 显式命名确认人的外键。超过 64 字符的约束名照先例由命名约定生成，迁移里用 op.f 引用。
+      明确不做：写这些表的代码、接口、领域规则；不改流水类型的检查约束。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 模型改在 app/models/inventory.py（该模块已在 alembic/env.py 登记，不改 env.py）；迁移文件放 alembic/versions，revision 0005 接在 0004 之后，upgrade 与 downgrade 都写全；约束名遵循 app/db.py 的命名约定
+      - 集成测试在真 MySQL 上验证余额行与池：last_book_only_version 为负或大于 balance_version 被拒；不带两列插入时取默认 0 与 NULL；池为 live 而 went_live_at 为空被拒、为 initializing 而 went_live 各列非空被拒、四列只填一部分被拒、went_live 凭据属于别的租户被拒
+      - 集成测试验证流水表：两条 CORRECTION 引用同一条原流水被拒；别的类型（corrects_entry_id 为空）的多条流水照常插入
+      - 集成测试验证 stock_imports：状态与确认列的一致性检查照 CORE-TASK-012 的四种被拒情形；rows 不是数组被拒；pool_id 或任一凭据属于别的租户被拒
+      - 集成测试验证 stock_documents：未知 document_type 被拒；同一租户、入口、类型、引用的第二行被拒，而同一引用换一种类型可以插入；result 不是对象被拒；入口、池或凭据属于别的租户被拒
+      - 集成测试验证 stock_counts 与 stock_count_lines：三种状态各自与确认、取消列不一致时被拒；同一入口重复 count_ref 被拒；实数超出 0 到 1000000 被拒；快照违反不变量被拒；d_shelf 或 d_u 与快照和实数不符被拒；盘点单、余额行或流水属于别的租户被拒
+      - CI 的迁移往返（upgrade、downgrade 到底、再 upgrade）与 alembic check 通过；集成测试经 tests/integration/conftest.py 的 migrated_engine 夹具升降迁移；改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试与迁移检查由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/models/inventory.py
+      - alembic/versions/20261115_0005_stock_management.py
+      - tests/integration/conftest.py
+      - tests/integration/test_stock_management_schema.py
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-023
+    title: 写更正、不可售调整与账面核实判定的流水纯函数
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 4.1（last_book_only_version）、4.3、6（COUNT_STALE）、6.5 与 6.7，在 CORE-TASK-001 的
+      app/domain/ledger.py 加纯函数，作为之后服务层的唯一规则来源。只做纯 Python，不 import FastAPI、SQLAlchemy 或做 I/O 的库。
+      一，EntryType 补上 MERGE_TRANSFER_OUT、MERGE_TRANSFER_IN、CORRECTION 三个值（取值与 app/models/inventory.py 的 ENTRY_TYPES 一致），
+      它们不按件数落账，不进 QUANTITY_RULES，apply_entry 对它们照旧报错。
+      二，只改账的流水集合 BOOK_ONLY_TYPES：OPENING_BALANCE、COUNT_ADJUSTMENT、CORRECTION、DEMO_RESET、MERGE_TRANSFER_OUT、MERGE_TRANSFER_IN。
+      函数 last_book_only_version_after(entry_type, current, version_after)：只改账的流水返回 version_after，其他类型返回 current 不变；
+      函数 is_stale(last_book_only_version, snapshot_version)：前者大于后者为真（契约 6 的 COUNT_STALE 与 2.4 执行前置检查）。
+      差额为 0 的核实把判定列设为当时的 balance_version，这一步由服务层直接赋值，不另写函数。
+      三，不可售调整：AdjustmentAction 取 mark_unavailable、restore_available、write_off，对应 MARK_UNAVAILABLE、RESTORE_AVAILABLE、
+      WRITE_OFF；adjustment_limit(action, current) 返回这一行当前最多能做的件数（标不可售为 available，恢复与报损为 unavailable）；
+      apply_adjustment(action, current, q) 在 q 超过上限时抛 AdjustmentExceedsLimit，带错误码（标不可售为 INSUFFICIENT_STOCK，
+      恢复与报损为 QUANTITY_EXCEEDS_UNAVAILABLE）与上限，否则返回 apply_entry 的结果。q 不是正整数时照 apply_entry 抛 InvalidQuantity。
+      四，更正：CORRECTABLE_TYPES 为 OPENING_BALANCE、RECEIPT、MARK_UNAVAILABLE、RESTORE_AVAILABLE、WRITE_OFF；
+      correction_blocker(entry_type, entry_version, last_book_only_version, pool_live) 按契约 6.7 第 1、2 步的顺序返回 None 或原因
+      entry_type、pool_live（原流水是 OPENING_BALANCE 且池已 live）、superseded（判定列大于 entry_version；或等于 entry_version
+      且原流水不是 OPENING_BALANCE）；apply_correction(current, deltas) 把四个量各减去原流水的增量（deltas 为四个增量的元组或 Quantities 形状），
+      落账后违反不变量时抛 CorrectionBreaksInvariants，带落账后的四个量与缺口数（公式同 CountBelowCommitments）。
+      明确不做：数据库读写、opening_entry_id 的维护（服务层做）、合并迁移的落账规则。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 改动在 app/domain/ledger.py 与 tests/unit/test_ledger.py；模块不 import FastAPI、SQLAlchemy 或做 I/O 的库；已有的单元测试照常通过
+      - 单元测试覆盖 EntryType 与 app/models/inventory.py 的 ENTRY_TYPES 取值完全一致（读模块常量比较，不连数据库也能跑；若 import 模型模块会拉进 SQLAlchemy，则改为在测试里逐字列出十八个值比较）
+      - 单元测试覆盖判定列：六种只改账的流水返回 version_after，其余十二种返回原值；is_stale 在大于时为真、等于与小于时为假
+      - 单元测试覆盖不可售调整：三种动作的上限、恰好等于上限通过、超过一件抛出带正确错误码与上限的异常、报损同时减 stock_balance 与 unavailable、q 为 0、负数、布尔或非整数时抛 InvalidQuantity
+      - 单元测试覆盖更正的类型与顺序：不可更正的十三种类型返回 entry_type；期初在池已 live 时返回 pool_live，未 live 时不拦；判定列大于原版本返回 superseded；等于原版本时非期初返回 superseded、期初返回 None；类型不可更正同时又被吸收时先报 entry_type
+      - 单元测试用版本号模拟契约 6.7 与审查提出的边界场景：两次收货 R1（版本 1）、R2（版本 2）后差额为 0 的盘点把判定列设为 2，更正 R1 与 R2 都得 superseded；初始化期 期初 E1（版本 1）、更正 C1（版本 2）、重导 E2（版本 3）后再更正 E2 不被拦；合并迁移（版本更大的只改账流水）之后更正较早的收货得 superseded；快照与差额为 0 的核实之间有、没有别的流水两种情况，is_stale 分别为真与假
+      - 单元测试覆盖 apply_correction：反向后合法时返回新账面；收货后已被预留用掉而反向使 reserved 超过 stock_balance 时抛 CorrectionBreaksInvariants，缺口数与落账后四个量正确
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/ledger.py
+      - tests/unit/test_ledger.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-024
+    title: 写库存命令字段取值、期初逐行判定与流水游标的纯函数
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 6.2 第 5、6 条、6.3 与 6.8，加两个纯函数模块，作为之后接口层与服务层的规则来源。
+      只做纯 Python，不 import FastAPI、SQLAlchemy 或做 I/O 的库。
+      一，app/domain/stock.py：
+      reason_code 校验（字符串，1 到 32 个小写字母、数字或下划线，不去空白）；note 规范化复用 app/domain/catalog.py 的
+      normalize_reason（契约 6.2 第 6 条规则同 2.6 的 reason）；occurred_at 解析：字符串，RFC 3339 的日期加 T 加时间，秒必须有，
+      小数秒 0 到 6 位，时区必须是 Z 或正负 hh:mm，换算成 UTC 的不带时区 datetime（微秒精度），不合规抛错；
+      件数校验：正件数为 1 到 1000000 的整数，非负件数为 0 到 1000000 的整数，布尔一律不算整数；
+      sku_ids 查询参数解析：逗号分隔，1 到 100 个，不能有空项、不能重复，不校验 ID 格式；
+      流水查询的 from、to 解析同 occurred_at，两个都带而 from 不早于 to 时报错；limit 复用 app/domain/catalog.py 的 parse_limit；
+      流水游标：format_ledger_cursor(version, pool_id, sku_id, from_, to) 返回 v1 加点加 balance_version_after 的十进制加点加筛选摘要，
+      摘要为 pool_id、sku_id、from、to 规范化后（时间写成 UTC 的 YYYY-MM-DDTHH:MM:SS.ffffffZ，没带为空串）以换行符连接、UTF-8 编码的
+      SHA-256 小写十六进制的前 16 个字符；parse_ledger_cursor(value, pool_id, sku_id, from_, to) 返回版本号，
+      格式不对（前缀、段数、十进制为 1 到 19 位且首位 1 到 9、不超过 BIGINT 上限、摘要为 16 个小写十六进制字符）或摘要与本次筛选条件不符时抛错。
+      二，app/domain/stock_imports.py（照 CORE-TASK-014 的写法）：
+      逐行判定 judge_rows(rows, lookup)：rows 为预览正文的 rows 列表，lookup 由服务层提供，按 sku_id 给出本租户里该 SKU 是否存在、
+      是否已合并、在该池是否已有有效期初；按契约 6.3 的顺序取第一个命中的结果：invalid_format（不是对象、缺字段、多字段、sku_id 不是字符串、
+      quantity 不是 0 到 1000000 的整数）、duplicate_sku（本次导入里别的行也是这个 sku_id，按字符串原样比较，相关各行都算，
+      invalid_format 的行不参加）、sku_not_found、sku_merged、already_opened、ok；行与行互不牵连。
+      逐行结果的键固定且都出现：index、sku_id（只在是字符串时回显，否则为 null）、quantity（只在是整数时回显，否则为 null）、result。
+      汇总 summarize：counts（六种结果的行数，六个键都出现）、executable_rows、executable_quantity（ok 行的件数合计）。
+      确认计划 plan_confirm(previews, lookup)：对预览为 ok 的行按当前 lookup 重查后三种情形，给出 created 或 failed（带原因），
+      预览不合格的行为 skipped（带预览结果）；确认结果每项的键固定且都出现：index、sku_id、quantity、outcome、entry_id（计划里为 null，
+      由服务层落账后填）、preview_result、failure。
+      明确不做：数据库读写、接口、错误码到 HTTP 的映射。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 新增 app/domain/stock.py 与 app/domain/stock_imports.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试放 tests/unit/test_stock.py 与 tests/unit/test_stock_imports.py，用标准库 unittest
+      - 单元测试覆盖字段取值：reason_code 的长度边界、大写、空格、连字符与非字符串被拒；note 与目录 reason 规则一致；occurred_at 接受 Z 与正负偏移并正确换算 UTC，拒绝缺时区、缺秒、7 位小数秒、非法日期与非字符串
+      - 单元测试覆盖件数：正件数 1 与 1000000 通过、0 与 1000001 与布尔与字符串被拒；非负件数 0 通过；sku_ids 的 1 个、100 个通过，101 个、空项、重复、空串被拒
+      - 单元测试覆盖流水查询：from 不早于 to 被拒；游标往返得到原版本；改了 pool_id、sku_id、from、to 任一项后原游标被拒；前缀不对、段数不对、版本为 0 或有前导零或超过 BIGINT 上限、摘要不是 16 位小写十六进制都被拒
+      - 单元测试覆盖逐行判定的六种结果与顺序，包括：重复的各行都记 duplicate_sku；invalid_format 的行不让别的行变成 duplicate_sku；同一行既重复又已合并时记 duplicate_sku；回显规则；汇总的六个键都出现、件数合计只算 ok 行
+      - 单元测试覆盖确认计划：预览 ok 而重查时已有有效期初、已合并、已不存在分别为 failed 与对应原因；预览不合格为 skipped 且带预览结果；结果每项键固定
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/stock.py
+      - app/domain/stock_imports.py
+      - tests/unit/test_stock.py
+      - tests/unit/test_stock_imports.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-025
+    title: 给幂等执行器加余额行预建与业务引用撞约束后的重新判定
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 4.1（余额行预建）、2.7 的开事务前先后、7.1 第 2 条最后一段（并发撞业务引用）与 6.2 第 7 条，
+      扩展 CORE-TASK-008、015 的 app/services/idempotency.py，供之后的库存命令使用。没用到这些参数的命令行为不变。
+      一，run_idempotent 加关键字参数 balance_rows：可空的函数，收连接、返回要预建的 (pool_id, sku_id) 列表。给了时，在取到幂等锁
+      （以及目录写锁）之后、开业务事务之前，先在同一连接上调用它（它可以读库，例如期初确认按导入记录取 SKU；读完照已有写法结束隐式事务），
+      再开一个短事务：去重后按 (pool_id, sku_id) 升序逐行 INSERT 进 stock_balances（balance_id 前缀 bal_，租户取凭据的，四个量与两个版本为 0），
+      ON DUPLICATE KEY UPDATE 只把 balance_id 设为自身，已有的行不改；某行因外键失败（MySQL 1452，SKU 或池不存在或属于别的租户）跳过、
+      继续下一行，不报错；提交后才开业务事务。不用 INSERT IGNORE。预建遇到别的数据库错误：什么也不保存，返回 500 INTERNAL_ERROR，
+      同键重试会重新执行。同键重放时预建照样做（全零的行与没有行等价，多建无害）。
+      二，Execution 加只读属性 request_digest，即本请求的规范化请求摘要，供命令判定换键重报的业务引用。
+      三，新异常 BusinessRefTaken(rejudge)：命令在写业务引用撞上唯一约束时抛出，rejudge 是收 Execution、返回 CommandResult 或抛 ApiError 的函数。
+      执行器收到后：回滚命令的全部写入，丢弃命令登记的安全事件与 keep_on_rejection 的写入，在同一连接上开新事务（读快照看得到已提交的那一条），
+      调用 rejudge，把它的结果（2xx 或 4xx）照常作为确定结果写幂等记录并提交；rejudge 登记的安全事件照常在事务结束后写。
+      rejudge 抛别的异常或数据库出错：回滚、不保存、500。写幂等记录撞唯一约束的已有处理照旧。
+      在模块文档里写明 balance_rows、request_digest、BusinessRefTaken 的用法与开事务前的先后：幂等锁、目录写锁、余额行预建、开业务事务。
+      明确不做：库存命令本身、锁余额行与写流水的服务函数（下一任务）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 改在 app/services/idempotency.py，模块文档按 purpose 写明；没传 balance_rows、不抛 BusinessRefTaken 的命令行为不变（已有的幂等测试照常通过）
+      - 集成测试：声明了 balance_rows 的测试写路由，在命令运行时（经测试钩子停顿）另一个连接已能看到预建的余额行（证明预建在业务事务之前提交）；已有余额行的四个量与版本不被改动；SKU 属于别的租户、池不存在的那几行跳过而其余照建，响应正常
+      - 集成测试：预建的插入顺序按 (pool_id, sku_id) 升序（测试记录执行的语句或插入顺序）；同键重放时命令不再执行而预建照做且无害
+      - 集成测试：测试让预建遇到非外键的数据库错误时返回 500，没有幂等记录、命令没有执行
+      - 集成测试：命令里 execution.request_digest 等于按契约 7.1 由路径参数与请求体算出的摘要
+      - 集成测试：两个不同幂等键的请求并发执行同一个测试命令（命令先写一行再插入带唯一约束的引用行，经钩子让两者交错），后到的那个抛 BusinessRefTaken 后，它先写的那一行被撤销，rejudge 读到先到者已提交的引用行并返回其结果；这个结果存为后到者幂等键的确定结果，同键重试原样重放；后到者命令登记的安全事件被丢弃、rejudge 登记的照常写入
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/idempotency.py
+      - tests/integration/conftest.py
+      - tests/integration/test_idempotency.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-026
+    title: 实现库存写命令共用的锁池、锁余额行、写流水与单据服务
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 4.1、4.3、6.2 与 8.1 的并发约定，新建 app/services/stock.py，放之后各库存写命令共用的数据库函数。
+      函数都在 CORE-TASK-025 的执行器已开的事务里、用 execution.connection 运行，自己不开、不提交、不回滚事务；拒绝抛 ApiError。
+      一，lock_pool(execution, pool_id, for_update=False)：按租户用 SELECT FOR SHARE（池切 live 用 FOR UPDATE）读池行，返回状态；
+      require_live 在不是 live 时抛 409 POOL_NOT_LIVE，require_initializing 在已 live 时抛 409 POOL_ALREADY_LIVE（details 带 pool_status）。
+      二，resolve_skus(execution, sku_ids)：按请求顺序查 SKU；不存在或属于别的租户的收集起来，抛 404 SKU_NOT_FOUND，details.sku_ids 按请求顺序列全，
+      其中属于别的租户的每个用 execution.record_security_event 登记一条 cross_tenant（对象类型 sku）；都存在时，第一个已合并的抛 409 SKU_MERGED，
+      details 带 sku_id 与 merged_into_sku_id；停用的 SKU 与停用商品下的 SKU 照常通过。
+      三，lock_balances(execution, pool_id, sku_ids)：按 (pool_id, sku_id) 升序 SELECT FOR UPDATE 锁余额行（行已由预建建好），返回按 sku_id 索引的
+      当前四个量、balance_version、last_book_only_version、opening_entry_id；行不存在视为程序错误（抛异常，500）。
+      四，append_entry(execution, balance, entry_type, deltas, command_id, ...)：由锁住的余额行与四个增量算出写后的四个量（用 app/domain/quantities.py 的
+      Quantities 校验不变量，违反时抛给调用方处理），balance_version 加 1，按 CORE-TASK-023 的 last_book_only_version_after 更新判定列；
+      OPENING_BALANCE 把 opening_entry_id 设为这条流水，CORRECTION 在原流水的 entry_id 等于 opening_entry_id 时清空它；UPDATE 余额行、
+      INSERT 流水（entry_id 前缀 ent_；channel_id 取凭据的销售入口；credential_id、actor_ref、actor_role、request_id、idempotency_key 取自本请求；
+      source_type、source_ref、line_ref、reason_code、note、occurred_at、corrects_entry_id 由调用方给，occurred_at 为空时取数据库当前时间），
+      返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_，由 new_command_id 生成）。mark_verified(execution, balance) 把判定列设为
+      当前 balance_version（差额为 0 的核实）。
+      五，单据：find_document(execution, document_type, document_ref) 按租户与凭据的销售入口读 stock_documents；answer_existing_document
+      按契约 6.2 第 7 条判定：request_hash 等于 execution.request_digest 时返回 200 与 result，否则抛 409 BUSINESS_REF_CONFLICT 并登记
+      business_ref_conflict 事件（details 带引用类型与值）；insert_document 写一行（前缀按类型 rcp_、adj_、cor_），撞唯一约束时抛 CORE-TASK-025 的
+      BusinessRefTaken，rejudge 重新 find_document 并按同一规则回答。
+      六，entry_representation：契约 6.8 的流水表示（deltas、after 两个对象各含四个量，时间为 UTC 的 RFC 3339 微秒加 Z，不含 idempotency_key 与 credential_id），
+      供本任务与之后的流水查询、更正共用。
+      明确不做：任何接口、具体命令的规则（期初、收货、调整、盘点、更正）、余额行预建（执行器已做）。
+    status: ready
+    depends_on:
+      - CORE-TASK-022
+      - CORE-TASK-023
+      - CORE-TASK-025
+    acceptance_criteria:
+      - 新增 app/services/stock.py，只放 purpose 列出的共用函数，有模块文档；不改已有模块
+      - 集成测试经一个只在测试里挂的写路由调用这些函数（照 tests/integration/test_idempotency.py 的测试路由写法），在真 MySQL 上验证池状态：initializing 时 require_live 得 409 POOL_NOT_LIVE、live 时 require_initializing 得 409 POOL_ALREADY_LIVE
+      - 集成测试验证 resolve_skus：不存在与属于别的租户的 SKU 一起出现时 404 SKU_NOT_FOUND 且 details.sku_ids 按请求顺序列全，别的租户的每个记一条 cross_tenant；已合并的得 409 SKU_MERGED 与规范 SKU；停用的 SKU 通过
+      - 集成测试验证 append_entry：连写两条流水后余额行的四个量、版本加 2、流水的写后值与 balance_version_after 一致；写只改账的流水更新判定列、写收货不更新；期初设置 opening_entry_id、更正该期初时清空；写后违反不变量时整笔回滚、库里没有流水；同一命令的流水 command_id 相同
+      - 集成测试验证单据：首次写入后换键重报同摘要得 200 与原 result、不同摘要得 409 BUSINESS_REF_CONFLICT 并记事件；两个不同键并发写同一引用时后到者经 rejudge 得到正确结果且只有一行单据
+      - 集成测试验证 lock_balances 按 sku_id 升序加锁（两个请求以相反顺序列出同两个 SKU 并发执行不死锁、都成功）
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/stock.py
+      - tests/integration/conftest.py
+      - tests/integration/test_stock_service.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-027
+    title: 实现池、余额与流水三个查询接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 6.2 第 1 条（读接口只限定租户、不做池授权）、6.3 的池查询与 6.8，新建 app/api/stock_queries.py，
+      在 app/main.py 挂路由。三个接口都要 stock.read，不要求角色，不做池授权；查询用 CORE-TASK-024 的纯函数解析参数，
+      流水表示用 CORE-TASK-026 的 entry_representation。
+      一，GET /v1/pools/{pool_id}：pool_id、location_id、name、status、went_live_at、created_at；池不存在或属于别的租户 404 POOL_NOT_FOUND，
+      后者记 cross_tenant。
+      二，GET /v1/balances：参数 pool_id 与 sku_ids，两个都必填、各出现一次，带未知参数 422；池同上 404；
+      返回 balances 数组（按 sku_id 升序），每项 sku_id、stock_balance、reserved、unavailable、paid_pending_dispatch、available、balance_version、
+      merged_into_sku_id；SKU 存在于本租户但还没有余额行时四个量为 0、版本为 0；不属于本租户或不存在的 SKU 不出现、不报错、不记事件。
+      三，GET /v1/ledger：参数 pool_id、sku_id 必填，from、to、after、limit 可选，各最多出现一次，未知参数 422；池同上 404；
+      SKU 不存在或属于别的租户 404 SKU_NOT_FOUND，后者记 cross_tenant；已合并的 SKU 返回它自己的流水。按 balance_version_after 升序，
+      from、to 按 recorded_at 筛选（含 from、不含 to），after 为游标时只返回版本大于它的，limit 默认 100；返回 entries 与 next_cursor
+      （最后一条的游标；没有记录时原样返回请求里的 after，没带为 null）。参数不合规 422。
+      明确不做：GET /v1/availability（随预留任务做）、期初导入与盘点单的查询（随各自任务做）。
+    status: ready
+    depends_on:
+      - CORE-TASK-024
+      - CORE-TASK-026
+    acceptance_criteria:
+      - 接口放 app/api/stock_queries.py，在 app/main.py 挂路由；数据库读取写在 app/services/stock_queries.py
+      - 集成测试在真 MySQL 上验证池查询：表示的字段；不存在与属于别的租户得完全相同的 404 POOL_NOT_FOUND，跨租户记一条 cross_tenant
+      - 集成测试验证余额查询：有余额行、没有余额行、已合并、属于别的租户的 SKU 混在一起时，结果按 sku_id 升序、没有余额行的为全 0、别的租户的不出现；available 为派生值；参数缺失、重复、未知、sku_ids 超过 100 或有重复均为 422
+      - 集成测试验证流水查询：写入若干条流水后按版本升序返回、字段与契约 6.8 一致且不含 idempotency_key 与 credential_id；limit 分页用 next_cursor 接着取不重不漏；没有新记录时 next_cursor 原样返回 after；from、to 筛选含前不含后；换了筛选条件用旧游标得 422；SKU 属于别的租户得 404 并记 cross_tenant
+      - 集成测试验证授权：缺 stock.read 为 403；不带操作者头照常可读
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/stock_queries.py
+      - app/services/stock_queries.py
+      - app/main.py
+      - tests/integration/conftest.py
+      - tests/integration/test_stock_queries_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-028
+    title: 实现期初导入的预览、确认、查询与池切上线命令
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 6.2、6.3、10 第 3、4 条，新建 app/api/stock_imports.py 与 app/services/stock_imports.py，
+      在 app/main.py 挂路由。规则用 CORE-TASK-024 的 app/domain/stock_imports.py，写流水与锁行用 CORE-TASK-026 的 app/services/stock.py，
+      经 CORE-TASK-025 的执行器。
+      一，预览 POST /v1/stock-imports（操作类型 stock_imports.preview）：stock.write，角色 stock_admin；正文字段校验只查顶层只有 pool_id 与 rows、
+      pool_id 是字符串、rows 是 1 到 100 个对象的数组（超过 100 为 413）；池授权按正文 pool_id（require_pool）。命令里：池已 live 为 409 POOL_ALREADY_LIVE；
+      按本租户查 SKU 与余额行的 opening_entry_id 组成 lookup（不锁行），逐行判定，保存导入（前缀 simp_，expires_at 为数据库当前时间加 24 小时，
+      各行原文照 CORE-TASK-019 的写法序列化成字符串存进 JSON），返回 201 与导入的表示。
+      二，确认 POST /v1/stock-imports/{import_id}/confirm（stock_imports.confirm）：没有请求体；stock.write，角色 stock_admin；
+      池授权按导入所属的池（require_object_pool，导入不存在或属于别的租户 404 STOCK_IMPORT_NOT_FOUND）；balance_rows 取导入里预览为 ok 的行的 SKU。
+      命令里按契约 6.3 的顺序：FOR UPDATE 读导入行，已确认返回 200 与当前表示，已过期 409 IMPORT_EXPIRED，池已 live 409 POOL_ALREADY_LIVE，
+      升序锁余额行，按锁住的行重查（SKU 仍在本租户、未合并、opening_entry_id 为空），通过且数量大于 0 的写 OPENING_BALANCE
+      （source_type stock_import，source_ref 为 import_id），为 0 的不写；导入改为 confirmed，存逐行结果与确认人，返回 200。
+      三，查询 GET /v1/stock-imports/{import_id}：stock.read；不存在或属于别的租户 404 STOCK_IMPORT_NOT_FOUND，后者记 cross_tenant；status 为 previewed、
+      expired（由 expires_at 推出，不存）或 confirmed。表示的键固定且都出现：import_id、pool_id、status、expires_at、created_at、confirmed_at、rows、summary、result。
+      四，池切 live POST /v1/pools/{pool_id}/go-live（pools.go_live）：没有请求体；stock.write，角色 stock_admin；池授权按路径 pool_id。命令里 FOR UPDATE 读池行，
+      已 live 返回 200 与池的表示，否则改为 live 并记 went_live 四列，返回 200 与池的表示（字段同 CORE-TASK-027 的池查询）。
+      明确不做：收货、盘点、更正等其他命令；不改池的其他列。
+    status: ready
+    depends_on:
+      - CORE-TASK-024
+      - CORE-TASK-026
+      - CORE-TASK-027
+    acceptance_criteria:
+      - 接口放 app/api/stock_imports.py，数据库写入放 app/services/stock_imports.py，在 app/main.py 挂路由；已有测试照常通过
+      - 集成测试在真 MySQL 上验证预览：六种逐行结果（含别的租户的 SKU 记 sku_not_found 且不记安全事件）、回显规则与汇总；行内问题不整单 422 而顶层结构错误 422、101 行 413；池已 live 为 409 POOL_ALREADY_LIVE；预览不写流水
+      - 集成测试验证确认：ok 行写 OPENING_BALANCE、余额行 opening_entry_id 与判定列随之更新，数量为 0 的不写流水；预览之后另一导入已确认同一 SKU、SKU 被合并时该行 failed 而别的行照常 created；已确认再确认（同键重放与换键）都返回首次结果且不重复落账；过期 409 IMPORT_EXPIRED；池已 live 409 POOL_ALREADY_LIVE
+      - 集成测试验证两个导入并发确认同一 SKU 时只有一笔期初生效、另一行为 failed（already_opened），没有死锁
+      - 集成测试验证池切 live：initializing 改为 live 并记四列；再调返回 200 不再改；切换之后预览与确认都得 409 POOL_ALREADY_LIVE
+      - 集成测试验证授权与跨租户：缺 stock.write 403、缺操作者头 400、角色为 stock_operator 403；导入与池属于别的租户得 404 并记 cross_tenant；查询的 status 在过期后为 expired
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/stock_imports.py
+      - app/services/stock_imports.py
+      - app/main.py
+      - tests/integration/conftest.py
+      - tests/integration/test_stock_imports_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-029
+    title: 实现收货与不可售调整两个库存写命令
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 6.2、6.4、6.5 与 10 第 3、4 条，新建 app/api/stock_documents.py 与 app/services/stock_documents.py，
+      在 app/main.py 挂路由。规则用 CORE-TASK-023、024 的纯函数，锁行、写流水与单据用 CORE-TASK-026 的 app/services/stock.py，
+      经 CORE-TASK-025 的执行器（balance_rows 取正文 pool_id 与各行 sku_id）。
+      一，收货 POST /v1/receipts（receipts.create）：stock.write，角色 stock_operator 或 stock_admin；正文 pool_id、receipt_ref（第 1 节引用格式）、
+      lines（1 到 100 行，批量数组，超过 413；每行 line_ref、sku_id、quantity 为 1 到 1000000），可选 reason_code、note、occurred_at；未知字段、
+      line_ref 或 sku_id 重复 422。池授权按正文 pool_id。命令按契约 6.2 第 4 条的顺序：业务引用（receipt 类型的单据）、池为 live、resolve_skus、
+      升序锁余额行、每行写一条 RECEIPT（source_type receipt，source_ref 为 receipt_ref，带 line_ref）、写单据；返回 201 与收货单的表示
+      （document_id、receipt_ref、pool_id、reason_code、note、occurred_at、created_at、lines 按请求顺序，每行 line_ref、sku_id、quantity、entry_id、
+      写后的四个量、available、balance_version）。
+      二，不可售调整 POST /v1/unavailable-adjustments（unavailable_adjustments.create）：stock.write；正文 pool_id、adjustment_ref、action
+      （mark_unavailable、restore_available、write_off）、reason_code（必填）、lines（同收货），可选 note、occurred_at；角色用 require_role_by_body：
+      write_off 只接受 stock_admin，另两种接受 stock_operator 与 stock_admin。命令顺序同收货，锁行后逐行按当前账面做 apply_adjustment，
+      任何一行超限时整笔 409（错误码按动作），details.lines 列出全部超限的行（line_ref、sku_id、quantity、limit），不写任何流水与单据；
+      都通过时每行写对应类型的流水（source_type unavailable_adjustment，source_ref 为 adjustment_ref）、写单据；返回 201，表示同收货单，
+      receipt_ref 换成 adjustment_ref，另带 action。
+      明确不做：更正、盘点、期初；不新增查询接口（契约 6.4：结果未知时原内容重报取回）。
+    status: ready
+    depends_on:
+      - CORE-TASK-023
+      - CORE-TASK-024
+      - CORE-TASK-026
+    acceptance_criteria:
+      - 接口放 app/api/stock_documents.py，数据库写入放 app/services/stock_documents.py，在 app/main.py 挂路由；已有测试照常通过
+      - 集成测试在真 MySQL 上验证收货：201 与表示，余额与流水正确、同一命令的流水共用 command_id；同键重放不重复入库；换键同内容得 200 与原结果、换键不同内容得 409 BUSINESS_REF_CONFLICT 并记事件；停用的 SKU 照收；池为 initializing 得 409 POOL_NOT_LIVE
+      - 集成测试验证 SKU 与正文校验：不存在与别的租户的 SKU 一起出现得 404 SKU_NOT_FOUND 且 details.sku_ids 列全、跨租户记事件；已合并的得 409 SKU_MERGED；line_ref 或 sku_id 重复、件数为 0 或超过 1000000、未知字段均 422；101 行 413
+      - 集成测试验证不可售调整的三种动作与上限：标不可售超过 available 得 409 INSUFFICIENT_STOCK、恢复与报损超过 unavailable 得 409 QUANTITY_EXCEEDS_UNAVAILABLE，details.lines 列出全部超限行，被拒时什么也没写；恰好等于上限通过；报损同时减 stock_balance 与 unavailable
+      - 集成测试验证角色：报损时 stock_operator 得 403、stock_admin 通过；标不可售与恢复时 stock_operator 通过；缺 reason_code 422；同一 adjustment_ref 换键重报规则同收货
+      - 集成测试验证并发：两个不同幂等键的收货并发使用同一 receipt_ref 时只入库一次，另一个得到原结果或 409（按内容）
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/stock_documents.py
+      - app/services/stock_documents.py
+      - app/main.py
+      - tests/integration/conftest.py
+      - tests/integration/test_stock_documents_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-030
+    title: 实现流水更正命令
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 4.3、6.2、6.7 与 10 第 3、4 条，在 CORE-TASK-029 的 app/api/stock_documents.py 与
+      app/services/stock_documents.py 加 POST /v1/corrections（corrections.create）。规则用 CORE-TASK-023 的 correction_blocker 与 apply_correction，
+      锁行、写流水与单据用 CORE-TASK-026 的 app/services/stock.py。
+      一，stock.write，角色 stock_admin；正文 entry_id、reason_code（必填），可选 note、occurred_at；未知字段 422。
+      池授权按原流水所属的池（require_object_pool，原流水不存在或属于别的租户 404 ENTRY_NOT_FOUND，后者记 cross_tenant）；池状态不限。
+      不需要 balance_rows（原流水的余额行已存在）。
+      二，命令里依次：业务引用（correction 类型、document_ref 为原 entry_id）——已有单据且摘要相同返回 200 与 result；摘要不同时不报
+      BUSINESS_REF_CONFLICT，改为 409 ENTRY_NOT_CORRECTABLE，details.reason 为 already_corrected，带已有单据的 document_id，不记安全事件；
+      然后 FOR SHARE 读池行，FOR UPDATE 锁原流水的余额行，按 correction_blocker 判定（409 ENTRY_NOT_CORRECTABLE，details.reason 为 entry_type、
+      pool_live 或 superseded，superseded 时带 details.last_book_only_version）；apply_correction 违反不变量时 409 CORRECTION_BREAKS_INVARIANTS，
+      details 带落账后的四个量与缺口数；通过则写一条 CORRECTION（四个增量为原流水的相反数，corrects_entry_id 为原流水，source_type correction，
+      source_ref 为原 entry_id），append_entry 照 CORE-TASK-026 更新判定列并在原流水是有效期初时清空 opening_entry_id，写单据，
+      返回 201：document_id、corrected_entry_id、entry（流水的表示）。
+      三，两个不同幂等键并发更正同一条流水：后到者撞上流水表或单据表的唯一约束，经 BusinessRefTaken 的 rejudge 按第二条的业务引用规则重新判定。
+      明确不做：盘点、期初接口；不改 CORE-TASK-029 的两个命令。
+    status: ready
+    depends_on:
+      - CORE-TASK-029
+    acceptance_criteria:
+      - 接口与写入加在 app/api/stock_documents.py 与 app/services/stock_documents.py；CORE-TASK-029 的测试照常通过
+      - 集成测试在真 MySQL 上验证成功的更正：收货后更正得 201，余额回到收货前、流水的四个增量为原流水的相反数、corrects_entry_id 正确、判定列更新；initializing 池上更正期初后 opening_entry_id 清空，可以用新导入再导期初（用服务层或接口造期初）
+      - 集成测试验证类型与池状态：更正 RESERVE 类流水（测试直接造流水）、COUNT_ADJUSTMENT、CORRECTION 得 entry_type；池已 live 时更正期初得 pool_live
+      - 集成测试验证已被吸收：收货之后有一条只改账的流水时得 superseded；两次收货后差额为 0 的核实（测试经服务层 mark_verified 或盘点确认造出）之后更正后一次收货也得 superseded
+      - 集成测试验证不变量：收货之后被预留用掉，更正得 409 CORRECTION_BREAKS_INVARIANTS 且 details 的四个量与缺口数正确，什么也没写
+      - 集成测试验证业务引用与并发：同一条流水换键同内容得 200 与原结果；换键不同内容得 409 ENTRY_NOT_CORRECTABLE（already_corrected）且不记 business_ref_conflict 事件；两个不同键并发更正同一条只有一条 CORRECTION 生效
+      - 集成测试验证授权：stock_operator 得 403；原流水不存在与属于别的租户得完全相同的 404 ENTRY_NOT_FOUND，跨租户记事件；改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/stock_documents.py
+      - app/services/stock_documents.py
+      - tests/integration/conftest.py
+      - tests/integration/test_corrections_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-031
+    title: 实现盘点单的开单、提交实数、取消与查询
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 6（盘点规则）、6.2、6.6 与 10 第 3、4 条，新建 app/api/counts.py 与 app/services/counts.py，在 app/main.py 挂路由。
+      锁行用 CORE-TASK-026 的 app/services/stock.py，经 CORE-TASK-025 的执行器；差额用 CORE-TASK-001 的 count_deltas。
+      一，开单 POST /v1/counts（counts.create）：stock.write，角色 stock_operator 或 stock_admin；正文 pool_id、count_ref（引用格式），可选 note；
+      池授权按正文 pool_id。命令里：按租户与凭据的销售入口找 count_ref，已有时摘要相同返回 200 与当前表示、不同 409 BUSINESS_REF_CONFLICT 并记事件；
+      池须为 live（409 POOL_NOT_LIVE）；写盘点单（前缀 cnt_，状态 open，存开单的 request_hash），返回 201 与表示；撞 count_ref 唯一约束经 BusinessRefTaken 重新判定。
+      二，提交实数 POST /v1/counts/{count_id}/submit（counts.submit）：stock.write，角色 stock_operator 或 stock_admin；正文 skus 为 1 到 100 个
+      sku_id、shelf_count、unsellable_count（批量数组，超过 413；两项实数 0 到 1000000；sku_id 重复 422）；池授权按盘点单所属的池
+      （require_object_pool，404 COUNT_NOT_FOUND）；balance_rows 取盘点单的池与正文的 SKU。命令里先 FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；
+      resolve_skus；提交后 SKU 总数超过 100 为 422（details.reason 为 count_sku_limit）；升序锁余额行，记快照与 count_deltas 算出的 d_shelf、d_u，
+      连同实数、提交人、请求 ID、时间写入盘点行，已有的行整行替换；不写流水；返回 200 与表示。
+      三，取消 POST /v1/counts/{count_id}/cancel（counts.cancel）：没有请求体；角色 stock_operator 或 stock_admin；池授权同提交。FOR UPDATE 读盘点单行，
+      不是 open 为 409 STATE_CONFLICT；改为 cancelled 并记取消人；不写流水，盘点行保留但不再生效；返回 200 与表示。
+      四，查询 GET /v1/counts/{count_id} 与 GET /v1/counts?count_ref=（stock.read）：前者不存在或属于别的租户 404 COUNT_NOT_FOUND，后者记 cross_tenant；
+      后者按凭据的销售入口查，返回 counts 数组（0 或 1 个），count_ref 必填且只出现一次，未知参数 422。
+      五，表示的键固定且都出现：count_id、count_ref、pool_id、status、note、created_at、confirmed_at、reason_code、confirm_note、cancelled_at、lines；
+      lines 按 sku_id 升序，每行 sku_id、shelf_count、unsellable_count、snapshot（四个量与 balance_version）、submitted_at、d_shelf、d_u、entry_id。
+      表示函数写成可复用的，供下一任务的确认使用。
+      明确不做：确认落账（下一任务）。
+    status: ready
+    depends_on:
+      - CORE-TASK-026
+    acceptance_criteria:
+      - 接口放 app/api/counts.py，数据库读写放 app/services/counts.py，在 app/main.py 挂路由；已有测试照常通过
+      - 集成测试在真 MySQL 上验证开单：201 与表示；换键同内容得 200 与当前表示（含已取消的单）、不同内容 409 BUSINESS_REF_CONFLICT 并记事件；池为 initializing 得 409 POOL_NOT_LIVE；两个不同键并发用同一 count_ref 只开一张单
+      - 集成测试验证提交：快照等于提交时的账面、d_shelf 与 d_u 按契约 6 的公式；只列部分 SKU 时其他行保留，重新提交只替换所列 SKU；还没有余额行的 SKU 先预建再记全零快照；已合并的 SKU 得 409 SKU_MERGED；总数超过 100 得 422 且原有行不变
+      - 集成测试验证状态：对已取消的单提交与取消得 409 STATE_CONFLICT；取消后 count_ref 仍占用；取消不写流水
+      - 集成测试验证并发：同一张单的提交与取消并发时串行执行，不会出现取消之后又写入实数
+      - 集成测试验证查询与授权：两种查询的结果一致；盘点单不存在与属于别的租户得完全相同的 404 COUNT_NOT_FOUND 并记 cross_tenant；缺 stock.write 403；缺操作者头 400；按 count_ref 查不到时为空数组
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/counts.py
+      - app/services/counts.py
+      - app/main.py
+      - tests/integration/conftest.py
+      - tests/integration/test_counts_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-032
+    title: 实现盘点单的确认落账
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.9 的 6（盘点规则、COUNT_STALE、COUNT_BELOW_COMMITMENTS）、4.1（判定列）与 6.6 的确认，
+      在 CORE-TASK-031 的 app/api/counts.py 与 app/services/counts.py 加 POST /v1/counts/{count_id}/confirm（counts.confirm）。
+      规则用 CORE-TASK-001 的 apply_count_adjustment 与 CORE-TASK-023 的 is_stale，锁行与写流水用 CORE-TASK-026 的 app/services/stock.py。
+      一，stock.write，角色 stock_admin；正文 reason_code（必填）、可选 note；池授权按盘点单所属的池（404 COUNT_NOT_FOUND）。
+      二，命令里依次：FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；没有盘点行为 422；按 sku_id 升序 FOR UPDATE 锁全部盘点行 SKU 的余额行；
+      对每个 SKU 用 is_stale(判定列, 快照版本) 检查，有为真的整笔 409 COUNT_STALE，details.sku_ids 按 sku_id 升序列出；
+      逐 SKU 用 apply_count_adjustment 算落账后的账面，有违反不变量的整笔 409 COUNT_BELOW_COMMITMENTS，details.skus 逐个列出 sku_id、落账后的四个量与缺口数；
+      都通过后，差额不全为 0 的 SKU 各写一条 COUNT_ADJUSTMENT（四个增量为 d_shelf 加 d_u、0、d_u、0；source_type count，source_ref 为 count_ref；
+      reason_code、note 取正文），append_entry 照 CORE-TASK-026 更新判定列；两个差额都为 0 的不写流水，用 mark_verified 把判定列设为当前版本；
+      盘点行记下 entry_id；盘点单改为 confirmed，记确认人、reason_code、confirm_note；返回 200 与表示（CORE-TASK-031 的表示函数）。
+      被拒时什么也不写（只保存幂等记录）。
+      明确不做：SKU 合并的定数（随合并任务做）、Demo 重置。
+    status: ready
+    depends_on:
+      - CORE-TASK-023
+      - CORE-TASK-031
+    acceptance_criteria:
+      - 接口与写入加在 app/api/counts.py 与 app/services/counts.py；CORE-TASK-031 的测试照常通过
+      - 集成测试在真 MySQL 上验证差额法：提交时点到 20、之后收货 10、确认时差额为 0 不写流水且账面仍是 30；点数少于账面时写 COUNT_ADJUSTMENT 且两个增量正确；只改不可售件数时 stock_balance 与 unavailable 同增；流水带正文的 reason_code 与 note
+      - 集成测试验证判定列：写了流水的 SKU 判定列为该流水的版本；差额为 0 的 SKU 判定列为当时的 balance_version；之后对这些 SKU 之前的收货做更正得 superseded（若 CORE-TASK-030 尚未合并，则直接断言判定列的值）
+      - 集成测试验证 COUNT_STALE：两张盘点单都提交了同一 SKU，先确认的写了流水后，后确认的得 409 COUNT_STALE 且列出该 SKU，什么也没写；重新提交该 SKU 后可确认；快照与差额为 0 的核实之间没有别的流水时不报
+      - 集成测试验证 COUNT_BELOW_COMMITMENTS：预留占着的件点不到时得 409 且 details 的落账后四个量与缺口数正确；释放预留（测试直接造流水与余额）后换新幂等键、正文照旧再确认成功，沿用原快照
+      - 集成测试验证状态与授权：没有盘点行 422；已确认再确认（换键）得 409 STATE_CONFLICT，同键重放得首次结果；缺 reason_code 422；stock_operator 得 403；两张单并发确认同一 SKU 不会把差额记两次
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/counts.py
+      - app/services/counts.py
+      - tests/integration/conftest.py
+      - tests/integration/test_count_confirm_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
