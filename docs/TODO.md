@@ -26,7 +26,6 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-032` 实现盘点单的确认落账
 
 ### 已阻塞
 

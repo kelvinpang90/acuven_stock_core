@@ -1489,7 +1489,7 @@ tasks:
       盘点行记下 entry_id；盘点单改为 confirmed，记确认人、reason_code、confirm_note；返回 200 与表示（CORE-TASK-031 的表示函数，传入锁内读到的盘点单行与盘点行加上本次的改动，不另用普通读）。
       被拒时什么也不写（只保存幂等记录）。
       明确不做：SKU 合并的定数（随合并任务做）、Demo 重置。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-023
       - CORE-TASK-029
