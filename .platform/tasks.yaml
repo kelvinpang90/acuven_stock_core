@@ -1045,6 +1045,7 @@ tasks:
       且原流水不是 OPENING_BALANCE）；apply_correction(current, deltas) 把四个量各减去原流水的增量（deltas 为 stock_balance、reserved、unavailable、paid_pending_dispatch
       四个增量组成的整数元组，可为负；不用 Quantities，它不接受负数），
       落账后违反不变量时抛 CorrectionBreaksInvariants，带落账后的四个量与缺口数（公式同 CountBelowCommitments）。
+      能更正的五种流水都不动 reserved 与 paid_pending_dispatch，所以这两个增量不为 0 的 deltas 直接抛 ValueError（程序错误），缺口公式因此不需要考虑这两个量为负。
       明确不做：数据库读写、opening_entry_id 的维护（服务层做）、合并迁移的落账规则。
     status: ready
     depends_on: []
@@ -1162,25 +1163,33 @@ tasks:
       函数都在 CORE-TASK-025 的执行器已开的事务里、用 execution.connection 运行，自己不开、不提交、不回滚事务；拒绝抛 ApiError。
       一，lock_pool(execution, pool_id, for_update=False)：按租户用 SELECT FOR SHARE（池切 live 用 FOR UPDATE）读池行，返回状态；
       require_live 在不是 live 时抛 409 POOL_NOT_LIVE，require_initializing 在已 live 时抛 409 POOL_ALREADY_LIVE（details 带 pool_status）。
-      二，resolve_skus(execution, sku_ids)：按请求顺序查 SKU；不存在或属于别的租户的收集起来，抛 404 SKU_NOT_FOUND，details.sku_ids 按请求顺序列全，
-      其中属于别的租户的每个用 execution.record_security_event 登记一条 cross_tenant（对象类型 sku）；都存在时，第一个已合并的抛 409 SKU_MERGED，
-      details 带 sku_id 与 merged_into_sku_id；停用的 SKU 与停用商品下的 SKU 照常通过。
+      二，SKU 检查分两步，因为读快照建立在幂等记录的查询时，普通读看不到之后提交的 SKU 合并：
+      require_skus_exist(execution, sku_ids) 在锁余额行之前用普通读按请求顺序查 SKU；不存在或属于别的租户的收集起来，抛 404 SKU_NOT_FOUND，
+      details.sku_ids 按请求顺序列全，其中属于别的租户的每个用 execution.record_security_event 登记一条 cross_tenant（对象类型 sku）；
+      require_not_merged(execution, sku_ids) 在 lock_balances 之后按 sku_id 升序用 SELECT FOR SHARE 读这些 SKU 行（加锁读看得到最新提交，
+      锁序为池行、余额行、SKU 行，与合并执行先锁余额行再改 SKU 行的顺序一致，不成环），第一个已合并的抛 409 SKU_MERGED，details 带 sku_id 与
+      merged_into_sku_id；停用的 SKU 与停用商品下的 SKU 照常通过。
+      锁余额行时某个 SKU 没有余额行（SKU 在预建之后才建成，极少见）：抛异常、500，同键重试时预建会补上。
+      另，命令时间：command_now(execution) 在命令开头用 SELECT CURRENT_TIMESTAMP(6) 读一次数据库时间，同一命令的各条流水在调用方
+      没给 occurred_at 时都用它，单据的 created_at 也用它，所以一张单据的各行与表示里的时间一致。
       三，lock_balances(execution, pool_id, sku_ids)：按 (pool_id, sku_id) 升序 SELECT FOR UPDATE 锁余额行（行已由预建建好），返回按 sku_id 索引的
       当前四个量、balance_version、last_book_only_version、opening_entry_id；行不存在视为程序错误（抛异常，500）。
       四，append_entry(execution, balance, entry_type, deltas, command_id, ...)：由锁住的余额行与四个增量算出写后的四个量（用 app/domain/quantities.py 的
       Quantities 校验不变量，违反时抛给调用方处理），balance_version 加 1，按 CORE-TASK-023 的 last_book_only_version_after 更新判定列；
       OPENING_BALANCE 把 opening_entry_id 设为这条流水，CORRECTION 在原流水的 entry_id 等于 opening_entry_id 时清空它；UPDATE 余额行、
       INSERT 流水（entry_id 前缀 ent_；channel_id 取凭据的销售入口；credential_id、actor_ref、actor_role、request_id、idempotency_key 取自本请求；
-      source_type、source_ref、line_ref、reason_code、note、occurred_at、corrects_entry_id 由调用方给，occurred_at 为空时取数据库当前时间），
+      source_type、source_ref、line_ref、reason_code、note、occurred_at、corrects_entry_id 由调用方给，occurred_at 为空时取 command_now），
       返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_，由 new_command_id 生成）。mark_verified(execution, balance) 把判定列设为
       当前 balance_version（差额为 0 的核实）。
       五，单据：find_document(execution, document_type, document_ref) 按租户与凭据的销售入口读 stock_documents；answer_existing_document
       按契约 6.2 第 7 条判定（摘要不同时的回答可由调用方替换，供更正报 already_corrected）：request_hash 等于 execution.request_digest 时返回 200 与 result，否则抛 409 BUSINESS_REF_CONFLICT 并登记
-      business_ref_conflict 事件（details 带引用类型与值）；insert_document 写一行（前缀按类型 rcp_、adj_、cor_），撞唯一约束时抛 CORE-TASK-025 的
+      business_ref_conflict 事件（details 带引用类型与值）；new_document_id(document_type) 生成单据 ID（前缀按类型 rcp_、adj_、cor_），命令先拿到 ID 与 command_now 再拼 result；
+      insert_document(execution, document_type, document_ref, document_id, created_at, result) 写一行，撞唯一约束时抛 CORE-TASK-025 的
       BusinessRefTaken，rejudge 重新 find_document 并按同一规则回答。
       业务引用的检查用普通读，读快照建立在幂等记录的查询时，看不到并发的另一个请求在那之后提交的同一引用；那个请求的写入又会改变本命令
       锁行后看到的账面，使本命令被业务规则拒绝（例如同一不可售调整换键重报，先到者已用掉可售量，后到者得 409 INSUFFICIENT_STOCK 而不是原结果）。
-      所以单据命令统一经 with_document(execution, document_type, document_ref, command) 执行：先 find_document，有则 answer_existing_document；
+      所以单据命令统一经 with_document(execution, document_type, document_ref, command, on_conflict=None) 执行（on_conflict 是摘要不同时的回答，
+      收已有的单据、抛 ApiError；不给时为 409 BUSINESS_REF_CONFLICT 加 business_ref_conflict 事件；首次判定与 rejudge 都用它）：先 find_document，有则 answer_existing_document；
       没有则运行 command（它锁行、写流水、最后 insert_document 并返回结果）；command 抛业务拒绝（ApiError 4xx）时不直接拒绝，改抛 BusinessRefTaken，
       其 rejudge 在执行器开的新事务里（读快照看得到已提交的全部写入）重新 find_document，有则 answer_existing_document，没有则再运行一次 command，
       这一次的拒绝就是确定结果；insert_document 撞唯一约束时的 rejudge 与此相同。rejudge 里再次撞上唯一约束（第三个并发请求）按 500 处理，
@@ -1196,7 +1205,7 @@ tasks:
     acceptance_criteria:
       - 新增 app/services/stock.py，只放 purpose 列出的共用函数，有模块文档；不改已有模块
       - 集成测试经一个只在测试里挂的写路由调用这些函数（照 tests/integration/test_idempotency.py 的测试路由写法），在真 MySQL 上验证池状态：initializing 时 require_live 得 409 POOL_NOT_LIVE、live 时 require_initializing 得 409 POOL_ALREADY_LIVE
-      - 集成测试验证 resolve_skus：不存在与属于别的租户的 SKU 一起出现时 404 SKU_NOT_FOUND 且 details.sku_ids 按请求顺序列全，别的租户的每个记一条 cross_tenant；已合并的得 409 SKU_MERGED 与规范 SKU；停用的 SKU 通过
+      - 集成测试验证 SKU 检查：不存在与属于别的租户的 SKU 一起出现时 404 SKU_NOT_FOUND 且 details.sku_ids 按请求顺序列全，别的租户的每个记一条 cross_tenant；已合并的得 409 SKU_MERGED 与规范 SKU；停用的 SKU 通过；命令开始后（经钩子停顿）另一个连接提交了 SKU 合并，require_not_merged 仍判出 409 SKU_MERGED；不传 occurred_at 时同一命令的各条流水 occurred_at 相同
       - 集成测试验证 append_entry：连写两条流水后余额行的四个量、版本加 2、流水的写后值与 balance_version_after 一致；写只改账的流水更新判定列、写收货不更新；期初设置 opening_entry_id、更正该期初时清空；写后违反不变量时整笔回滚、库里没有流水；同一命令的流水 command_id 相同
       - 集成测试验证单据：首次写入后换键重报同摘要得 200 与原 result、不同摘要得 409 BUSINESS_REF_CONFLICT 并记事件；两个不同键并发写同一引用时后到者经 rejudge 得到正确结果且只有一行单据；后到者因先到者改了账面而会被业务拒绝时（测试命令按账面拒绝），经 with_document 得到先到者的结果而不是拒绝，被拒的第一次运行登记的安全事件丢弃
       - 集成测试验证 lock_balances 按 sku_id 升序加锁（两个请求以相反顺序列出同两个 SKU 并发执行不死锁、都成功）
@@ -1265,7 +1274,8 @@ tasks:
       二，确认 POST /v1/stock-imports/{import_id}/confirm（stock_imports.confirm）：没有请求体；stock.write，角色 stock_admin；
       池授权按导入所属的池（require_object_pool，导入不存在或属于别的租户 404 STOCK_IMPORT_NOT_FOUND）；balance_rows 取导入里预览为 ok 的行的 SKU。
       命令里按契约 6.3 的顺序：FOR UPDATE 读导入行，已确认返回 200 与当前表示，已过期 409 IMPORT_EXPIRED，池已 live 409 POOL_ALREADY_LIVE，
-      升序锁余额行，按锁住的行重查（SKU 仍在本租户、未合并、opening_entry_id 为空），通过且数量大于 0 的写 OPENING_BALANCE
+      升序锁余额行，按锁住的行重查（SKU 仍在本租户；未合并，照 CORE-TASK-026 的 require_not_merged 用 FOR SHARE 读 SKU 行，但这里不抛错、只把该行记为 failed；
+      opening_entry_id 为空），通过且数量大于 0 的写 OPENING_BALANCE
       （source_type stock_import，source_ref 为 import_id），为 0 的不写；导入改为 confirmed，存逐行结果与确认人，返回 200。
       三，查询 GET /v1/stock-imports/{import_id}：stock.read；不存在或属于别的租户 404 STOCK_IMPORT_NOT_FOUND，后者记 cross_tenant；status 为 previewed、
       expired（由 expires_at 推出，不存）或 confirmed。表示的键固定且都出现：import_id、pool_id、status、expires_at、created_at、confirmed_at、rows、summary、result。
@@ -1306,8 +1316,8 @@ tasks:
       经 CORE-TASK-025 的执行器（balance_rows 取正文 pool_id 与各行 sku_id）。
       一，收货 POST /v1/receipts（receipts.create）：stock.write，角色 stock_operator 或 stock_admin；正文 pool_id、receipt_ref（第 1 节引用格式）、
       lines（1 到 100 行，批量数组，超过 413；每行 line_ref、sku_id、quantity 为 1 到 1000000），可选 reason_code、note、occurred_at；未知字段、
-      line_ref 或 sku_id 重复 422。池授权按正文 pool_id。命令经 CORE-TASK-026 的 with_document 执行，按契约 6.2 第 4 条的顺序：业务引用（receipt 类型的单据）、池为 live、resolve_skus、
-      升序锁余额行、每行写一条 RECEIPT（source_type receipt，source_ref 为 receipt_ref，带 line_ref）、写单据；返回 201 与收货单的表示
+      line_ref 或 sku_id 重复 422。池授权按正文 pool_id。命令经 CORE-TASK-026 的 with_document 执行，按契约 6.2 第 4 条的顺序：业务引用（receipt 类型的单据）、池为 live、require_skus_exist、
+      升序锁余额行、require_not_merged、每行写一条 RECEIPT（source_type receipt，source_ref 为 receipt_ref，带 line_ref）、写单据；返回 201 与收货单的表示
       （document_id、receipt_ref、pool_id、reason_code、note、occurred_at、created_at、lines 按请求顺序，每行 line_ref、sku_id、quantity、entry_id、
       写后的四个量、available、balance_version）。
       二，不可售调整 POST /v1/unavailable-adjustments（unavailable_adjustments.create）：stock.write；正文 pool_id、adjustment_ref、action
@@ -1355,10 +1365,10 @@ tasks:
       二，命令经 CORE-TASK-026 的 with_document 执行（被业务拒绝时在新事务里重新判定一次，见该任务），依次：业务引用（correction 类型、
       document_ref 为原 entry_id）——已有单据且摘要相同返回 200 与 result；摘要不同时不报
       BUSINESS_REF_CONFLICT，改为 409 ENTRY_NOT_CORRECTABLE，details.reason 为 already_corrected，带已有单据的 document_id，不记安全事件
-      （with_document 要能让调用方替换摘要不同时的回答）；
+      （用 with_document 的 on_conflict 参数）；
       然后 FOR SHARE 读池行，FOR UPDATE 锁原流水的余额行，按 correction_blocker 判定（409 ENTRY_NOT_CORRECTABLE，details.reason 为 entry_type、
       pool_live 或 superseded，superseded 时带 details.last_book_only_version）；apply_correction 违反不变量时 409 CORRECTION_BREAKS_INVARIANTS，
-      details 带落账后的四个量与缺口数；通过则写一条 CORRECTION（四个增量为原流水的相反数，corrects_entry_id 为原流水，source_type correction，
+      details 为一个对象：sku_id、stock_balance、reserved、unavailable、paid_pending_dispatch（落账后的值）与 shortfall；通过则写一条 CORRECTION（四个增量为原流水的相反数，corrects_entry_id 为原流水，source_type correction，
       source_ref 为原 entry_id），append_entry 照 CORE-TASK-026 更新判定列并在原流水是有效期初时清空 opening_entry_id，写单据，
       返回 201：document_id、corrected_entry_id、entry（流水的表示）。
       三，两个不同幂等键并发更正同一条流水：后到者的读快照看不到先到者的单据，锁行后又因先到者的 CORRECTION 抬高了判定列而判出 superseded；
@@ -1400,7 +1410,7 @@ tasks:
       二，提交实数 POST /v1/counts/{count_id}/submit（counts.submit）：stock.write，角色 stock_operator 或 stock_admin；正文 skus 为 1 到 100 个
       sku_id、shelf_count、unsellable_count（批量数组，超过 413；两项实数 0 到 1000000；sku_id 重复 422）；池授权按盘点单所属的池
       （require_object_pool，404 COUNT_NOT_FOUND）；balance_rows 取盘点单的池与正文的 SKU。命令里先 FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；
-      resolve_skus；提交后 SKU 总数超过 100 为 422（details.reason 为 count_sku_limit）；升序锁余额行，记快照与 count_deltas 算出的 d_shelf、d_u，
+      require_skus_exist；盘点单的已有盘点行在盘点单行锁之后用 FOR UPDATE 读（普通读看不到并发提交已写入的行）；提交后 SKU 总数超过 100 为 422（details.reason 为 count_sku_limit）；升序锁余额行，require_not_merged，记快照与 count_deltas 算出的 d_shelf、d_u，
       连同实数、提交人、请求 ID、时间写入盘点行，已有的行整行替换；不写流水；返回 200 与表示。
       三，取消 POST /v1/counts/{count_id}/cancel（counts.cancel）：没有请求体；角色 stock_operator 或 stock_admin；池授权同提交。FOR UPDATE 读盘点单行，
       不是 open 为 409 STATE_CONFLICT；改为 cancelled 并记取消人；删除这张单的盘点行（契约 6：取消丢弃已提交的实数与快照；盘点行不是流水，
@@ -1443,8 +1453,8 @@ tasks:
       在 CORE-TASK-031 的 app/api/counts.py 与 app/services/counts.py 加 POST /v1/counts/{count_id}/confirm（counts.confirm）。
       规则用 CORE-TASK-001 的 apply_count_adjustment 与 CORE-TASK-023 的 is_stale，锁行与写流水用 CORE-TASK-026 的 app/services/stock.py。
       一，stock.write，角色 stock_admin；正文 reason_code（必填）、可选 note；池授权按盘点单所属的池（404 COUNT_NOT_FOUND）。
-      二，命令里依次：FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；没有盘点行为 422（details.reason 为 count_has_no_lines）；
-      按 sku_id 升序 FOR UPDATE 锁全部盘点行 SKU 的余额行；提交之后被合并的 SKU（锁行后读 SKU 的 merged_into_sku_id）：409 SKU_MERGED，
+      二，命令里依次：FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；盘点行在盘点单行锁之后用 FOR UPDATE 读（读快照建立得早，普通读会漏掉并发提交刚写入的行）；没有盘点行为 422（details.reason 为 count_has_no_lines）；
+      按 sku_id 升序 FOR UPDATE 锁全部盘点行 SKU 的余额行；提交之后被合并的 SKU（锁余额行后用 CORE-TASK-026 的 require_not_merged，FOR SHARE 读 SKU 行）：409 SKU_MERGED，
       details 带按 sku_id 升序第一个这样的 sku_id 与 merged_into_sku_id（合并在来源 SKU 全为 0 时可能不写迁移流水，所以不能只靠 COUNT_STALE 拦）；
       这张单只能取消、另开新单在规范 SKU 上重点；
       对每个 SKU 用 is_stale(判定列, 快照版本) 检查，有为真的整笔 409 COUNT_STALE，details.sku_ids 按 sku_id 升序列出；
