@@ -25,6 +25,7 @@ from tests.integration.conftest import add_credential, assert_rejected_by, new_i
 Balance = tuple[str, str, str]
 
 OCCURRED_AT = datetime(2026, 11, 12, 8, 30)
+WENT_LIVE_AT = datetime(2026, 11, 15, 8, 0)
 
 # 只有 stock_balance 为负时，reserved + unavailable ≤ stock_balance 必然同时被违反；
 # 不依赖 MySQL 先报哪一条，下面的测试对这种行接受两者之一。
@@ -83,6 +84,16 @@ def pool_insert(tenant_id: str, location_id: str, **overrides: object) -> Execut
         "status": "initializing",
     }
     return insert(StockPool).values(values | overrides)
+
+
+def went_live(db: Connection, tenant_id: str) -> dict[str, object]:
+    """切 live 时记下的四列（契约 6.3）；live 的池必须都有。"""
+    return {
+        "went_live_at": WENT_LIVE_AT,
+        "went_live_credential_id": add_credential(db, tenant_id),
+        "went_live_actor_ref": "admin_1",
+        "went_live_request_id": new_id("req"),
+    }
 
 
 def add_pool(db: Connection, tenant_id: str) -> str:
@@ -202,7 +213,7 @@ def test_pool_status_must_be_an_exact_known_value(db: Connection):
     tenant = add_tenant(db)
     location = add_location(db, tenant)
     db.execute(pool_insert(tenant, location, status="initializing"))
-    db.execute(pool_insert(tenant, location, status="live"))
+    db.execute(pool_insert(tenant, location, status="live", **went_live(db, tenant)))
     for status in ["LIVE", "Live", "Initializing", "active", "closed"]:
         rejected = pool_insert(tenant, location, status=status)
         assert_rejected_by(db, rejected, "ck_stock_pools_status")
