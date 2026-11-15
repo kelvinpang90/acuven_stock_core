@@ -1182,7 +1182,8 @@ tasks:
       OPENING_BALANCE 把 opening_entry_id 设为这条流水，CORRECTION 在原流水的 entry_id 等于 opening_entry_id 时清空它；UPDATE 余额行、
       INSERT 流水（entry_id 前缀 ent_；channel_id 取凭据的销售入口；credential_id、actor_ref、actor_role、request_id、idempotency_key 取自本请求；
       source_type、source_ref、line_ref、reason_code、note、occurred_at、corrects_entry_id 由调用方给，occurred_at 为空时取 command_now；recorded_at 也显式写 command_now，不靠列默认值，所以同一命令的各条流水 recorded_at 相同），
-      返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_，由 new_command_id 生成）。mark_verified(execution, balance) 把两个判定列都设为
+      返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_，由 new_command_id 生成）。mark_reconciled_at(execution, balance, version) 把 last_reconciled_version 设为给定版本（盘点确认取快照版本，契约 0.10 的 4.1；
+      给的版本小于当前值或大于 last_book_only_version 时抛异常）；mark_verified(execution, balance) 把两个判定列都设为
       当前 balance_version（差额为 0 的核实）。
       五，单据：find_document(execution, document_type, document_ref) 按租户与凭据的销售入口读 stock_documents；answer_existing_document
       按契约 6.2 第 7 条判定（摘要不同时的回答可由调用方替换，供更正报 already_corrected）：request_hash 等于 execution.request_digest 时返回 200 与 result，否则抛 409 BUSINESS_REF_CONFLICT 并登记
@@ -1466,7 +1467,8 @@ tasks:
       逐 SKU 用 apply_count_adjustment 算落账后的账面，有违反不变量的整笔 409 COUNT_BELOW_COMMITMENTS，details.skus 只列违反的 SKU（按 sku_id 升序），每项 sku_id、stock_balance、reserved、
       unavailable、paid_pending_dispatch（落账后的值）与 shortfall；
       都通过后，差额不全为 0 的 SKU 各写一条 COUNT_ADJUSTMENT（四个增量为 d_shelf 加 d_u、0、d_u、0；source_type count，source_ref 为 count_ref；
-      reason_code、note 取正文），append_entry 照 CORE-TASK-026 更新判定列；两个差额都为 0 的不写流水，用 mark_verified 把两个判定列都设为当前版本；
+      reason_code、note 取正文），append_entry 照 CORE-TASK-026 更新判定列；两个差额都为 0 的不写流水，把 last_book_only_version 设为当前 balance_version；
+      无论写没写，最后用 mark_reconciled_at 把 last_reconciled_version 设为该 SKU 的快照版本（契约 0.10 的 4.1 与 6.6 第 6 步：点数核实的是快照那一刻）；
       盘点行记下 entry_id；盘点单改为 confirmed，记确认人、reason_code、confirm_note；返回 200 与表示（CORE-TASK-031 的表示函数，传入锁内读到的盘点单行与盘点行加上本次的改动，不另用普通读）。
       被拒时什么也不写（只保存幂等记录）。
       明确不做：SKU 合并的定数（随合并任务做）、Demo 重置。
@@ -1477,7 +1479,7 @@ tasks:
     acceptance_criteria:
       - 接口与写入加在 app/api/counts.py 与 app/services/counts.py；CORE-TASK-031 的测试照常通过
       - 集成测试在真 MySQL 上验证差额法：提交时点到 20、之后收货 10、确认时差额为 0 不写流水且账面仍是 30；点数少于账面时写 COUNT_ADJUSTMENT 且两个增量正确；只改不可售件数时 stock_balance 与 unavailable 同增；流水带正文的 reason_code 与 note
-      - 集成测试验证判定列：写了流水的 SKU 判定列为该流水的版本；差额为 0 的 SKU 判定列为当时的 balance_version；之后对这些 SKU 之前的收货做更正得 superseded（若 CORE-TASK-030 尚未合并，则直接断言判定列的值）
+      - 集成测试验证判定列：写了流水的 SKU 的 last_book_only_version 为该流水的版本、差额为 0 的为当时的 balance_version；两种 SKU 的 last_reconciled_version 都是快照版本；快照之后、确认之前录的收货在确认后仍可更正（判定列小于它的版本）；之后对这些 SKU 之前的收货做更正得 superseded（若 CORE-TASK-030 尚未合并，则直接断言判定列的值）
       - 集成测试验证 COUNT_STALE：两张盘点单都提交了同一 SKU，先确认的写了流水后，后确认的得 409 COUNT_STALE 且列出该 SKU，什么也没写；重新提交该 SKU 后可确认；快照与差额为 0 的核实之间没有别的流水时不报
       - 集成测试验证 COUNT_BELOW_COMMITMENTS：预留占着的件点不到时得 409 且 details 的落账后四个量与缺口数正确；释放预留（测试直接造流水与余额）后换新幂等键、正文照旧再确认成功，沿用原快照
       - 集成测试验证状态与授权：提交之后 SKU 被合并（测试直接改 SKU 行）得 409 SKU_MERGED 且什么也没写；没有盘点行 422；已确认再确认（换键）得 409 STATE_CONFLICT，同键重放得首次结果；缺 reason_code 422；stock_operator 得 403；两张单并发确认同一 SKU 不会把差额记两次
