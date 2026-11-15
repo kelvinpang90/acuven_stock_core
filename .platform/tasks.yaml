@@ -1105,7 +1105,7 @@ tasks:
       预览不合格的行为 skipped（带预览结果）；确认结果每项的键固定且都出现：index、sku_id、quantity、outcome、entry_id（计划里为 null，
       由服务层落账后填）、preview_result（created 与 failed 的行为 ok，skipped 的行为预览时的结果）、failure（只有 failed 的行有，其余为 null）。
       明确不做：数据库读写、接口、错误码到 HTTP 的映射。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 新增 app/domain/stock.py 与 app/domain/stock_imports.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试放 tests/unit/test_stock.py 与 tests/unit/test_stock_imports.py，用标准库 unittest
