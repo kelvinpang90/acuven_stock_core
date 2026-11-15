@@ -909,7 +909,7 @@ tasks:
       不输出 credential_id、actor_role 与 idempotency_key。
       明确不做：推送、按对象或事件类型筛选、Core 侧保存消费进度。
       整机恢复后抬高自增起点是运行手册的一步（契约 0.8 的 12.1 第 3 条），不在本任务里做。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-012
       - CORE-TASK-013

@@ -26,7 +26,6 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-020` 实现目录变更流的拉取接口
 
 ### 已阻塞
 
