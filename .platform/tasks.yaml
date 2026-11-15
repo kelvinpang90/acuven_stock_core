@@ -1302,7 +1302,7 @@ tasks:
       四，池切 live POST /v1/pools/{pool_id}/go-live（pools.go_live）：没有请求体；stock.write，角色 stock_admin；池授权按路径 pool_id。命令里 FOR UPDATE 读池行，
       已 live 返回 200 与池的表示，否则改为 live 并记 went_live 四列，返回 200 与池的表示（字段同 CORE-TASK-027 的池查询）。
       明确不做：收货、盘点、更正等其他命令；不改池的其他列。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-024
       - CORE-TASK-026
