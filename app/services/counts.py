@@ -1,7 +1,7 @@
-"""盘点单的开单、提交实数、取消与查询（契约第 6 节、§6.2、§6.6）。
+"""盘点单的开单、提交实数、确认落账、取消与查询（契约第 6 节、§4.1、§6.2、§6.6）。
 
 写命令都在幂等执行器以 READ COMMITTED 开的事务里、用 execution.connection 运行，
-自己不开、不提交、不回滚事务。确认落账不在这里。
+自己不开、不提交、不回滚事务。
 
 开单：业务引用（count_ref，按租户与凭据的销售入口）→ 池为 live → 写盘点单。
 业务引用用普通读查；被业务规则拒绝或撞 (tenant_id, channel_id, count_ref) 唯一约束时，
@@ -13,11 +13,20 @@
 而同一张单的提交、确认、取消都先锁盘点单行，读到的就是最新的；
 不用加锁读，它对还没有盘点行的单会锁住空范围的间隙，两张单的首次提交会互相等待而死锁。
 
+确认：FOR UPDATE 读盘点单行 → 不是 open 409 → 普通读读盘点行，没有为 422
+→ 升序锁全部盘点行 SKU 的余额行 → COUNT_STALE → COUNT_BELOW_COMMITMENTS
+→ 差额不全为 0 的写 COUNT_ADJUSTMENT，全为 0 的 mark_verified
+→ 盘点行记 entry_id、盘点单改为 confirmed。
+不查 SKU 已合并（§6.6 确认的步骤里没有）：
+提交之后被合并的 SKU 有成对的迁移流水，由 COUNT_STALE 拦下。
+两个判定列：last_book_only_version 取写的流水的版本或当时的 balance_version，
+last_reconciled_version 无论写没写都取快照版本（§4.1，点数核实的是快照那一刻）。
+
 取消：FOR UPDATE 读盘点单行 → 不是 open 409 → 改为 cancelled、记取消人 → 删除盘点行。
 盘点行不是流水，没有落账，取消丢弃已提交的实数与快照（第 6 节）。
 
 锁序：盘点单行 → 余额行（FOR UPDATE，按 (pool_id, sku_id) 升序）→ SKU 行（FOR SHARE）。
-提交、取消都不写流水。
+只有确认写流水。
 
 表示由 count_representation 从盘点单行与盘点行算出，它不读库：
 写命令把锁内读到的行加上本次的改动传进去，查询接口用普通读读出后传进去，确认也照此复用。
@@ -34,16 +43,26 @@ from sqlalchemy.exc import IntegrityError
 from app.api.auth import ObjectPool
 from app.api.errors import INVALID_REQUEST, ApiError
 from app.domain.ids import new_id
-from app.domain.ledger import count_deltas
+from app.domain.ledger import (
+    CountBelowCommitments,
+    EntryType,
+    apply_count_adjustment,
+    count_deltas,
+    is_stale,
+)
+from app.domain.quantities import Quantities
 from app.models.inventory import QUANTITIES, StockCount, StockCountLine
 from app.services.idempotency import BusinessRefTaken, CommandResult, Execution
 from app.services.stock import (
     BUSINESS_REF_CONFLICT,
     BUSINESS_REF_CONFLICT_EVENT,
     LockedBalance,
+    append_entry,
     command_now,
     format_timestamp,
     lock_balances,
+    mark_verified,
+    new_command_id,
     require_live,
     require_not_merged,
     require_skus_exist,
@@ -58,7 +77,10 @@ CANCELLED = "cancelled"
 COUNT = "count"
 COUNT_NOT_FOUND = "COUNT_NOT_FOUND"
 STATE_CONFLICT = "STATE_CONFLICT"
+COUNT_STALE = "COUNT_STALE"
+COUNT_BELOW_COMMITMENTS = "COUNT_BELOW_COMMITMENTS"
 COUNT_SKU_LIMIT = "count_sku_limit"
+COUNT_HAS_NO_LINES = "count_has_no_lines"
 # 一张盘点单最多的 SKU 数（§6.6 提交第 3 步）。
 MAX_COUNT_SKUS = 100
 
@@ -430,6 +452,157 @@ def submit_count(execution: Execution, count_id: str, skus: Sequence[CountSku]) 
         _write_line(execution, count, line, exists=sku.sku_id in existing)
         lines[sku.sku_id] = line
     return CommandResult(count_representation(count, lines.values()))
+
+
+# --- 确认 ---
+
+
+def _snapshot(line: CountLineRecord) -> Quantities:
+    return Quantities(*(getattr(line, f"snapshot_{name}") for name in QUANTITIES))
+
+
+def _require_lines(lines: Sequence[CountLineRecord]) -> None:
+    """一个盘点行都没有：422，details.reason 为 count_has_no_lines。"""
+    if not lines:
+        details = {"reason": COUNT_HAS_NO_LINES}
+        raise ApiError(422, INVALID_REQUEST, "the count has no counted skus", details=details)
+
+
+def _require_fresh(lines: Sequence[CountLineRecord], balances: dict[str, LockedBalance]) -> None:
+    """快照之后有只改账的流水的 SKU：整笔 409 COUNT_STALE，details.sku_ids 升序。"""
+    stale = sorted(
+        line.sku_id
+        for line in lines
+        if is_stale(balances[line.sku_id].last_book_only_version, line.snapshot_balance_version)
+    )
+    if stale:
+        raise ApiError(
+            409,
+            COUNT_STALE,
+            "skus have book-only entries after their snapshots",
+            details={"sku_ids": stale},
+        )
+
+
+def _require_within_commitments(
+    lines: Sequence[CountLineRecord], balances: dict[str, LockedBalance]
+) -> None:
+    """按差额落账后违反不变量的 SKU：整笔 409 COUNT_BELOW_COMMITMENTS，
+    details.skus 按 sku_id 升序，每项带落账后的四个量与缺口数。
+    """
+    violations = []
+    for line in sorted(lines, key=lambda line: line.sku_id):
+        latest, snapshot = balances[line.sku_id].quantities, _snapshot(line)
+        try:
+            apply_count_adjustment(latest, snapshot, line.shelf_count, line.unsellable_count)
+        except CountBelowCommitments as exc:
+            violations.append(
+                {
+                    "sku_id": line.sku_id,
+                    **{name: getattr(exc, name) for name in QUANTITIES},
+                    "shortfall": exc.shortfall,
+                }
+            )
+    if violations:
+        raise ApiError(
+            409,
+            COUNT_BELOW_COMMITMENTS,
+            "the count would break the balance invariants",
+            details={"skus": violations},
+        )
+
+
+def _settle_line(
+    execution: Execution,
+    count: CountRecord,
+    line: CountLineRecord,
+    balance: LockedBalance,
+    command_id: str,
+    now: datetime,
+    reason_code: str,
+    note: str | None,
+) -> CountLineRecord:
+    """落账一个 SKU，返回记下 entry_id 的盘点行。
+
+    差额不全为 0：写 COUNT_ADJUSTMENT（stock_balance 增 d_shelf + d_u、unavailable 增 d_u），
+    并把 entry_id 写回盘点行；全为 0：不写流水，只核实。
+    两种情况 last_reconciled_version 都取快照版本（§4.1、§6.6 确认第 6 步）。
+    """
+    snapshot_version = line.snapshot_balance_version
+    if line.d_shelf == 0 and line.d_u == 0:
+        mark_verified(execution, balance, reconciled_version=snapshot_version)
+        return line
+    entry = append_entry(
+        execution,
+        balance,
+        EntryType.COUNT_ADJUSTMENT,
+        (line.d_shelf + line.d_u, 0, line.d_u, 0),
+        command_id,
+        now=now,
+        source_type=COUNT,
+        source_ref=count.count_ref,
+        reason_code=reason_code,
+        note=note,
+        reconciled_version=snapshot_version,
+    )
+    entry_id = entry["entry_id"]
+    execution.connection.execute(
+        update(StockCountLine)
+        .where(
+            StockCountLine.tenant_id == _tenant_id(execution),
+            StockCountLine.count_id == count.count_id,
+            StockCountLine.sku_id == line.sku_id,
+        )
+        .values(entry_id=entry_id)
+    )
+    return replace(line, entry_id=entry_id)
+
+
+def confirm_count(
+    execution: Execution, count_id: str, reason_code: str, note: str | None
+) -> CommandResult:
+    """确认落账，200 与盘点单的表示。被拒时什么也不写（执行器撤销，只保存幂等记录）。
+
+    余额行在提交时已预建，盘点行又有外键指向它，lock_balances 读得到。
+    """
+    connection = execution.connection
+    tenant_id = _tenant_id(execution)
+    now = command_now(execution)
+    count = _lock_open_count(execution, count_id)
+    lines = read_lines(connection, tenant_id, count_id)
+    _require_lines(lines)
+    balances = lock_balances(execution, count.pool_id, [line.sku_id for line in lines])
+    _require_fresh(lines, balances)
+    _require_within_commitments(lines, balances)
+
+    command_id = new_command_id()
+    settled = [
+        _settle_line(
+            execution, count, line, balances[line.sku_id], command_id, now, reason_code, note
+        )
+        for line in lines
+    ]
+    connection.execute(
+        update(StockCount)
+        .where(StockCount.tenant_id == tenant_id, StockCount.count_id == count_id)
+        .values(
+            status=CONFIRMED,
+            confirmed_credential_id=execution.access.principal.credential_id,
+            confirmed_actor_ref=_actor_ref(execution),
+            confirmed_request_id=execution.request.state.request_id,
+            confirmed_at=now,
+            confirmed_reason_code=reason_code,
+            confirm_note=note,
+        )
+    )
+    confirmed = replace(
+        count,
+        status=CONFIRMED,
+        confirmed_at=now,
+        confirmed_reason_code=reason_code,
+        confirm_note=note,
+    )
+    return CommandResult(count_representation(confirmed, settled))
 
 
 # --- 取消 ---
