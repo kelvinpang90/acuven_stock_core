@@ -869,7 +869,7 @@ tasks:
       表示里的 external_ref 与 product_ref 在行里是字符串时原样回显，否则（没带、数字、对象等）为 null，这样响应体（也存进幂等记录的 JSON 列）里不会出现调用方的任意值。
       时间格式用 CORE-TASK-016 的函数。
       明确不做：往现有商品加规格、修改现有商品、CSV 解析、过期导入的清理、变更流接口。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-012
       - CORE-TASK-014
