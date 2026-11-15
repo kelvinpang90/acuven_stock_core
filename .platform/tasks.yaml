@@ -1380,7 +1380,8 @@ tasks:
       document_ref 为原 entry_id）——已有单据且摘要相同返回 200 与 result；摘要不同时不报
       BUSINESS_REF_CONFLICT，改为 409 ENTRY_NOT_CORRECTABLE，details.reason 为 already_corrected，带已有单据的 document_id，不记安全事件
       （用 with_document 的 on_conflict 参数）；
-      然后 FOR SHARE 读池行，FOR UPDATE 锁原流水的余额行，按 correction_blocker 判定（409 ENTRY_NOT_CORRECTABLE，details.reason 为 entry_type、
+      然后 FOR SHARE 读池行，FOR UPDATE 锁原流水的余额行，用 CORE-TASK-026 的 require_not_merged 查原流水的 SKU（已合并 409 SKU_MERGED，
+      照契约 6.2 第 4 条先于本命令自己的规则；合并在来源 SKU 全为 0 时可能不写迁移流水，不能只靠判定列拦），再按 correction_blocker 判定（409 ENTRY_NOT_CORRECTABLE，details.reason 为 entry_type、
       pool_live 或 superseded，superseded 时带 details.last_reconciled_version）；apply_correction 违反不变量时 409 CORRECTION_BREAKS_INVARIANTS，
       details 为一个对象：sku_id、stock_balance、reserved、unavailable、paid_pending_dispatch（落账后的值）与 shortfall；通过则写一条 CORRECTION（四个增量为原流水的相反数，corrects_entry_id 为原流水，source_type correction，
       source_ref 为原 entry_id），append_entry 照 CORE-TASK-026 更新判定列并在原流水是有效期初时清空 opening_entry_id，写单据，
@@ -1391,11 +1392,12 @@ tasks:
       明确不做：盘点、期初接口；不改 CORE-TASK-029 的两个命令。
     status: ready
     depends_on:
+      - CORE-TASK-028
       - CORE-TASK-029
     acceptance_criteria:
       - 接口与写入加在 app/api/stock_documents.py 与 app/services/stock_documents.py；CORE-TASK-029 的测试照常通过
       - 集成测试在真 MySQL 上验证成功的更正：收货后更正得 201，余额回到收货前、流水的四个增量为原流水的相反数、corrects_entry_id 正确、判定列更新；initializing 池上更正期初后 opening_entry_id 清空，可以用新导入再导期初（用服务层或接口造期初）
-      - 集成测试验证类型与池状态：更正 RESERVE 类流水（测试直接造流水）、COUNT_ADJUSTMENT、CORRECTION 得 entry_type；池已 live 时更正期初得 pool_live
+      - 集成测试验证类型与池状态：原流水的 SKU 已合并（测试直接改 SKU 行，不写迁移流水）得 409 SKU_MERGED；更正 RESERVE 类流水（测试直接造流水）、COUNT_ADJUSTMENT、CORRECTION 得 entry_type；池已 live 时更正期初得 pool_live
       - 集成测试验证已被吸收：收货之后有一条定数类流水时得 superseded；同一行上两笔收货都录错时，更正后一笔之后前一笔照样能更正（契约 0.10）；两次收货后差额为 0 的核实（测试经服务层 mark_verified 或盘点确认造出）之后更正后一次收货也得 superseded
       - 集成测试验证不变量：收货之后被预留用掉，更正得 409 CORRECTION_BREAKS_INVARIANTS 且 details 的四个量与缺口数正确，什么也没写
       - 集成测试验证业务引用与并发：同一条流水换键同内容得 200 与原结果；换键不同内容得 409 ENTRY_NOT_CORRECTABLE（already_corrected）且不记 business_ref_conflict 事件；两个不同键并发更正同一条只有一条 CORRECTION 生效，后到者得到 200 原结果（同内容）或 already_corrected（不同内容），不得 superseded
