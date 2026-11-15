@@ -1,6 +1,6 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.9（起草）｜2026-11-15｜状态：**待 Kelvin 批准**——第 14 节第 54–62 条（§6.2–§6.8 库存管理命令的通用约定、期初与池切 live、收货、不可售调整、
+> 版本：0.9（起草）｜2026-11-15｜状态：**待 Kelvin 批准**——第 14 节第 54–63 条（§6.2–§6.8 库存管理命令的通用约定、期初与池切 live、收货、不可售调整、
 > 盘点单的接口与存放、更正、余额与流水查询，§4.1 余额行的两个判定列，以及 §1、§2.4、§4.3、§6、§7.1、§8.2、§8.3、§10 第 3、4 条的相应条目；取舍见 Q-42～Q-48）。
 > 0.9 批准之前，库存管理命令的任务都不登记。
 > 0.8：第 14 节第 53 条（§2.5 整机恢复后的游标与游标的保存，§12.1 第 3 条恢复流程加一步、第 4 条恢复后重读目录，版本区的闸门说明；取舍见 Q-41）
@@ -201,11 +201,12 @@ stateDiagram-v2
      有则录入的实数已作废，整笔拒绝，409 `COUNT_STALE`，合并单留在 `counted`，须重新点数、重新录入。
   1. **整行迁移**：来源 SKU **执行时**的四个账面量全部转到规范 SKU——来源写 `MERGE_TRANSFER_OUT`（四个量各减去当前值，归零），
      规范写 `MERGE_TRANSFER_IN`（各加同样的量），成对出现；来源的未结预留、订单行累计量同时改挂到规范 SKU。
-     两个各自满足不变量的账面相加仍满足不变量，这一步不会失败。
+     两个各自满足不变量的账面相加仍满足不变量，这一步不会失败。两条迁移流水都是只改账的流水，照 §4.1 更新两个余额行的 `last_book_only_version`（0.9）。
   2. **按差额定数**：`d_u` = 不可售实数 − 两个快照的 `unavailable` 之和；
      `d_shelf` = 在架实数 − 两个快照的（`stock_balance` − `unavailable` + `paid_pending_dispatch`）之和。
      在规范 SKU 上写一条 `COUNT_ADJUSTMENT`（引用合并单）：`stock_balance` 增 `d_shelf + d_u`、`unavailable` 增 `d_u`，
      加到第 1 步之后的最新账面上；两个差额都为 0 时不写。流水记两个快照、两项实数与差额。
+     无论写没写，执行后规范 SKU 余额行的 `last_book_only_version` 都设为它当时的 `balance_version`（§4.1，0.9）。
   3. **不变量**：第 2 步落账后若违反 §4.1，整笔执行回滚（第 1 步也不生效），返回 409 `COUNT_BELOW_COMMITMENTS`，
      缺口数照 §6 的公式算；合并单留在 `counted`。管理员照 §6 先处理相关预留与缺货的已付款订单，然后**直接再执行**：
      沿用原实数与快照，其间的释放、退款回库、发货等变动由差额法照常保留；不要把原来的数再录一遍（会重取快照、把其间的发货等算错）。
@@ -357,7 +358,7 @@ V1 用拉取，不做推送（Q-08）。
 | `paid_pending_dispatch` | 已付款扣库、实物尚未交运 |
 | `available` | **派生**：`stock_balance − reserved − unavailable`，不存储为可写字段 |
 | `balance_version` | 每写一条流水 +1，用于查询核对，并用来认出盘点快照之后的流水（§6，不做乐观锁比较） |
-| `last_book_only_version` | （0.9）这一行最后一条**只改账的流水**（§6 的定义）的 `balance_version_after`，没有为 0；写这类流水时在同一事务里同步更新。§6 的 `COUNT_STALE`、§2.4 执行的前置检查、§6.7 的“已被吸收”都靠它判定 |
+| `last_book_only_version` | （0.9）这一行的账面最后一次**被核实或另行定数**时的 `balance_version`，没有为 0。写只改账的流水（§6 的定义）时设为这条流水的 `balance_version_after`；盘点确认、合并执行、Demo 重置对一个 SKU 核实或定数却因差额为 0 没写流水时，也设为该行当时的 `balance_version`。都在同一事务里更新。检查约束 `last_book_only_version <= balance_version`。§6 的 `COUNT_STALE`、§2.4 执行的前置检查、§6.7 的“已被吸收”都靠它判定 |
 | `opening_entry_id` | （0.9）这一行的有效期初（§6.3）的 `OPENING_BALANCE` 流水 ID，没有为空；写期初时填上，更正这条期初时清空。不加外键（流水表已有外键指向余额行，再反向引用会成环），一致性由同一事务的服务层保证 |
 
 这两列只为判定服务，不是账面量：只在已 `FOR UPDATE` 锁住的余额行上读写，所以判定不用另查流水区间。在 REPEATABLE READ 下，普通读查流水看不到并发刚提交的流水，加锁读查一个还没有流水的 SKU 又会锁住间隙、与并发插入互相死锁（§4.1 下文同一原则），所以凡是“某个版本之后有没有某类流水”的判定都读这两列。加这两列时还没有任何写流水的命令上线，现有余额行取默认值 0 与空即正确。
@@ -519,7 +520,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 | --- | --- |
 | 期初 `opening-balances` | 只在池处于 `initializing` 状态时可用；批量“校验预览 → 确认”，与 2.3 同形；**Demo 库存数不得作为期初**（STK-03）。池切到 `live` 后期初命令一律拒绝，只能走盘点更正或经审批的重建流程（Q-09）。接口、逐行结果与池切 live 见 §6.3（0.9）。 |
 | 收货 `receipts` | `receipt_ref` 唯一；同引用重试不重复入库（STK-02）。V1 无采购单，`receipt_ref` 由网店后台生成。接口见 §6.4（0.9）。 |
-| 盘点 `counts` | 三步：**开单 → 提交实数 → 管理员确认**。实数分两项录：**在架件数**（含已付款待发的件）与**不可售件数**。两项实数都必须是不小于 0 的整数，否则提交 422。**点数之前已发生的实物进出（收货、发货、报损处理）须在提交实数前入账**，否则会被差额重复计入或漏计；对已提交实数的 SKU，之后的 `WRITE_OFF` 只用于点数之后才处理掉的实物。提交实数**按 SKU 计**：一次提交可以只列部分 SKU，再次提交只替换所列 SKU 的实数与快照，没列的 SKU 保留原实数与原快照（0.5）。确认只对已提交实数的 SKU 落账，一个都没提交时 422；没提交的 SKU 不动，不当作实数 0。`count_ref` 只标识开单；提交与确认靠幂等键去重，按 SKU 重新提交不算 §7.1 的业务引用冲突。提交实数时，Core 在同一事务里记下当时每个 SKU 的四个账面量作为**快照**（表示“这个时刻点到的就是这么多”）。确认时按**差额**落账，不用快照覆盖最新账面：`d_u` = 不可售件数 − 快照 `unavailable`；`d_shelf` = 在架件数 − 快照（`stock_balance` − `unavailable` + `paid_pending_dispatch`）；写一条 `COUNT_ADJUSTMENT`：`stock_balance` 增 `d_shelf + d_u`、`unavailable` 增 `d_u`，加到确认时的最新账面上。这样提交之后、确认之前发生的收货、销售、发货都保留（例：提交时点到 20、之后收货 10，确认时差额为 0，账面仍是 30）。快照也记下每个 SKU 的 `balance_version`，不做乐观锁比较（其间的收货、销售、发货照常保留），只用来认出快照之后的**只改账的流水**：`OPENING_BALANCE`、`COUNT_ADJUSTMENT`、`CORRECTION`、`DEMO_RESET`、`MERGE_TRANSFER_OUT` / `IN`——它们改账面但不对应实物进出，差额法会把它们与实数的差额重复计入（例：快照 5、点到 3，另一张盘点单先把同一 SKU 记了 −2，再确认又记 −2）。确认时在锁内看每个 SKU 的余额行上 `last_book_only_version` 是否大于快照版本（§4.1，0.9；即快照之后有没有这类流水）；有则这些 SKU 的实数作废，整笔确认拒绝，409 `COUNT_STALE`，`details` 列出 SKU，管理员只重新点这些 SKU、只为它们重新提交实数，其余 SKU 不重录（重录会重取快照，见第 14 节第 17 条）；一时点不了的，只能取消这张盘点单、另开新单（0.5）。**取消**（`POST /v1/counts/{id}/cancel`，0.6）：只有未确认的盘点单（已开单、无论有没有提交实数）能取消；取消不写流水，丢弃已提交的实数与快照；对已确认或已取消的盘点单再提交、确认或取消，409 `STATE_CONFLICT`；取消后 `count_ref` 仍被占用，另开新单要用新的 `count_ref`；用原 `count_ref` 换新幂等键再开单（同内容），按 §7.1 第 2 条返回原单当前的表示（状态 `cancelled`），不开新单；开单与查询的响应都带盘点单状态。流水记快照、实数、差额、原因（STK-02、STK-05）。**若落账后会违反 §4.1 不变量**（任一量为负，或 `reserved` + `unavailable` > `stock_balance`），整笔拒绝，返回 409 `COUNT_BELOW_COMMITMENTS`，逐 SKU 给出落账后的四个量和一个缺口数 = max(0, `reserved` + 新 `unavailable` − 新 `stock_balance`, −新 `stock_balance`, −新 `unavailable`)（任一项违反时缺口都大于 0）；盘点单保持未确认：管理员先让相关预留释放或到期，对缺货的已付款订单走退款（退款回库把待发货量转回账面，两步都有流水），然后**直接再确认**：沿用原实数与快照，实际短缺由同一个差额记掉；只有重新点过实物时才重新提交实数（0.5）。Core 不记负数，也不替管理员决定先砍哪笔订单（Q-20 同一原则）。接口、表示与存放见 §6.6（0.9）。 |
+| 盘点 `counts` | 三步：**开单 → 提交实数 → 管理员确认**。实数分两项录：**在架件数**（含已付款待发的件）与**不可售件数**。两项实数都必须是不小于 0 的整数，否则提交 422。**点数之前已发生的实物进出（收货、发货、报损处理）须在提交实数前入账**，否则会被差额重复计入或漏计；对已提交实数的 SKU，之后的 `WRITE_OFF` 只用于点数之后才处理掉的实物。提交实数**按 SKU 计**：一次提交可以只列部分 SKU，再次提交只替换所列 SKU 的实数与快照，没列的 SKU 保留原实数与原快照（0.5）。确认只对已提交实数的 SKU 落账，一个都没提交时 422；没提交的 SKU 不动，不当作实数 0。`count_ref` 只标识开单；提交与确认靠幂等键去重，按 SKU 重新提交不算 §7.1 的业务引用冲突。提交实数时，Core 在同一事务里记下当时每个 SKU 的四个账面量作为**快照**（表示“这个时刻点到的就是这么多”）。确认时按**差额**落账，不用快照覆盖最新账面：`d_u` = 不可售件数 − 快照 `unavailable`；`d_shelf` = 在架件数 − 快照（`stock_balance` − `unavailable` + `paid_pending_dispatch`）；写一条 `COUNT_ADJUSTMENT`：`stock_balance` 增 `d_shelf + d_u`、`unavailable` 增 `d_u`，加到确认时的最新账面上。这样提交之后、确认之前发生的收货、销售、发货都保留（例：提交时点到 20、之后收货 10，确认时差额为 0，账面仍是 30）。快照也记下每个 SKU 的 `balance_version`，不做乐观锁比较（其间的收货、销售、发货照常保留），只用来认出快照之后的**只改账的流水**：`OPENING_BALANCE`、`COUNT_ADJUSTMENT`、`CORRECTION`、`DEMO_RESET`、`MERGE_TRANSFER_OUT` / `IN`——它们改账面但不对应实物进出，差额法会把它们与实数的差额重复计入（例：快照 5、点到 3，另一张盘点单先把同一 SKU 记了 −2，再确认又记 −2）。确认时在锁内看每个 SKU 的余额行上 `last_book_only_version` 是否大于快照版本（§4.1，0.9；即快照之后有没有这类流水，或账面已被别的盘点以差额 0 核实过）；有则这些 SKU 的实数作废，整笔确认拒绝，409 `COUNT_STALE`，`details` 列出 SKU，管理员只重新点这些 SKU、只为它们重新提交实数，其余 SKU 不重录（重录会重取快照，见第 14 节第 17 条）；一时点不了的，只能取消这张盘点单、另开新单（0.5）。**取消**（`POST /v1/counts/{id}/cancel`，0.6）：只有未确认的盘点单（已开单、无论有没有提交实数）能取消；取消不写流水，丢弃已提交的实数与快照；对已确认或已取消的盘点单再提交、确认或取消，409 `STATE_CONFLICT`；取消后 `count_ref` 仍被占用，另开新单要用新的 `count_ref`；用原 `count_ref` 换新幂等键再开单（同内容），按 §7.1 第 2 条返回原单当前的表示（状态 `cancelled`），不开新单；开单与查询的响应都带盘点单状态。流水记快照、实数、差额、原因（STK-02、STK-05）。**若落账后会违反 §4.1 不变量**（任一量为负，或 `reserved` + `unavailable` > `stock_balance`），整笔拒绝，返回 409 `COUNT_BELOW_COMMITMENTS`，逐 SKU 给出落账后的四个量和一个缺口数 = max(0, `reserved` + 新 `unavailable` − 新 `stock_balance`, −新 `stock_balance`, −新 `unavailable`)（任一项违反时缺口都大于 0）；盘点单保持未确认：管理员先让相关预留释放或到期，对缺货的已付款订单走退款（退款回库把待发货量转回账面，两步都有流水），然后**直接再确认**：沿用原实数与快照，实际短缺由同一个差额记掉；只有重新点过实物时才重新提交实数（0.5）。Core 不记负数，也不替管理员决定先砍哪笔订单（Q-20 同一原则）。接口、表示与存放见 §6.6（0.9）。 |
 | 不可售 / 恢复 / 报损 | 见 4.3；`unavailable` 不得超过 `stock_balance − reserved`。接口见 §6.5（0.9）。 |
 | 更正 `corrections` | 见 4.3 的 `CORRECTION`；能更正的类型与依赖判定见 §6.7（0.9）。 |
 
@@ -539,7 +540,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 - Core 的处理：
   1. 在一个事务里，按 SKU 升序加锁；
   2. 对每个列出的 SKU 计算 `new_balance = max(target, reserved + unavailable)`；
-  3. 写一条 `DEMO_RESET` 流水，增量 = `new_balance − stock_balance`；
+  3. 写一条 `DEMO_RESET` 流水，增量 = `new_balance − stock_balance`；增量为 0 不写（见下）。无论写没写，余额行的 `last_book_only_version` 都设为当时的 `balance_version`（§4.1，0.9）；
   4. `reserved`、`unavailable`、`paid_pending_dispatch` 都不动。
 - 结果：`available = max(target − reserved − unavailable, 0)`，与网店现在的规则“当日可用 = max(初始 − 待付预留, 0)”一致；未结订单的预留和待发货量照常保留。
 - `target` 必须是不小于 0 的整数（0 表示当天该 SKU 售罄），负数或非整数整批 422；同一请求里同一 SKU 重复出现也是 422。
@@ -598,7 +599,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
      - `credential_id`、`actor_ref`、`actor_role`、`request_id`、`created_at`。
 
      `(tenant_id, channel_id, document_type, document_ref)` 唯一。这一行与流水、余额、幂等记录在同一事务提交。命令被业务规则拒绝时不写这一行，因为只有已生效的命令才占用业务引用（§7.1 第 2 条）。
-   - **换幂等键重报同一引用**：摘要相同，返回 200 与 `result`。这些单据生效后不再改变，所以对象当前的表示就是首次的结果。摘要不同，409 `BUSINESS_REF_CONFLICT`，记 `business_ref_conflict` 事件。
+   - **换幂等键重报同一引用**：摘要相同，返回 200 与 `result`。这些单据生效后不再改变，所以对象当前的表示就是首次的结果。摘要不同，409 `BUSINESS_REF_CONFLICT`，记 `business_ref_conflict` 事件；更正例外，见 §6.7。
      判定用普通读查这一行。两个不同键的请求并发撞上唯一约束时，照 §7.1 第 2 条最后一段处理。
 
 ### 6.3 期初与池切 live（Q-42、Q-43）
@@ -700,7 +701,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
     3. 按 §8.1 升序锁住全部盘点行 SKU 的余额行（这些行在提交时已建好）；
     4. `COUNT_STALE` 检查（§6，按余额行的 `last_book_only_version`，§4.1）；
     5. 逐 SKU 按差额算出落账后的四个量，任一个违反不变量：整笔 409 `COUNT_BELOW_COMMITMENTS`（§6）；
-    6. 差额不全为 0 的 SKU 各写一条 `COUNT_ADJUSTMENT`（`source_type` 为 `count`，`source_ref` 为 `count_ref`），并把余额行的 `last_book_only_version` 设为它的版本；两个差额都为 0 的不写；
+    6. 差额不全为 0 的 SKU 各写一条 `COUNT_ADJUSTMENT`（`source_type` 为 `count`，`source_ref` 为 `count_ref`），并把余额行的 `last_book_only_version` 设为它的版本；两个差额都为 0 的不写流水，但 `last_book_only_version` 也设为该行当时的 `balance_version`（账面已核实，§4.1）；
     7. 盘点单改为 `confirmed`，每行记下流水 ID。
 
     成功 200，返回盘点单的表示。被 `COUNT_BELOW_COMMITMENTS` 拒绝、处理订单后“直接再确认”时，用新的幂等键（§7.1），正文照旧。
@@ -746,9 +747,10 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
      - 更正本身不能再更正，错了也重新盘点。
   2. **已被吸收**：原流水之后，同一余额行上已有只改账的流水（看锁住的余额行上 `last_book_only_version` 是否大于原流水的 `balance_version_after`，§4.1；§6 的定义：`OPENING_BALANCE`、`COUNT_ADJUSTMENT`、`CORRECTION`、
      `DEMO_RESET`、`MERGE_TRANSFER_OUT` / `IN`），409 `ENTRY_NOT_CORRECTABLE`，`details.reason` 为 `superseded`，并带 `details.last_book_only_version`（不再查是哪条流水；要看的话用 §6.8 的流水查询）。
-     这类流水已经把账面对到实数或另行定数，原来的错误已被吸收，再反向一次就会重复更正。
+     这类流水已经把账面对到实数或另行定数，原来的错误已被吸收，再反向一次就会重复更正。差额为 0 的盘点确认同样算核实过（§4.1）：
+     例如同一批到货被录了两次收货、各 10 件，实际确实到了 20 件，盘点点到 20、差额 0；之后再更正其中一笔会被拦下，不会把账面改得比实物少 10。
   3. **落账**：写一条 `CORRECTION`。四个增量各取原流水增量的相反数；`corrects_entry_id` 为原流水；`source_type` 为 `correction`，`source_ref` 为原 `entry_id`。
-     `CORRECTION` 是只改账的流水，所以同时把余额行的 `last_book_only_version` 设为它的版本；原流水是 `OPENING_BALANCE` 时把 `opening_entry_id` 清空（§4.1、§6.3）。
+     `CORRECTION` 是只改账的流水，所以同时把余额行的 `last_book_only_version` 设为它的版本；原流水的 `entry_id` 等于余额行的 `opening_entry_id` 时把它清空（§4.1、§6.3）。
      落账后若违反 §4.1 不变量——说明原流水之后的预留、销售等动作已经用到了这批错误的数量——整笔拒绝，409 `CORRECTION_BREAKS_INVARIANTS`，
      `details` 给出落账后的四个量与缺口数（公式同 §6）。处理办法是给这个 SKU 盘点（§6），用差额修正。
   
@@ -820,7 +822,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
    - **已保存的业务 4xx，同键只会重放。**处理完原因后要再试的（如补货后重试确认、`COUNT_BELOW_COMMITMENTS` 处理订单后
      “直接再确认或执行”），必须用**新的幂等键**；业务引用（第 2 条）保证换键不会让同一事实生效两次。
 2. **业务引用（事实级）**：`(channel, order_ref)` 一个预留；`(channel, payment_ref)`、`shipment_ref`、`refund_ref`、`return_ref`、
-   `receipt_ref`、`count_ref`、`adjustment_ref` 各自唯一（库存管理命令的业务引用另见 §6.2 第 7 条、§6.3、§6.7）。换幂等键重报同一业务引用：内容相同返回原结果，内容不同 409 `BUSINESS_REF_CONFLICT`。
+   `receipt_ref`、`count_ref`、`adjustment_ref` 各自唯一（库存管理命令的业务引用另见 §6.2 第 7 条、§6.3、§6.7）。换幂等键重报同一业务引用：内容相同返回原结果，内容不同 409 `BUSINESS_REF_CONFLICT`（更正的例外见 §6.7）。
    这里的“原结果”是该业务对象**当前**的表示（状态可能已变，如盘点单已取消）；同键重放（第 1 条）才是首次保存的响应原样。
    这一层防止“调用方崩溃后用新键重试”造成重复扣库。业务引用只被**已生效**的命令占用：被业务规则拒绝的命令（如晚到支付缺货）
    不占用该引用，所以补货后可以用新幂等键、同一 `payment_ref` 重试确认。
@@ -938,7 +940,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 | 409 | `INSUFFICIENT_STOCK` | 整单不进入付款；`details.lines` 列出不足的行。标不可售超过可售量也用它（§6.5） |
 | 409 | `POOL_NOT_LIVE` / `POOL_ALREADY_LIVE` | 库存池还在初始化，只能做期初、更正与读 / 池已上线，期初一律拒绝（§6.2 第 2 条）；不重试 |
 | 409 | `QUANTITY_EXCEEDS_UNAVAILABLE` | 恢复可售或报损的件数超过不可售量（§6.5）；不重试 |
-| 409 | `ENTRY_NOT_CORRECTABLE` / `CORRECTION_BREAKS_INVARIANTS` | 这条流水不能更正，或更正后账面不合法；改走盘点（§6.7）；不重试 |
+| 409 | `ENTRY_NOT_CORRECTABLE` / `CORRECTION_BREAKS_INVARIANTS` | 这条流水不能更正，或更正后账面不合法；改走盘点（§6.7）；`details.reason` 为 `already_corrected` 时别人已经更正过，查看已有的那条更正；不重试 |
 | 409 | `SKU_INACTIVE` / `SKU_MERGED` / `SKU_SELLING_PAUSED` | 不可新预留（`SKU_MERGED` 也用于重新启用、或清空条码以外的修改已合并的 SKU，§2.6） |
 | 409 | `SKU_CODE_TAKEN` / `SKU_CODE_RETIRED` / `BARCODE_TAKEN` | 编码是别的 SKU 的当前编码 / 退役编码（永不再分配），条码已被别的 SKU 使用；换一个再提交（§2.2、§2.6） |
 | 409 | `IMPORT_EXPIRED` | 批量导入或期初导入的预览已过有效期；重新预览（§2.3、§6.3） |
@@ -1402,6 +1404,12 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 | # | 发现 | 类型 | 处理 | 改了哪里 |
 | --- | --- | --- | --- | --- |
 | 62 | ①“快照或原流水之后有没有只改账的流水”“有没有有效期初”若用普通读查流水，在 REPEATABLE READ 下看不到并发刚提交的流水（并发更正与盘点确认会重复更正，两张盘点单会把差额记两次）；用加锁读查还没有流水的 SKU 又会锁间隙、与并发插入死锁。§2.4 执行的前置检查与 0.5 起的 §6 `COUNT_STALE` 同样有这个问题。②上线后能不能更正期初，§6.3 与 §6.7 矛盾。③盘点确认没有请求体，原因无处安放（STK-05）。④盘点表缺 `tenant_id` 与复合外键。⑤非阻塞：合并在 `initializing` 池上能不能做；换键重新提交会重取快照；确认前看不到差额；提交实数的预建位置；两个管理员先后更正同一条被当成调用方 bug；Q-46 漏了期初 | 设计缺陷／未决定 | ①余额行加 `last_book_only_version` 与 `opening_entry_id` 两列，在已 `FOR UPDATE` 的余额行上判定，不查流水区间；§6、§2.4、§6.3、§6.7 都改为按这两列判；②期初只在池 `initializing` 时能更正，`live` 时 409 `ENTRY_NOT_CORRECTABLE`（`pool_live`）；③盘点确认带 `reason_code`（必填）与 `note`，存在盘点单与流水上；④写明两张盘点表的 `tenant_id`、唯一约束与复合外键；⑤合并按池处理的命令只在 `live`；写明提交实数的幂等键要确定性派生；`d_shelf`、`d_u` 提交后就给；预建在开事务之前；同一条流水的第二次不同更正报 `already_corrected`、不记安全事件；Q-46 补期初；更正的锁序改为先池行后余额行 | §2.4、§4.1、§6、§6.2、§6.3、§6.6、§6.7、`OPEN_QUESTIONS.md` |
+
+第二轮独立审查（提交 `dca9e71`，通过，非阻塞 4 条）之后的补充：
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 63 | 合并迁移与 Demo 重置更新判定列没写进步骤；差额为 0 的盘点确认不更新判定列，之后仍能更正它已核实过的流水；`already_corrected` 的例外只写在 §6.7；`opening_entry_id` 的清空条件 | 未决定 | 判定列改为“账面最后一次被核实或另行定数的版本”，差额为 0 的盘点确认、合并执行、Demo 重置也更新它（代价：快照更早的别的盘点单多报一次 `COUNT_STALE`，偏保守），加检查约束 `last_book_only_version <= balance_version`；§2.4、§6.1、§6.6 步骤里写明；§6.2 第 7 条、§7.1 第 2 条、§8.3 指向 §6.7 的例外；按 `entry_id` 等于 `opening_entry_id` 清空 | §2.4、§4.1、§6.1、§6.2、§6.6、§6.7、§7.1、§8.3 |
 
 对调用方（网店）的影响：
 - 迁移时先导期初、再调池切 live，之后才能收货、盘点、预留；
