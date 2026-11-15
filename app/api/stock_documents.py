@@ -1,12 +1,14 @@
-"""收货与不可售调整接口。
+"""收货、不可售调整与更正接口。
 
-契约 §6.2、§6.4、§6.5、§7.2、§10 第 3、4 条。
-两个命令都要求 stock.write，经幂等执行器；池授权按正文的 pool_id，
+契约 §6.2、§6.4、§6.5、§6.7、§7.2、§10 第 3、4 条。
+三个命令都要求 stock.write，经幂等执行器。收货与不可售调整的池授权按正文的 pool_id，
 余额行按正文的 pool_id 与各行 sku_id 预建。
 收货接受 stock_operator 与 stock_admin；不可售调整按 action 定角色（第 8 步，在请求体之后）：
 write_off 只接受 stock_admin，另两种接受 stock_operator 与 stock_admin。
 未知字段、字段取值、line_ref 或 sku_id 重复在第 7 步 422（取锁之前，不保存）；
 lines 超过 100 行 413。
+更正只接受 stock_admin；池授权按原流水所属的池，原流水不存在或属于别的租户 404 ENTRY_NOT_FOUND
+（后者记 cross_tenant，都不保存）；不预建余额行（原流水的余额行已存在）。
 不另设查询接口：结果未知时用原内容重报取回（§6.4）。
 写库在 app/services/stock_documents.py。
 """
@@ -19,7 +21,13 @@ from fastapi.responses import Response
 from pydantic import Field, field_validator, model_validator
 from sqlalchemy import Connection
 
-from app.api.auth import authorize, require_pool, require_role, require_role_by_body
+from app.api.auth import (
+    authorize,
+    require_object_pool,
+    require_pool,
+    require_role,
+    require_role_by_body,
+)
 from app.api.requests import ParsedBody, RequestBody, json_body
 from app.domain.catalog import InvalidField
 from app.domain.ledger import AdjustmentAction
@@ -33,10 +41,14 @@ from app.domain.stock import (
 )
 from app.services import stock_documents
 from app.services.idempotency import CommandResult, Execution, run_idempotent
-from app.services.stock_documents import DocumentFields, DocumentLine
+from app.services.stock_documents import CorrectionFields, DocumentFields, DocumentLine
 
 RECEIPTS_CREATE = "receipts.create"
 UNAVAILABLE_ADJUSTMENTS_CREATE = "unavailable_adjustments.create"
+CORRECTIONS_CREATE = "corrections.create"
+
+ENTRY = "entry"
+ENTRY_NOT_FOUND = "ENTRY_NOT_FOUND"
 
 LINES = "lines"
 
@@ -224,3 +236,70 @@ def create_adjustment(
         command=command,
         balance_rows=_balance_rows(fields),
     )
+
+
+# --- 更正（§6.7） ---
+
+
+class Correction(RequestBody):
+    """可选字段的默认 None 只表示没带，规则同 _Document。"""
+
+    entry_id: str
+    reason_code: str
+    note: str | None = None
+    occurred_at: str | None = None
+
+    @field_validator("reason_code")
+    @classmethod
+    def check_reason_code(cls, value: str) -> str:
+        return normalize_reason_code(value)
+
+    @field_validator("note")
+    @classmethod
+    def check_note(cls, value: str | None) -> str | None:
+        return normalize_note(value)
+
+    @field_validator("occurred_at")
+    @classmethod
+    def check_occurred_at(cls, value: str | None) -> str:
+        parse_occurred_at(value)
+        return value
+
+    def correction_fields(self) -> CorrectionFields:
+        return CorrectionFields(
+            entry_id=self.entry_id,
+            reason_code=self.reason_code,
+            note=self.note,
+            occurred_at=None if self.occurred_at is None else parse_occurred_at(self.occurred_at),
+        )
+
+
+correction_body = json_body(Correction)
+CorrectionBody = Annotated[ParsedBody[Correction], Depends(correction_body)]
+
+
+def _correction_entry(body: CorrectionBody) -> str:
+    return body.model.entry_id
+
+
+_entry_pool = require_object_pool(
+    _correction_entry,
+    stock_documents.find_entry_pool,
+    object_type=ENTRY,
+    not_found_code=ENTRY_NOT_FOUND,
+)
+
+
+@router.post("/v1/corrections", dependencies=_WRITE)
+def create_correction(
+    request: Request,
+    body: CorrectionBody,
+    actor: Annotated[Actor, Depends(require_role(STOCK_ADMIN))],
+    pool_id: Annotated[str, Depends(_entry_pool)],
+) -> Response:
+    fields = body.model.correction_fields()
+
+    def command(execution: Execution) -> CommandResult:
+        return stock_documents.create_correction(execution, fields)
+
+    return run_idempotent(request, operation=CORRECTIONS_CREATE, body=body, command=command)
