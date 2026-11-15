@@ -1347,7 +1347,7 @@ tasks:
       都通过时每行写对应类型的流水（source_type unavailable_adjustment，source_ref 为 adjustment_ref）、写单据；返回 201，表示同收货单，
       receipt_ref 换成 adjustment_ref，另带 action。
       明确不做：更正、盘点、期初；不新增查询接口（契约 6.4：结果未知时原内容重报取回）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-023
       - CORE-TASK-024
