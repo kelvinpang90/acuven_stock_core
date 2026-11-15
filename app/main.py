@@ -10,6 +10,7 @@ from app.api import (
     catalog,
     catalog_changes,
     catalog_imports,
+    counts,
     stock_documents,
     stock_imports,
     stock_queries,
@@ -68,6 +69,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(stock_queries.router)
     app.include_router(stock_imports.router)
     app.include_router(stock_documents.router)
+    app.include_router(counts.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
