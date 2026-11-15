@@ -1182,7 +1182,8 @@ tasks:
       锁序为池行、余额行、SKU 行，与合并执行先锁余额行再改 SKU 行的顺序一致，不成环），第一个已合并的抛 409 SKU_MERGED，details 带 sku_id 与
       merged_into_sku_id；停用的 SKU 与停用商品下的 SKU 照常通过。
       锁余额行时某个 SKU 没有余额行（SKU 在预建之后才建成，极少见）：抛异常、500，同键重试时预建会补上。
-      另，命令时间：command_now(execution) 在命令开头用 SELECT CURRENT_TIMESTAMP(6) 读一次数据库时间，同一命令的各条流水在调用方
+      另，命令时间：command_now(execution) 在命令开头用 SELECT CURRENT_TIMESTAMP(6) 读一次数据库时间（返回值由命令自己保存、传给各函数，
+      不存在 Execution 上；with_document 在新事务里重新运行命令时，命令照样在开头重读一次），同一命令的各条流水在调用方
       没给 occurred_at 时都用它，单据的 created_at 也用它，所以一张单据的各行与表示里的时间一致。
       三，lock_balances(execution, pool_id, sku_ids)：按 (pool_id, sku_id) 升序 SELECT FOR UPDATE 锁余额行（行已由预建建好），返回按 sku_id 索引的
       当前四个量、balance_version、last_book_only_version、last_reconciled_version、opening_entry_id；行不存在视为程序错误（抛异常，500）。
@@ -1191,7 +1192,8 @@ tasks:
       OPENING_BALANCE 把 opening_entry_id 设为这条流水，CORRECTION 在原流水的 entry_id 等于 opening_entry_id 时清空它；UPDATE 余额行、
       INSERT 流水（entry_id 前缀 ent_；channel_id 取凭据的销售入口；credential_id、actor_ref、actor_role、request_id、idempotency_key 取自本请求；
       source_type、source_ref、line_ref、reason_code、note、occurred_at、corrects_entry_id 由调用方给，occurred_at 为空时取 command_now；recorded_at 也显式写 command_now，不靠列默认值，所以同一命令的各条流水 recorded_at 相同），
-      返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_；在本模块定义 new_command_id()，用 app/domain/ids.py 已有的 new_id 生成，不改 ids.py）。append_entry 另收可选的 reconciled_version：
+      返回流水的表示；append_entry 就地更新传入的余额对象（四个量、balance_version、两个判定列、opening_entry_id），同一命令对同一行再写流水时用更新后的值。
+      同一命令的各条流水共用一个 command_id（前缀 cmd_；在本模块定义 new_command_id()，用 app/domain/ids.py 已有的 new_id 生成，不改 ids.py）。append_entry 另收可选的 reconciled_version：
       给了时 last_reconciled_version 取它而不按默认规则（盘点确认取快照版本，契约 0.10 的 4.1 例外），它小于当前值或大于写后的 last_book_only_version 时抛异常（程序错误）。
       mark_verified(execution, balance, reconciled_version=None)：差额为 0、不写流水的核实，把 last_book_only_version 设为当前 balance_version，
       last_reconciled_version 设为当前 balance_version 或给定的 reconciled_version（同样的检查）。
