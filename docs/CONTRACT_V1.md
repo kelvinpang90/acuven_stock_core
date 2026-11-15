@@ -1,6 +1,6 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.11｜2026-11-16｜状态：**待 Kelvin 批准**——第 14 节第 66–68 条（§6.1 Demo 每日重置的正文、判定顺序、表示与存放，
+> 版本：0.11｜2026-11-16｜状态：**待 Kelvin 批准**——第 14 节第 66–69 条（§6.1 Demo 每日重置的正文、判定顺序、表示与存放，
 > 同日同池内容不同 409，库里的实例标记、启动核对与生产库的流水类型约束；取舍见 Q-50～Q-52）待批准；其余部分的批准不受影响。
 > 0.10：第 14 节第 65 条（§4.1 余额行加 `last_reconciled_version`，§6.7 的“已被吸收”改用它、不再把更正算作吸收，
 > §2.4、§6.1、§6.3、§6.6 的相应步骤；取舍见 Q-49）于 2026-11-15 批准。
@@ -540,10 +540,18 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 - Demo 实例与将来的生产实例各用独立的库和凭据。
 - 健康检查返回这个环境标记，供网店做启动核对（§9.2）。
 - **库里的实例标记（0.11，Q-50）**：表 `core_instance` 只有一行，列为 `singleton`（主键，检查约束恒为 1）、`core_env`（检查约束 `demo` 或 `production`）与 `created_at`。
-  建这张表的迁移按执行迁移的进程的 `CORE_ENV` 写入这一行；`CORE_ENV` 没有设或取值不合法，迁移失败、不改库。
-  之后的迁移不改这一行，所以库一旦标记就不能换环境。部署时迁移在 Core 的容器里执行，用的就是这个实例的 `CORE_ENV`。
-- **启动核对（0.11）**：API 进程与运维命令行启动时读 `core_instance`。表或行不存在（迁移没跑到）、读不到（数据库连不上）、或 `core_env` 与 `CORE_ENV` 不同，
-  都拒绝启动：退出码非 0，输出一行原因，不带连接串与异常文本。这样 Demo 配置的进程连不上生产库，生产配置的进程也连不上 Demo 库。
+  建这张表的迁移（下称标记迁移）按执行迁移的进程的 `CORE_ENV` 写入这一行，步骤依次是：先校验 `CORE_ENV`，没有设或取值不合法就失败、不改库；
+  `production` 时收窄流水类型约束（见下面的生产实例的防护）；最后建 `core_instance` 并写入这一行。MySQL 的 DDL 会隐式提交，按这个顺序，“有这一行”就说明约束已经按环境处理过。
+  之后的迁移不改这一行，所以只要不降级，库一旦标记就不能换环境。降级（downgrade）只用于 CI 与开发库：标记迁移的降级删掉 `core_instance`，生产库上恢复原约束。
+  部署时迁移在 Core 的容器里执行，用的就是这个实例的 `CORE_ENV`。
+- **迁移前核对（0.11）**：库里已有 `core_instance` 时，迁移环境在执行任何迁移之前比对 `core_env` 与执行进程的 `CORE_ENV`，不一致就失败、不改库；
+  还没有这张表（标记迁移之前）时跳过这一步。这样部署配错连接串、指向了另一种实例的库时，迁移也不会跑。
+- **以后的迁移**：凡是重建流水类型约束（例如加新的流水类型）或重建流水表的迁移，按库里 `core_instance.core_env` 决定约束是否包含 `DEMO_RESET`，
+  不按 `CORE_ENV`，也不按模型里的静态列表。
+- **启动核对（0.11）**：所有连库的 Core 进程（API、运维命令行，以及将来独立的定时任务进程）在开始处理请求或命令之前读 `core_instance`。
+  表或行不存在（迁移没跑到）、读不到（数据库连不上）、或 `core_env` 与 `CORE_ENV` 不同，都拒绝启动：退出码非 0，输出一行原因，不带连接串与异常文本。
+  所以 API 进程的 `CORE_DATABASE_URL` 从此必填（以前没配时照常启动、`/readyz` 回 503）。运维命令行在连库之前就结束的情形（`--help`、参数错误）不做核对。
+  这样 Demo 配置的进程连不上生产库，生产配置的进程也连不上 Demo 库。
 
 **重置命令**：`POST /v1/demo/resets`，只在 Demo 实例上存在。操作类型 `demo_resets.create`，scope `demo.reset`，不要求角色（§10 第 3、4 条）。
 - **正文（0.11，Q-52）**：`{"pool_id": …, "business_date": …, "skus": [{"sku_id": …, "target": …}, …]}`，不接受别的字段（没有 `reason_code`、`note`、`occurred_at`）。
@@ -553,16 +561,18 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 - **池授权**按 `pool_id`（§6.2 第 1 条）。余额行照 §4.1 预建（§6.2 第 5 条）。
 - **事务里的判定与执行**，按顺序（§6.2 第 4 条的顺序）：
   1. 业务引用：用普通读按 `(tenant_id, pool_id, business_date)` 查 `demo_resets`（见下面的存放）。已有一行：规范化请求摘要（§7.1）相同，返回 200 与这一行的 `result`，不再执行；
-     不同，409 `BUSINESS_REF_CONFLICT`，记 `business_ref_conflict` 事件（Q-51）。两个不同幂等键的请求并发撞上唯一约束时，照 §7.1 第 2 条最后一段处理；
+     不同，409 `BUSINESS_REF_CONFLICT`，记 `business_ref_conflict` 事件（Q-51）；事件与错误的 `details` 都是 `{"ref_type": "demo_reset", "ref": business_date, "pool_id": …}`。两个不同幂等键的请求并发撞上唯一约束时，照 §7.1 第 2 条最后一段处理；
   2. `FOR SHARE` 读池行；池不是 `live`：409 `POOL_NOT_LIVE`（§6.2 第 2 条）；
-  3. SKU 不存在或属于别的租户：404 `SKU_NOT_FOUND`；已合并：409 `SKU_MERGED`（§6.2 第 3 条）。停用的 SKU 与合并进行中的 SKU 照常重置；
+  3. SKU 不存在或属于别的租户（普通读）：404 `SKU_NOT_FOUND`（§6.2 第 3 条）；
   4. 按 §8.1 升序锁住所列 SKU 的余额行；
-  5. 对每个所列 SKU 计算 `new_balance = max(target, reserved + unavailable)`；
-  6. 增量 = `new_balance − stock_balance`，不为 0 时写一条 `DEMO_RESET` 流水：`source_type` 为 `demo_reset`，`source_ref` 为 `reset_id`，没有 `line_ref`；
+  5. 用加锁读（`FOR SHARE`，按 `sku_id` 升序）读 SKU 行，已合并：409 `SKU_MERGED`（§6.2 第 3 条）。先锁余额行、再加锁读 SKU 行，与收货、盘点等命令的加锁顺序相同，
+     而且看得到第 1 步建立读快照之后才提交的合并；加锁不算判定，判定顺序仍同 §6.2 第 4 条。停用的 SKU 与合并进行中的 SKU 照常重置；
+  6. 对每个所列 SKU 计算 `new_balance = max(target, reserved + unavailable)`；
+  7. 增量 = `new_balance − stock_balance`，不为 0 时写一条 `DEMO_RESET` 流水：`source_type` 为 `demo_reset`，`source_ref` 为 `reset_id`，没有 `line_ref`；
      `reason_code`、`note` 为空，`occurred_at` 取数据库时间，`channel_id` 取凭据的销售入口。增量为 0 不写（见下）。
      无论写没写，余额行的 `last_book_only_version` 与 `last_reconciled_version` 都设为写完之后的 `balance_version`（§4.1，0.9、0.10）；
-  7. `reserved`、`unavailable`、`paid_pending_dispatch` 都不动。新的 `stock_balance` 不小于 `reserved + unavailable`，所以重置不会违反 §4.1 不变量，没有数量上的拒绝；
-  8. 写 `demo_resets` 一行，与流水、余额、幂等记录在同一事务提交。被拒绝的请求（第 1–3 步）不写这一行，因为只有已生效的重置才占用 `(pool_id, business_date)`。
+  8. `reserved`、`unavailable`、`paid_pending_dispatch` 都不动。新的 `stock_balance` 不小于 `reserved + unavailable`，所以重置不会违反 §4.1 不变量，没有数量上的拒绝；
+  9. 写 `demo_resets` 一行，与流水、余额、幂等记录在同一事务提交。被拒绝的请求（第 1、2、3、5 步）不写这一行，因为只有已生效的重置才占用 `(pool_id, business_date)`。
 - 结果：`available = max(target − reserved − unavailable, 0)`，与网店现在的规则“当日可用 = max(初始 − 待付预留, 0)”一致；未结订单的预留和待发货量照常保留。
 - 增量为 0 的 SKU 不写流水，但在该次重置的结果里列出（`delta = 0`）。
 - 请求里没列的 SKU 不动。
@@ -579,9 +589,9 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 
 **生产实例的防护**
 - 该路径返回 404：生产实例不挂这个路由，按 §8.1 第 1 步返回 404 `NOT_FOUND`，与不存在的路径相同，不鉴权；
-- `DEMO_RESET` 流水类型在数据库约束层面就被拒（0.11，Q-50）：建 `core_instance` 的那次迁移在 `core_env` 为 `production` 时，把流水表 `entry_type` 的检查约束换成不含 `DEMO_RESET` 的版本；
-  Demo 库保持原约束。两种库只有这一处约束不同；
-- 启动时如果发现 Demo 配置和生产标记冲突，直接拒绝启动：即上面的启动核对，`CORE_ENV` 与库里的 `core_instance` 不一致就不启动；
+- `DEMO_RESET` 流水类型在数据库约束层面就被拒（0.11，Q-50）：标记迁移在 `CORE_ENV` 为 `production` 时，把流水表 `entry_type` 的检查约束换成不含 `DEMO_RESET` 的版本；
+  Demo 库保持原约束。两种库只有这一处约束不同，以后的迁移按 `core_instance` 保持这个差别（见上面的以后的迁移）；
+- 启动时如果发现 Demo 配置和生产标记冲突，直接拒绝启动：即上面的启动核对与迁移前核对，`CORE_ENV` 与库里的 `core_instance` 不一致就不启动、不迁移；
 - 运维命令行在 `CORE_ENV=production` 时拒绝签发带 `demo.reset` 的凭据（§10 第 4 条）。
 
 **留在网店的部分**
@@ -1482,11 +1492,18 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 | # | 发现 | 类型 | 处理 | 改了哪里 |
 | --- | --- | --- | --- | --- |
-| 66 | “`DEMO_RESET` 在数据库约束层面就被拒”与“Demo 配置和生产标记冲突拒绝启动”没有机制：迁移与运行环境无关，库里没有环境标记，类型约束在所有库上相同；MySQL 触发器在开了 binlog 时要额外权限 | 未决定 | 加单行表 `core_instance`，由建它的迁移按执行进程的 `CORE_ENV` 写入、之后不改；同一迁移在生产库上把流水类型约束换成不含 `DEMO_RESET` 的版本；API 进程与运维命令行启动时比对库里的标记与 `CORE_ENV`，不一致或读不到就拒绝启动（Q-50） | §6.1 实例区分、生产实例的防护 |
+| 66 | “`DEMO_RESET` 在数据库约束层面就被拒”与“Demo 配置和生产标记冲突拒绝启动”没有机制：迁移与运行环境无关，库里没有环境标记，类型约束在所有库上相同；MySQL 触发器在开了 binlog 时要额外权限 | 未决定 | 加单行表 `core_instance`，由建它的迁移按执行进程的 `CORE_ENV` 写入、之后不改；同一迁移在生产库上把流水类型约束换成不含 `DEMO_RESET` 的版本；所有连库的 Core 进程启动时比对库里的标记与 `CORE_ENV`，不一致或读不到就拒绝启动（Q-50） | §6.1 实例区分、生产实例的防护 |
 | 67 | “同一天重复调用，返回第一次的结果”不论内容，与 §7.1 第 2 条“内容不同 409”不一致，网店当天改了每日初始库存再调会被静默忽略 | 未决定 | 与其他业务引用一致：内容相同返回第一次的结果，内容不同 409 `BUSINESS_REF_CONFLICT` 并记 `business_ref_conflict`（Q-51） | §6.1、§7.1 第 2 条 |
 | 68 | 重置的正文字段、`business_date` 格式、`target` 上限、判定顺序（池状态、不存在与已合并的 SKU）、流水的来源字段、成功的表示与业务引用的存放都没定 | 未决定 | 正文 `pool_id`、`business_date`（`YYYY-MM-DD`，不与当前日期比较）、`skus`（1–100 个 `{sku_id, target}`，`target` 0–1,000,000）；判定顺序同 §6.2 第 4 条；流水 `source_type` 为 `demo_reset`、`source_ref` 为 `reset_id`；201 返回逐 SKU 的增量、流水 ID 与写后账面；只追加的表 `demo_resets`，`(tenant_id, pool_id, business_date)` 唯一（Q-52） | §6.1 |
 
 不影响库存数量规则（§6.1 的 `new_balance` 公式与判定列的更新不变）。
 对调用方（网店）的影响：
 - 重置正文用 `skus` 数组；同一天只能重置一次，改了每日初始库存从下一天起生效，当天重报不同内容会得到 409；
-- 重报要保持同样的 SKU 顺序。
+- 重报要保持同样的 SKU 顺序；
+- 每日初始库存表里还留着已合并的 SKU 时整批 409 `SKU_MERGED`，当天全部 SKU 都没有重置；两个规格映射到同一个规范 SKU 时请求里 `sku_id` 重复，整批 422。
+
+首轮独立审查（PR #88，提交 `4aabc0d`，要求修改：阻塞 2 条、非阻塞 8 条）之后的修改：
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 69 | ①先查“已合并”再锁余额行：普通读看不到第 1 步建立快照之后提交的合并，重置会把已迁出的 SKU 拉回 `target`；改用加锁读又与其他命令的加锁顺序相反。②只约束了标记迁移：以后重建流水类型约束的迁移会按静态列表把 `DEMO_RESET` 加回生产库；迁移在 API 启动之前跑，启动核对管不到迁移进程。③非阻塞：标记迁移的步骤顺序（DDL 隐式提交）、降级的语义、启动核对使 `CORE_DATABASE_URL` 必填、命令行哪些情形不核对、冲突的 `details`、合并对网店重置的影响 | 设计缺陷／未决定 | ①先普通读查 SKU 存在，锁余额行之后再加锁读查合并（同收货、盘点）；②以后的迁移按 `core_instance` 决定约束；迁移环境在已有标记时先比对 `CORE_ENV`；③标记迁移先校验、再收窄约束、最后写标记；降级只用于 CI 与开发库；启动核对覆盖所有连库进程，API 的连接串必填，`--help` 与参数错误不核对；`details` 为 `ref_type`、`ref`、`pool_id`；调用方影响补两条 | §6.1 |
