@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api import catalog, catalog_imports
+from app.api import catalog, catalog_changes, catalog_imports
 from app.api.errors import install_error_handlers
 from app.api.requests import RequestMiddleware
 from app.config import Settings
@@ -57,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     install_error_handlers(app)
     app.include_router(catalog.router)
     app.include_router(catalog_imports.router)
+    app.include_router(catalog_changes.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
