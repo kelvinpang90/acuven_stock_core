@@ -1004,6 +1004,7 @@ tasks:
       （如 fk_stock_counts_confirmed_credential_id_credentials、fk_stock_counts_cancelled_credential_id_credentials），
       开单人的照约定命名；stock_imports 照 CORE-TASK-012 显式命名确认人的外键。超过 64 字符的约束名照先例由命名约定生成，迁移里用 op.f 引用。
       已有的 tests/integration/test_inventory_schema.py 里直接插入 live 池的测试，改为同时填上 went_live 四列（只改造数，不改它验证的内容）。
+      已有的 tests/integration/test_cli_provisioning.py 里建池的测试把库里整行与 CLI 输出逐列比较，池加列后库里多出 went_live 四列；改为期望这四列为空（新池还没有上线记录），不改 CLI 代码，也不改它验证的其他内容。
       明确不做：写这些表的代码、接口、领域规则；不改流水类型的检查约束。
     status: ready
     depends_on: []
@@ -1022,6 +1023,7 @@ tasks:
       - tests/integration/conftest.py
       - tests/integration/test_stock_management_schema.py
       - tests/integration/test_inventory_schema.py
+      - tests/integration/test_cli_provisioning.py
     allowed_commands:
       - lint.check
       - format.check
