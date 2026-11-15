@@ -1217,7 +1217,7 @@ tasks:
       六，entry_representation：契约 6.8 的流水表示（deltas、after 两个对象各含四个量，时间为 UTC 的 RFC 3339 微秒加 Z，不含 idempotency_key 与 credential_id），
       供本任务与之后的流水查询、更正共用。
       明确不做：任何接口、具体命令的规则（期初、收货、调整、盘点、更正）、余额行预建（执行器已做）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-022
       - CORE-TASK-023
