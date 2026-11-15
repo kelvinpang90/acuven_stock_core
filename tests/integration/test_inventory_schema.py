@@ -1,159 +1,35 @@
 """库存侧各表的约束在真 MySQL 上生效（契约第 3 节、4.1、4.3、7.1 与第 10 节第 1 条）。
 
-这些规则由数据库兜底，服务层的 bug 也绕不过去。连接夹具 db 与 assert_rejected_by 见 conftest。
+这些规则由数据库兜底，服务层的 bug 也绕不过去。
+连接夹具 db、assert_rejected_by 与各表的造数见 conftest。
 """
 
-from datetime import datetime
-
-import pytest
 from sqlalchemy import Connection, insert, select
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql.expression import Executable
 
-from app.models.catalog import Product, Sku, Tenant
-from app.models.inventory import (
-    IdempotencyRecord,
-    LedgerEntry,
-    Location,
-    SalesChannel,
-    StockBalance,
-    StockPool,
+from app.models.inventory import IdempotencyRecord, Location, StockBalance
+from tests.integration.conftest import (
+    add_balance,
+    add_channel,
+    add_credential,
+    add_entry,
+    add_location,
+    add_pool,
+    add_sku,
+    add_tenant,
+    assert_rejected_by,
+    assert_rejected_by_one_of,
+    balance_insert,
+    channel_insert,
+    entry_insert,
+    new_id,
+    pool_insert,
+    went_live,
 )
-from tests.integration.conftest import add_credential, assert_rejected_by, new_id
-
-# (tenant_id, pool_id, sku_id)：一个余额行，也是流水指向它的复合外键。
-Balance = tuple[str, str, str]
-
-OCCURRED_AT = datetime(2026, 11, 12, 8, 30)
 
 # 只有 stock_balance 为负时，reserved + unavailable ≤ stock_balance 必然同时被违反；
 # 不依赖 MySQL 先报哪一条，下面的测试对这种行接受两者之一。
 NON_NEGATIVE_ALONE = ["reserved", "unavailable", "paid_pending_dispatch"]
-
-
-def assert_rejected_by_one_of(db: Connection, statement: Executable, *constraints: str) -> None:
-    with pytest.raises(DBAPIError) as caught, db.begin_nested():
-        db.execute(statement)
-    assert any(constraint in str(caught.value.orig) for constraint in constraints)
-
-
-def add_tenant(db: Connection) -> str:
-    tenant_id = new_id("ten")
-    db.execute(insert(Tenant).values(tenant_id=tenant_id, name="Tenant", status="active"))
-    return tenant_id
-
-
-def add_sku(db: Connection, tenant_id: str) -> str:
-    product_id, sku_id = new_id("prd"), new_id("sku")
-    db.execute(
-        insert(Product).values(
-            product_id=product_id, tenant_id=tenant_id, name="Tee", status="active", version=1
-        )
-    )
-    db.execute(
-        insert(Sku).values(
-            sku_id=sku_id,
-            tenant_id=tenant_id,
-            product_id=product_id,
-            sku_code=new_id("code"),
-            name="Tee",
-            status="active",
-            version=1,
-        )
-    )
-    return sku_id
-
-
-def add_location(db: Connection, tenant_id: str) -> str:
-    location_id = new_id("loc")
-    db.execute(
-        insert(Location).values(
-            location_id=location_id, tenant_id=tenant_id, name="Warehouse", status="active"
-        )
-    )
-    return location_id
-
-
-def pool_insert(tenant_id: str, location_id: str, **overrides: object) -> Executable:
-    values = {
-        "pool_id": new_id("pool"),
-        "tenant_id": tenant_id,
-        "location_id": location_id,
-        "name": "Main",
-        "status": "initializing",
-    }
-    return insert(StockPool).values(values | overrides)
-
-
-def add_pool(db: Connection, tenant_id: str) -> str:
-    pool_id = new_id("pool")
-    db.execute(pool_insert(tenant_id, add_location(db, tenant_id), pool_id=pool_id))
-    return pool_id
-
-
-def channel_insert(tenant_id: str, pool_id: str, **overrides: object) -> Executable:
-    values = {
-        "channel_id": new_id("chn"),
-        "tenant_id": tenant_id,
-        "pool_id": pool_id,
-        "name": "Shop",
-        "status": "active",
-    }
-    return insert(SalesChannel).values(values | overrides)
-
-
-def add_channel(db: Connection, tenant_id: str, pool_id: str) -> str:
-    channel_id = new_id("chn")
-    db.execute(channel_insert(tenant_id, pool_id, channel_id=channel_id))
-    return channel_id
-
-
-def balance_insert(tenant_id: str, pool_id: str, sku_id: str, **overrides: object) -> Executable:
-    values = {
-        "balance_id": new_id("bal"),
-        "tenant_id": tenant_id,
-        "pool_id": pool_id,
-        "sku_id": sku_id,
-    }
-    return insert(StockBalance).values(values | overrides)
-
-
-def add_balance(db: Connection) -> Balance:
-    """建一个租户及其池、SKU 与余额行。"""
-    tenant_id = add_tenant(db)
-    pool_id, sku_id = add_pool(db, tenant_id), add_sku(db, tenant_id)
-    db.execute(balance_insert(tenant_id, pool_id, sku_id))
-    return tenant_id, pool_id, sku_id
-
-
-def entry_insert(balance: Balance, version: int, **overrides: object) -> Executable:
-    """默认是一条 RECEIPT：收货 5 件，余额行从 0/0/0/0 到 5/0/0/0。"""
-    tenant_id, pool_id, sku_id = balance
-    values = {
-        "entry_id": new_id("led"),
-        "tenant_id": tenant_id,
-        "pool_id": pool_id,
-        "sku_id": sku_id,
-        "entry_type": "RECEIPT",
-        "stock_balance_delta": 5,
-        "reserved_delta": 0,
-        "unavailable_delta": 0,
-        "paid_pending_dispatch_delta": 0,
-        "stock_balance_after": 5,
-        "reserved_after": 0,
-        "unavailable_after": 0,
-        "paid_pending_dispatch_after": 0,
-        "balance_version_after": version,
-        "command_id": new_id("cmd"),
-        "occurred_at": OCCURRED_AT,
-    }
-    return insert(LedgerEntry).values(values | overrides)
-
-
-def add_entry(db: Connection, balance: Balance, version: int, **overrides: object) -> str:
-    entry_id = new_id("led")
-    db.execute(entry_insert(balance, version, entry_id=entry_id, **overrides))
-    return entry_id
 
 
 def idempotency_insert(tenant_id: str, credential_id: str, **overrides: object) -> Executable:
@@ -202,7 +78,9 @@ def test_pool_status_must_be_an_exact_known_value(db: Connection):
     tenant = add_tenant(db)
     location = add_location(db, tenant)
     db.execute(pool_insert(tenant, location, status="initializing"))
-    db.execute(pool_insert(tenant, location, status="live"))
+    # live 的池必有上线记录（契约 6.3）。
+    live = went_live(add_credential(db, tenant))
+    db.execute(pool_insert(tenant, location, status="live", **live))
     for status in ["LIVE", "Live", "Initializing", "active", "closed"]:
         rejected = pool_insert(tenant, location, status=status)
         assert_rejected_by(db, rejected, "ck_stock_pools_status")

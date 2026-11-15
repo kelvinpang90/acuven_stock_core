@@ -18,7 +18,7 @@ from sqlalchemy import Connection, Engine, func, insert, make_url, select
 from app.cli.__main__ import main
 from app.config import Settings
 from app.models.catalog import Tenant
-from app.models.inventory import Location, SalesChannel, StockPool
+from app.models.inventory import WENT_LIVE_COLUMNS, Location, SalesChannel, StockPool
 from tests.integration.conftest import ROOT, TEST_DATABASE_URL, new_id
 
 TABLES = (Tenant, Location, StockPool, SalesChannel)
@@ -142,7 +142,9 @@ def test_pool_create_writes_an_initializing_pool_at_the_location(cli, migrated_e
         "name": "Main",
         "status": "initializing",
     }
-    assert row(migrated_engine, StockPool, output["pool_id"]) == output
+    # 新池还没有上线记录（契约 6.3），库里的 went_live 四列为空。
+    not_live = dict.fromkeys(WENT_LIVE_COLUMNS)
+    assert row(migrated_engine, StockPool, output["pool_id"]) == output | not_live
 
 
 def test_channel_create_writes_an_active_channel_bound_to_the_pool(cli, migrated_engine):
