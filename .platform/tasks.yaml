@@ -1037,11 +1037,14 @@ tasks:
       定数类流水集合 RECONCILING_TYPES 为 BOOK_ONLY_TYPES 去掉 CORRECTION；函数 last_reconciled_version_after(entry_type, current, version_after)：
       定数类流水返回 version_after，其他类型（含 CORRECTION）返回 current 不变（契约 0.10：更正不核实账面）；
       函数 is_stale(last_book_only_version, snapshot_version)：前者大于后者为真（契约 6 的 COUNT_STALE 与 2.4 执行前置检查）。
-      差额为 0 的核实把两个判定列都设为当时的 balance_version，这一步由服务层直接赋值，不另写函数。
+      合并执行与 Demo 重置差额为 0 时把两个判定列都设为当时的 balance_version；盘点确认的 last_reconciled_version 取快照版本而不是这条流水的版本
+      （契约 0.10 的 4.1 例外）；这些由服务层传入覆盖值，本任务的函数只给默认规则，不另写函数。
       三，不可售调整：AdjustmentAction 取 mark_unavailable、restore_available、write_off，对应 MARK_UNAVAILABLE、RESTORE_AVAILABLE、
       WRITE_OFF；adjustment_limit(action, current) 返回这一行当前最多能做的件数（标不可售为 available，恢复与报损为 unavailable）；
       apply_adjustment(action, current, q) 在 q 超过上限时抛 AdjustmentExceedsLimit，带错误码（标不可售为 INSUFFICIENT_STOCK，
       恢复与报损为 QUANTITY_EXCEEDS_UNAVAILABLE）与上限，否则返回 apply_entry 的结果。q 不是正整数时照 apply_entry 抛 InvalidQuantity。
+      AdjustmentExceedsLimit 继承 ValueError、不继承 InvariantViolation（它是命令事先的上限检查，不是落账后违反不变量）；
+      CorrectionBreaksInvariants 照 CountBelowCommitments 继承 InvariantViolation。
       四，更正：CORRECTABLE_TYPES 为 OPENING_BALANCE、RECEIPT、MARK_UNAVAILABLE、RESTORE_AVAILABLE、WRITE_OFF；
       correction_blocker(entry_type, entry_version, last_reconciled_version, pool_live) 按契约 6.7 第 1、2 步的顺序返回 None 或原因
       entry_type、pool_live（原流水是 OPENING_BALANCE 且池已 live）、superseded（判定列大于 entry_version；或等于 entry_version
@@ -1078,7 +1081,8 @@ tasks:
       一，app/domain/stock.py：
       reason_code 校验（字符串，1 到 32 个小写字母、数字或下划线，不去空白）；note 规范化复用 app/domain/catalog.py 的
       normalize_reason（契约 6.2 第 6 条规则同 2.6 的 reason）；occurred_at 解析：字符串，RFC 3339 的日期加 T 加时间，秒必须有，
-      小数秒 0 到 6 位，时区必须是 Z 或正负 hh:mm，换算成 UTC 的不带时区 datetime（微秒精度），不合规抛错；
+      小数秒 0 到 6 位，时区必须是 Z 或正负 hh:mm，换算成 UTC 的不带时区 datetime（微秒精度），不合规抛错；分隔的 T 与 Z 只接受大写；
+      秒为 00 到 59（不接受闰秒 60）；年份为 2000 到 9998（DATETIME(6) 只到 9999 年，留一年余量，换算时区不会溢出）；
       件数校验：正件数为 1 到 1000000 的整数，非负件数为 0 到 1000000 的整数，布尔一律不算整数；
       sku_ids 查询参数解析：逗号分隔，1 到 100 个，不能有空项、不能重复，不校验 ID 格式；
       流水查询的 from、to 解析同 occurred_at，两个都带而 from 不早于 to 时报错；limit 复用 app/domain/catalog.py 的 parse_limit；
@@ -1095,7 +1099,7 @@ tasks:
       汇总 summarize：counts（六种结果的行数，六个键都出现）、executable_rows、executable_quantity（ok 行的件数合计）。
       确认计划 plan_confirm(previews, lookup)：对预览为 ok 的行按当前 lookup 重查后三种情形，给出 created 或 failed（带原因），
       预览不合格的行为 skipped（带预览结果）；确认结果每项的键固定且都出现：index、sku_id、quantity、outcome、entry_id（计划里为 null，
-      由服务层落账后填）、preview_result、failure。
+      由服务层落账后填）、preview_result（created 与 failed 的行为 ok，skipped 的行为预览时的结果）、failure（只有 failed 的行有，其余为 null）。
       明确不做：数据库读写、接口、错误码到 HTTP 的映射。
     status: ready
     depends_on: []
@@ -1135,7 +1139,10 @@ tasks:
       执行器收到后：回滚命令的全部写入，丢弃命令登记的安全事件与 keep_on_rejection 的写入，在同一连接上开新事务（读快照看得到已提交的那一条），
       调用 rejudge，把它的结果（2xx 或 4xx）照常作为确定结果写幂等记录并提交；rejudge 登记的安全事件照常在事务结束后写。
       rejudge 抛别的异常或数据库出错：回滚、不保存、500。写幂等记录撞唯一约束的已有处理照旧。
-      在模块文档里写明 balance_rows、request_digest、BusinessRefTaken 的用法与开事务前的先后：幂等锁、目录写锁、余额行预建、开业务事务。
+      四，run_idempotent 加关键字参数 read_committed（默认 False）：为真时，业务事务（以及 BusinessRefTaken 的重新判定事务）以 READ COMMITTED 隔离级别开启，
+      只影响这一个事务，事务结束后连接回到默认级别。READ COMMITTED 下普通读每条语句都看到最新已提交的数据，加锁读不加间隙锁；
+      供盘点单命令在锁住盘点单行之后用普通读读盘点行（加锁读一个空范围会锁间隙，两张单的首次提交互相等待而死锁）。
+      在模块文档里写明 balance_rows、request_digest、BusinessRefTaken、read_committed 的用法与开事务前的先后：幂等锁、目录写锁、余额行预建、开业务事务。
       明确不做：库存命令本身、锁余额行与写流水的服务函数（下一任务）。
     status: ready
     depends_on:
@@ -1145,7 +1152,7 @@ tasks:
       - 集成测试：声明了 balance_rows 的测试写路由，在命令运行时（经测试钩子停顿）另一个连接已能看到预建的余额行（证明预建在业务事务之前提交）；已有余额行的四个量与版本不被改动；SKU 属于别的租户、池不存在的那几行跳过而其余照建，响应正常
       - 集成测试：预建的插入顺序按 (pool_id, sku_id) 升序（测试记录执行的语句或插入顺序）；同键重放时命令不再执行而预建照做且无害
       - 集成测试：测试让预建遇到非外键的数据库错误时返回 500，没有幂等记录、命令没有执行
-      - 集成测试：命令里 execution.request_digest 等于按契约 7.1 由路径参数与请求体算出的摘要
+      - 集成测试：命令里 execution.request_digest 等于按契约 7.1 由路径参数与请求体算出的摘要；声明 read_committed 的命令里查询当前事务的隔离级别为 READ-COMMITTED，命令运行中（经钩子停顿）另一个连接提交的行能被普通读看到，请求结束后同一连接再执行的事务回到默认隔离级别
       - 集成测试：两个不同幂等键的请求并发执行同一个测试命令（命令先写一行再插入带唯一约束的引用行，经钩子让两者交错），后到的那个抛 BusinessRefTaken 后，它先写的那一行被撤销，rejudge 读到先到者已提交的引用行并返回其结果；这个结果存为后到者幂等键的确定结果，同键重试原样重放；后到者命令登记的安全事件被丢弃、rejudge 登记的照常写入
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
       - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
@@ -1182,9 +1189,10 @@ tasks:
       OPENING_BALANCE 把 opening_entry_id 设为这条流水，CORRECTION 在原流水的 entry_id 等于 opening_entry_id 时清空它；UPDATE 余额行、
       INSERT 流水（entry_id 前缀 ent_；channel_id 取凭据的销售入口；credential_id、actor_ref、actor_role、request_id、idempotency_key 取自本请求；
       source_type、source_ref、line_ref、reason_code、note、occurred_at、corrects_entry_id 由调用方给，occurred_at 为空时取 command_now；recorded_at 也显式写 command_now，不靠列默认值，所以同一命令的各条流水 recorded_at 相同），
-      返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_，由 new_command_id 生成）。mark_reconciled_at(execution, balance, version) 把 last_reconciled_version 设为给定版本（盘点确认取快照版本，契约 0.10 的 4.1；
-      给的版本小于当前值或大于 last_book_only_version 时抛异常）；mark_verified(execution, balance) 把两个判定列都设为
-      当前 balance_version（差额为 0 的核实）。
+      返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_，由 new_command_id 生成）。append_entry 另收可选的 reconciled_version：
+      给了时 last_reconciled_version 取它而不按默认规则（盘点确认取快照版本，契约 0.10 的 4.1 例外），它小于当前值或大于写后的 last_book_only_version 时抛异常（程序错误）。
+      mark_verified(execution, balance, reconciled_version=None)：差额为 0、不写流水的核实，把 last_book_only_version 设为当前 balance_version，
+      last_reconciled_version 设为当前 balance_version 或给定的 reconciled_version（同样的检查）。
       五，单据：find_document(execution, document_type, document_ref) 按租户与凭据的销售入口读 stock_documents；answer_existing_document
       按契约 6.2 第 7 条判定（摘要不同时的回答可由调用方替换，供更正报 already_corrected）：request_hash 等于 execution.request_digest 时返回 200 与 result，否则抛 409 BUSINESS_REF_CONFLICT 并登记
       business_ref_conflict 事件（details 带引用类型与值）；new_document_id(document_type) 生成单据 ID（前缀按类型 rcp_、adj_、cor_），命令先拿到 ID 与 command_now 再拼 result；
@@ -1414,7 +1422,8 @@ tasks:
       二，提交实数 POST /v1/counts/{count_id}/submit（counts.submit）：stock.write，角色 stock_operator 或 stock_admin；正文 skus 为 1 到 100 个
       sku_id、shelf_count、unsellable_count（批量数组，超过 413；两项实数 0 到 1000000；sku_id 重复 422）；池授权按盘点单所属的池
       （require_object_pool，404 COUNT_NOT_FOUND）；balance_rows 取盘点单的池与正文的 SKU。命令里先 FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；
-      require_skus_exist；盘点单的已有盘点行在盘点单行锁之后用 FOR UPDATE 读（普通读看不到并发提交已写入的行）；升序锁余额行；require_not_merged（按契约 6.2 第 4 条，SKU 已合并先于本命令自己的规则）；
+      require_skus_exist；盘点单的已有盘点行在盘点单行锁之后用普通读读（四个盘点单命令都以 CORE-TASK-025 的 read_committed 执行，普通读看得到最新提交；
+      不用加锁读，它对还没有盘点行的单会锁住空范围的间隙，两张单的首次提交会互相等待而死锁）；升序锁余额行；require_not_merged（按契约 6.2 第 4 条，SKU 已合并先于本命令自己的规则）；
       提交后 SKU 总数超过 100 为 422（details.reason 为 count_sku_limit）；记快照与 count_deltas 算出的 d_shelf、d_u，
       连同实数、提交人、请求 ID、时间写入盘点行，已有的行整行替换；不写流水；返回 200 与表示。
       三，取消 POST /v1/counts/{count_id}/cancel（counts.cancel）：没有请求体；角色 stock_operator 或 stock_admin；池授权同提交。FOR UPDATE 读盘点单行，
@@ -1425,8 +1434,8 @@ tasks:
       它不可能有自己的 count_ref，返回空数组；count_ref 不合第 1 节的引用格式为 422。
       五，表示的键固定且都出现：count_id、count_ref、pool_id、status、note、created_at、confirmed_at、reason_code、confirm_note、cancelled_at、lines；
       lines 按 sku_id 升序，每行 sku_id、shelf_count、unsellable_count、snapshot（四个量与 balance_version）、submitted_at、d_shelf、d_u、entry_id。
-      表示函数写成可复用的，供下一任务的确认使用：它收盘点单行与盘点行，不自己读库；写命令把锁内读到的行加上本次的改动传进去
-      （读快照建立得早，事务里再用普通读会读到旧的行，保存的幂等结果就错了），查询接口用普通读读出后传进去。
+      表示函数写成可复用的，供下一任务的确认使用：它收盘点单行与盘点行，不自己读库；写命令把锁内读到的行加上本次的改动传进去，
+      查询接口用普通读读出后传进去。
       明确不做：确认落账（下一任务）。
     status: ready
     depends_on:
@@ -1459,7 +1468,7 @@ tasks:
       在 CORE-TASK-031 的 app/api/counts.py 与 app/services/counts.py 加 POST /v1/counts/{count_id}/confirm（counts.confirm）。
       规则用 CORE-TASK-001 的 apply_count_adjustment 与 CORE-TASK-023 的 is_stale，锁行与写流水用 CORE-TASK-026 的 app/services/stock.py。
       一，stock.write，角色 stock_admin；正文 reason_code（必填）、可选 note；池授权按盘点单所属的池（404 COUNT_NOT_FOUND）。
-      二，命令里依次：FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；盘点行在盘点单行锁之后用 FOR UPDATE 读（读快照建立得早，普通读会漏掉并发提交刚写入的行）；没有盘点行为 422（details.reason 为 count_has_no_lines）；
+      二，命令里依次：FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；命令以 CORE-TASK-025 的 read_committed 执行，盘点行在盘点单行锁之后用普通读读（看得到最新提交，不加间隙锁）；没有盘点行为 422（details.reason 为 count_has_no_lines）；
       按 sku_id 升序 FOR UPDATE 锁全部盘点行 SKU 的余额行；提交之后被合并的 SKU（锁余额行后用 CORE-TASK-026 的 require_not_merged，FOR SHARE 读 SKU 行）：409 SKU_MERGED，
       details 带按 sku_id 升序第一个这样的 sku_id 与 merged_into_sku_id（合并在来源 SKU 全为 0 时可能不写迁移流水，所以不能只靠 COUNT_STALE 拦）；
       这张单只能取消、另开新单在规范 SKU 上重点；
@@ -1467,8 +1476,8 @@ tasks:
       逐 SKU 用 apply_count_adjustment 算落账后的账面，有违反不变量的整笔 409 COUNT_BELOW_COMMITMENTS，details.skus 只列违反的 SKU（按 sku_id 升序），每项 sku_id、stock_balance、reserved、
       unavailable、paid_pending_dispatch（落账后的值）与 shortfall；
       都通过后，差额不全为 0 的 SKU 各写一条 COUNT_ADJUSTMENT（四个增量为 d_shelf 加 d_u、0、d_u、0；source_type count，source_ref 为 count_ref；
-      reason_code、note 取正文），append_entry 照 CORE-TASK-026 更新判定列；两个差额都为 0 的不写流水，把 last_book_only_version 设为当前 balance_version；
-      无论写没写，最后用 mark_reconciled_at 把 last_reconciled_version 设为该 SKU 的快照版本（契约 0.10 的 4.1 与 6.6 第 6 步：点数核实的是快照那一刻）；
+      reason_code、note 取正文），append_entry 传 reconciled_version 为该 SKU 的快照版本；两个差额都为 0 的不写流水，调 mark_verified 并传
+      reconciled_version 为快照版本（契约 0.10 的 4.1 与 6.6 第 6 步：点数核实的是快照那一刻）；
       盘点行记下 entry_id；盘点单改为 confirmed，记确认人、reason_code、confirm_note；返回 200 与表示（CORE-TASK-031 的表示函数，传入锁内读到的盘点单行与盘点行加上本次的改动，不另用普通读）。
       被拒时什么也不写（只保存幂等记录）。
       明确不做：SKU 合并的定数（随合并任务做）、Demo 重置。
