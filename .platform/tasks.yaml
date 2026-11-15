@@ -1447,7 +1447,7 @@ tasks:
       表示函数写成可复用的，供下一任务的确认使用：它收盘点单行与盘点行，不自己读库；写命令把锁内读到的行加上本次的改动传进去，
       查询接口用普通读读出后传进去。
       明确不做：确认落账（下一任务）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-026
     acceptance_criteria:
