@@ -1057,7 +1057,7 @@ tasks:
       落账后违反不变量时抛 CorrectionBreaksInvariants，带落账后的四个量与缺口数（公式同 CountBelowCommitments）。
       能更正的五种流水都不动 reserved 与 paid_pending_dispatch，所以这两个增量不为 0 的 deltas 直接抛 ValueError（程序错误），缺口公式因此不需要考虑这两个量为负。
       明确不做：数据库读写、opening_entry_id 的维护（服务层做）、合并迁移的落账规则。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 改动在 app/domain/ledger.py 与 tests/unit/test_ledger.py；模块不 import FastAPI、SQLAlchemy 或做 I/O 的库；已有的单元测试照常通过
