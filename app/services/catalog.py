@@ -7,7 +7,8 @@ read_* 与 find_* 都按租户过滤，不管事务：调用方在自己的连�
 
 写入函数在调用方已开的事务里运行（幂等执行器的事务，已取目录写锁），自己不提交、不回滚；
 与现有目录冲突抛 CatalogConflict，由调用方撤销已做的写入。
-sku_conflicts、create_sku 与 record_change 供之后的修改与批量导入共用。
+sku_conflicts、create_sku 与 record_change 供之后的修改与批量导入共用；
+批量导入的确认用 create_product_with_skus 建商品，它另返回各 sku_id。
 
 修改、停用与重新启用（§2.6 第 4、5 条）：调用方先用 lock_product、lock_sku 在事务里
 SELECT … FOR UPDATE 读要改的行，判定完不存在、合并、版本与“改没改”之后，
@@ -435,6 +436,18 @@ def create_product(
     否则建商品（active、版本 1）、写 product_created，再按请求顺序建各 SKU。
     请求内的编码与条码重复由调用方先拒绝。
     """
+    product_id, _ = create_product_with_skus(connection, tenant_id, name, skus, author)
+    return product_id
+
+
+def create_product_with_skus(
+    connection: Connection,
+    tenant_id: str,
+    name: str,
+    skus: Sequence[SkuFields],
+    author: ChangeAuthor,
+) -> tuple[str, list[str]]:
+    """同 create_product，另按 skus 的顺序返回建好的各 sku_id（批量导入的确认用）。"""
     conflicts = [
         conflict
         for index, sku in enumerate(skus)
@@ -459,9 +472,11 @@ def create_product(
         version=1,
         changes=product_created_changes(name),
     )
-    for index, sku in enumerate(skus):
+    sku_ids = [
         create_sku(connection, tenant_id, product_id, sku, author, index)
-    return product_id
+        for index, sku in enumerate(skus)
+    ]
+    return product_id, sku_ids
 
 
 def add_sku(
