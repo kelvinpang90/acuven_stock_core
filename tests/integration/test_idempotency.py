@@ -5,9 +5,15 @@
 按 marker 挂的钩子在命令插完地点之后运行：业务拒绝、抛异常、绕过锁先提交一条同键记录。
 声明了目录写锁的测试路由有两个：一个同上插地点；一个是计数命令，marker 是计数地点的 location_id，
 命令用不加锁的普通 SELECT 读出地点名里的计数、运行钩子、再写回加一。
+声明了余额行预建的测试路由按请求体的 rows 预建余额行，命令同上插地点；
+声明了 READ COMMITTED 的测试路由命令同上。
+业务引用路由的命令先插一个名为 marker 的地点，再插 location_id 为 marker 的引用地点
+（地点名记下请求摘要与先插那一行的 ID），撞主键时抛 BusinessRefTaken，按引用地点重新判定。
 造数据与观察都用测试自己的连接；应用用自己的连接池。
 """
 
+import hashlib
+import json
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -19,7 +25,8 @@ import pytest
 from fastapi import Depends, Request
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
-from sqlalchemy import Connection, Engine, func, insert, make_url, select, text, update
+from sqlalchemy import Connection, Engine, event, func, insert, make_url, select, text, update
+from sqlalchemy.exc import IntegrityError
 
 from app.api.auth import authorize
 from app.api.errors import ApiError
@@ -29,11 +36,30 @@ from app.domain.catalog import catalog_lock_name
 from app.domain.idempotency import lock_name, request_digest
 from app.domain.service_auth import STOCK_WRITE, generate_token, token_digest
 from app.main import create_app
-from app.models.inventory import IdempotencyRecord, Location
+from app.models.inventory import IdempotencyRecord, Location, StockBalance
 from app.services import idempotency
-from app.services.idempotency import CommandResult, Execution, run_idempotent
-from tests.integration.conftest import TEST_DATABASE_URL, add_credential, new_id
-from tests.integration.test_api_auth import Caller, add_token, error_of, events, issue
+from app.services.idempotency import (
+    BusinessRefTaken,
+    CommandResult,
+    Execution,
+    run_idempotent,
+)
+from tests.integration.conftest import (
+    TEST_DATABASE_URL,
+    add_credential,
+    add_sku,
+    add_tenant,
+    balance_insert,
+    new_id,
+)
+from tests.integration.test_api_auth import (
+    Caller,
+    add_other_pool,
+    add_token,
+    error_of,
+    events,
+    issue,
+)
 from tests.integration.test_inventory_schema import idempotency_insert
 from tests.integration.test_service_auth_schema import token_insert
 
@@ -43,8 +69,15 @@ CATALOG_NOTES = "test-catalog-notes.create"
 CATALOG_COUNT = "test-catalog-count.increment"
 CATALOG_NOTES_URL = "/test/catalog/notes"
 CATALOG_COUNT_URL = "/test/catalog/count"
+BALANCE_NOTES = "test-balance-notes.create"
+BALANCE_NOTES_URL = "/test/balances/notes"
+READ_COMMITTED_NOTES = "test-read-committed-notes.create"
+READ_COMMITTED_NOTES_URL = "/test/read-committed/notes"
+REFS = "test-refs.claim"
+REFS_URL = "/test/refs"
 KEY = "shop:note:1"
 REJECTED = "NOTE_REJECTED"
+REF_CONFLICT = "BUSINESS_REF_CONFLICT"
 COMMAND_EVENT = "business_ref_conflict"
 
 # 按 marker 挂的钩子：命令插完地点、登记完事件之后运行。每个测试结束时清空。
@@ -94,6 +127,61 @@ def count_note(execution: Execution, note: Note) -> CommandResult:
     return CommandResult({"count": current + 1})
 
 
+class BalanceNote(Note):
+    rows: list[list[str]]  # 要预建的 [pool_id, sku_id]，原样交给执行器
+
+
+balance_note_body = json_body(BalanceNote)
+
+
+def balance_rows_of(note: BalanceNote) -> Callable[[Connection], list[tuple[str, str]]]:
+    def balance_rows(connection: Connection) -> list[tuple[str, str]]:
+        # 预建函数可以读库；读完由执行器结束这条读隐式开的事务。
+        connection.execute(select(func.count()).select_from(StockBalance)).scalar_one()
+        return [(pool_id, sku_id) for pool_id, sku_id in note.rows]
+
+    return balance_rows
+
+
+def claim_ref(execution: Execution, note: Note) -> CommandResult:
+    """先插一个地点，再插业务引用（location_id 为 marker 的地点）。
+
+    撞主键时抛 BusinessRefTaken；插完引用之后运行钩子。
+    """
+    tenant_id = execution.access.principal.tenant_id
+    note_id = new_id("loc")
+    values = {"location_id": note_id, "tenant_id": tenant_id, "name": note.marker}
+    execution.connection.execute(insert(Location).values(status="active", **values))
+    if note.event:
+        execution.record_security_event(COMMAND_EVENT, {"ref_type": "note", "ref": note.marker})
+    ref = {
+        "location_id": note.marker,
+        "tenant_id": tenant_id,
+        "name": f"{execution.request_digest}:{note_id}",
+        "status": "active",
+    }
+    try:
+        execution.connection.execute(insert(Location).values(ref))
+    except IntegrityError as exc:
+        if exc.orig.args[0] != 1062:
+            raise
+        raise BusinessRefTaken(lambda rejudging: judge_ref(rejudging, note.marker)) from None
+    hook = HOOKS.get(note.marker)
+    if hook is not None:
+        hook(execution)
+    return CommandResult({"ref": note.marker, "note_id": note_id}, status=201)
+
+
+def judge_ref(execution: Execution, ref: str) -> CommandResult:
+    """按已提交的引用重新判定：摘要相同返回它的结果，不同 409。都登记一条事件。"""
+    statement = select(Location.name).where(Location.location_id == ref)
+    digest, note_id = execution.connection.execute(statement).scalar_one().split(":")
+    execution.record_security_event(COMMAND_EVENT, {"ref_type": "rejudge", "ref": ref})
+    if digest != execution.request_digest:
+        raise ApiError(409, REF_CONFLICT, "the reference was used with different content")
+    return CommandResult({"ref": ref, "note_id": note_id})
+
+
 def add_test_routes(app) -> None:
     @app.post("/test/notes", dependencies=[WRITE])
     def create_note(request: Request, body: NoteBody) -> Response:
@@ -131,6 +219,37 @@ def add_test_routes(app) -> None:
             body=body,
             command=lambda execution: count_note(execution, body.model),
             catalog_lock=True,
+        )
+
+    @app.post(BALANCE_NOTES_URL, dependencies=[WRITE])
+    def create_balance_note(
+        request: Request, body: Annotated[ParsedBody[BalanceNote], Depends(balance_note_body)]
+    ) -> Response:
+        return run_idempotent(
+            request,
+            operation=BALANCE_NOTES,
+            body=body,
+            command=lambda execution: write_note(execution, body.model),
+            balance_rows=balance_rows_of(body.model),
+        )
+
+    @app.post(READ_COMMITTED_NOTES_URL, dependencies=[WRITE])
+    def create_read_committed_note(request: Request, body: NoteBody) -> Response:
+        return run_idempotent(
+            request,
+            operation=READ_COMMITTED_NOTES,
+            body=body,
+            command=lambda execution: write_note(execution, body.model),
+            read_committed=True,
+        )
+
+    @app.post(REFS_URL, dependencies=[WRITE])
+    def claim_test_ref(request: Request, body: NoteBody) -> Response:
+        return run_idempotent(
+            request,
+            operation=REFS,
+            body=body,
+            command=lambda execution: claim_ref(execution, body.model),
         )
 
 
@@ -721,3 +840,285 @@ def test_the_read_snapshot_is_taken_after_the_catalog_lock(client, engine):
     with engine.connect() as db:
         statement = select(Location.name).where(Location.location_id == counter_id)
         assert db.execute(statement).scalar_one() == "2"
+
+
+# --- 余额行预建 ---
+
+# 已有余额行的量与版本：预建不能改动它们。
+EXISTING_BALANCE = {
+    "stock_balance": 7,
+    "reserved": 2,
+    "unavailable": 1,
+    "paid_pending_dispatch": 4,
+    "balance_version": 3,
+    "last_book_only_version": 2,
+    "last_reconciled_version": 1,
+}
+ZERO_BALANCE = {column: 0 for column in EXISTING_BALANCE}
+
+
+@pytest.fixture
+def balance_inserts(client) -> Iterator[list[tuple[str, str]]]:
+    """应用的连接上执行的余额行插入，按执行顺序记下 (pool_id, sku_id)。"""
+    inserted: list[tuple[str, str]] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany) -> None:
+        if statement.startswith("INSERT INTO stock_balances"):
+            inserted.append((parameters["pool_id"], parameters["sku_id"]))
+
+    app_engine = client.app.state.engine
+    event.listen(app_engine, "before_cursor_execute", record)
+    try:
+        yield inserted
+    finally:
+        event.remove(app_engine, "before_cursor_execute", record)
+
+
+def balances(engine: Engine, *where) -> list[dict]:
+    statement = select(*StockBalance.__table__.columns).where(*where)
+    statement = statement.order_by(StockBalance.pool_id, StockBalance.sku_id)
+    with engine.connect() as db:
+        return [dict(row) for row in db.execute(statement).mappings()]
+
+
+def balance_of(engine: Engine, caller: Caller, pool_id: str, sku_id: str) -> dict | None:
+    where = (
+        StockBalance.tenant_id == caller.tenant_id,
+        StockBalance.pool_id == pool_id,
+        StockBalance.sku_id == sku_id,
+    )
+    rows = balances(engine, *where)
+    return rows[0] if rows else None
+
+
+def add_skus(engine: Engine, tenant_id: str, count: int) -> list[str]:
+    with engine.begin() as db:
+        return [add_sku(db, tenant_id) for _ in range(count)]
+
+
+def send_balances(client: TestClient, caller: Caller, rows, key: str = KEY, **body: object):
+    payload = {"marker": "m", "rows": [list(row) for row in rows]} | body
+    return send(client, caller, key, url=BALANCE_NOTES_URL, json=payload)
+
+
+def test_balance_rows_are_committed_before_the_command_runs(client, engine):
+    caller = issue(engine)
+    new_sku, existing_sku = add_skus(engine, caller.tenant_id, 2)
+    with engine.begin() as db:
+        foreign_sku = add_sku(db, add_tenant(db))
+        values = EXISTING_BALANCE | {"opening_entry_id": new_id("led")}
+        db.execute(balance_insert(caller.tenant_id, caller.pool_id, existing_sku, **values))
+    existing_before = balance_of(engine, caller, caller.pool_id, existing_sku)
+    missing_pool = new_id("pool")
+
+    seen: dict[str, list[dict]] = {}
+
+    def look(execution: Execution) -> None:
+        # 命令的业务事务还开着：另一个连接已经看得到预建的行。
+        seen["rows"] = balances(engine, StockBalance.tenant_id == caller.tenant_id)
+
+    HOOKS["m"] = look
+    rows = [
+        (caller.pool_id, new_sku),
+        (caller.pool_id, foreign_sku),  # SKU 属于别的租户
+        (missing_pool, new_sku),  # 池不存在
+        (caller.pool_id, existing_sku),
+    ]
+    response = send_balances(client, caller, rows)
+    assert response.status_code == 201
+    assert notes(engine, caller, "m") == 1
+
+    assert sorted(row["sku_id"] for row in seen["rows"]) == sorted([new_sku, existing_sku])
+    created = balance_of(engine, caller, caller.pool_id, new_sku)
+    assert created is not None
+    assert created["balance_id"].startswith("bal_")
+    assert {column: created[column] for column in ZERO_BALANCE} == ZERO_BALANCE
+    assert created["opening_entry_id"] is None
+    # 已有的行一列都没变。
+    assert balance_of(engine, caller, caller.pool_id, existing_sku) == existing_before
+    # 外键失败的行跳过，不在任何租户下建出来。
+    assert balances(engine, StockBalance.sku_id == foreign_sku) == []
+    assert balances(engine, StockBalance.pool_id == missing_pool) == []
+
+
+def test_balance_rows_are_inserted_in_order_and_again_on_replay(client, engine, balance_inserts):
+    caller = issue(engine)
+    other_pool = add_other_pool(engine, caller.tenant_id)
+    skus = add_skus(engine, caller.tenant_id, 3)
+    rows = [
+        (other_pool, skus[2]),
+        (caller.pool_id, skus[1]),
+        (other_pool, skus[0]),
+        (caller.pool_id, skus[2]),
+        (other_pool, skus[2]),  # 重复的只插一次
+        (caller.pool_id, skus[0]),
+    ]
+    expected = sorted(set(rows))
+    assert len(expected) == 5
+
+    first = send_balances(client, caller, rows)
+    assert first.status_code == 201
+    assert balance_inserts == expected
+    created = balances(engine, StockBalance.tenant_id == caller.tenant_id)
+    assert [(row["pool_id"], row["sku_id"]) for row in created] == expected
+
+    # 同键重放：命令不再执行，预建照样按顺序做一遍，已建的行不变。
+    balance_inserts.clear()
+    replay = send_balances(client, caller, rows)
+    assert replay.status_code == 201
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == first.json()
+    assert notes(engine, caller, "m") == 1
+    assert balance_inserts == expected
+    assert balances(engine, StockBalance.tenant_id == caller.tenant_id) == created
+
+
+def test_a_database_error_while_pre_creating_is_500_and_saves_nothing(client, engine):
+    caller = issue(engine)
+    [sku] = add_skus(engine, caller.tenant_id, 1)
+    # 比 VARCHAR(32) 长：严格模式下是数据错误（1406），不是外键失败。排在合格的那一行之后。
+    too_long = "z" * 40
+    rows = [(caller.pool_id, too_long), (caller.pool_id, sku)]
+    failed = send_balances(client, caller, rows, event=True)
+    error = error_of(failed, 500)
+    assert error["code"] == "INTERNAL_ERROR"
+    assert error["retryable"] is True
+    assert records(engine, caller, operation=BALANCE_NOTES) == []
+    assert notes(engine, caller, "m") == 0
+    assert events(engine, rid_of(failed)) == []
+    # 先插的那一行也随短事务回滚。
+    assert balances(engine, StockBalance.tenant_id == caller.tenant_id) == []
+    assert_lock_free(engine, note_lock(caller, operation=BALANCE_NOTES))
+
+    # 没保存幂等记录：同键重试会重新执行。
+    retry = send_balances(client, caller, [(caller.pool_id, sku)], event=True)
+    assert retry.status_code == 201
+    assert "Idempotency-Replayed" not in retry.headers
+    assert notes(engine, caller, "m") == 1
+    assert balance_of(engine, caller, caller.pool_id, sku) is not None
+
+
+# --- 本请求的摘要 ---
+
+
+def test_the_command_sees_the_request_digest(client, engine):
+    caller = issue(engine)
+    seen: list[str] = []
+    HOOKS["m"] = lambda execution: seen.append(execution.request_digest)
+    body = {"marker": "m", "event": False}
+    response = send(client, caller, url="/test/folders/f1/notes", json=body)
+    assert response.status_code == 201
+
+    # 契约 §7.1：{"path": 路径参数, "body": 请求体} 排序键、不留空白地序列化后取 SHA-256。
+    canonical = {"path": {"folder_id": "f1"}, "body": body}
+    serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    assert seen == [hashlib.sha256(serialized.encode("utf-8")).hexdigest()]
+    [record] = records(engine, caller, operation=FOLDER_NOTES)
+    assert record["request_hash"] == seen[0]
+
+
+# --- READ COMMITTED ---
+
+
+@pytest.mark.parametrize("read_committed", [True, False])
+def test_read_committed_applies_to_the_business_transaction_only(client, engine, read_committed):
+    caller = issue(engine)
+    seen: dict[str, object] = {}
+    outside = (Location.tenant_id == caller.tenant_id, Location.name == "outside")
+
+    def look(execution: Execution) -> None:
+        db = execution.connection
+        seen["isolation"] = db.execute(text("SELECT @@transaction_isolation")).scalar_one()
+        seen["connection_id"] = db.execute(text("SELECT CONNECTION_ID()")).scalar_one()
+        # 命令运行中另一个连接提交一行，再用普通读去读。
+        with engine.begin() as other:
+            values = {"location_id": new_id("loc"), "tenant_id": caller.tenant_id}
+            other.execute(insert(Location).values(name="outside", status="active", **values))
+        statement = select(func.count()).select_from(Location).where(*outside)
+        seen["outside"] = db.execute(statement).scalar_one()
+
+    HOOKS["m"] = look
+    url = READ_COMMITTED_NOTES_URL if read_committed else "/test/notes"
+    response = send(client, caller, url=url, json={"marker": "m"})
+    assert response.status_code == 201
+
+    if read_committed:
+        assert seen["isolation"] == "READ-COMMITTED"
+        assert seen["outside"] == 1
+    else:
+        # 默认的 REPEATABLE READ：读快照在查幂等记录时已经建立，看不到之后提交的行。
+        assert seen["isolation"] == "REPEATABLE-READ"
+        assert seen["outside"] == 0
+
+    # 请求结束后同一连接（这个应用的连接池里只有它）再开的事务回到默认隔离级别。
+    with client.app.state.engine.connect() as db:
+        assert db.execute(text("SELECT CONNECTION_ID()")).scalar_one() == seen["connection_id"]
+        isolation = db.execute(text("SELECT @@transaction_isolation")).scalar_one()
+        assert isolation == "REPEATABLE-READ"
+        statement = select(func.count()).select_from(Location).where(*outside)
+        assert db.execute(statement).scalar_one() == 1
+
+
+# --- 并发撞上业务引用 ---
+
+
+@pytest.mark.parametrize("same_content", [True, False])
+def test_a_business_ref_taken_concurrently_is_rejudged_and_saved(client, engine, same_content):
+    caller = issue(engine)
+    ref = new_id("loc")
+    first_body = {"marker": ref, "event": True}
+    second_body = first_body if same_content else {"marker": ref}
+
+    inserted = threading.Event()
+    proceed = threading.Event()
+
+    def pause_first(execution: Execution) -> None:
+        # 先到者插完引用、提交之前停在这里；后到者写完自己那一行后在引用的主键上等它。
+        if not inserted.is_set():
+            inserted.set()
+            assert proceed.wait(10)
+
+    HOOKS[ref] = pause_first
+    other_client = TestClient(client.app)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            first_future = pool.submit(
+                send, client, caller, "shop:ref:1", url=REFS_URL, json=first_body
+            )
+            assert inserted.wait(10)
+            second_future = pool.submit(
+                send, other_client, caller, "shop:ref:2", url=REFS_URL, json=second_body
+            )
+            time.sleep(0.5)
+        finally:
+            proceed.set()
+        first, second = first_future.result(), second_future.result()
+
+    assert first.status_code == 201
+    if same_content:
+        # 重新判定读到先到者已提交的引用，返回它的结果。
+        assert second.status_code == 200
+        assert second.json()["data"] == first.json()["data"]
+    else:
+        assert error_of(second, 409)["code"] == REF_CONFLICT
+    # 后到者先写的那一行撤销了。
+    assert notes(engine, caller, ref) == 1
+
+    # 重新判定的结果是后到者那个幂等键的确定结果。
+    [record] = records(engine, caller, "shop:ref:2", operation=REFS)
+    assert record["response_status"] == second.status_code
+    assert record["response_body"] == second.json()
+
+    # 后到者命令登记的事件丢弃，重新判定登记的照常写。
+    [first_event] = events(engine, rid_of(first))
+    assert first_event["details"] == {"ref_type": "note", "ref": ref}
+    [second_event] = events(engine, rid_of(second))
+    assert second_event["event_type"] == COMMAND_EVENT
+    assert second_event["details"] == {"ref_type": "rejudge", "ref": ref}
+
+    replay = send(client, caller, "shop:ref:2", url=REFS_URL, json=second_body)
+    assert replay.status_code == second.status_code
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == second.json()
+    assert events(engine, rid_of(replay)) == []
+    assert notes(engine, caller, ref) == 1
