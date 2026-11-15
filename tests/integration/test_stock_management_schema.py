@@ -594,7 +594,7 @@ def test_differences_follow_the_count_formula(db: Connection):
             line_insert(shop, count, add_counted_sku(db, shop), shelf_count=7, d_shelf=d_shelf),
             "ck_stock_count_lines_d_shelf",
         )
-    for d_u in [-2, 1, 2]:
+    for d_u in [-2, 1, 3]:
         assert_rejected_by(
             db,
             line_insert(shop, count, add_counted_sku(db, shop), unsellable_count=3, d_u=d_u),
