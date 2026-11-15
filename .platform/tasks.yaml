@@ -1204,7 +1204,9 @@ tasks:
       收已有的单据、抛 ApiError；不给时为 409 BUSINESS_REF_CONFLICT 加 business_ref_conflict 事件；首次判定与 rejudge 都用它）：先 find_document，有则 answer_existing_document；
       没有则运行 command（它锁行、写流水、最后 insert_document 并返回结果）；command 抛业务拒绝（ApiError 4xx）时不直接拒绝，改抛 BusinessRefTaken，
       其 rejudge 在执行器开的新事务里（读快照看得到已提交的全部写入）重新 find_document，有则 answer_existing_document，没有则再运行一次 command，
-      这一次的拒绝就是确定结果；insert_document 撞唯一约束时的 rejudge 与此相同。rejudge 里再次撞上唯一约束（第三个并发请求）按 500 处理，
+      这一次的拒绝就是确定结果；insert_document 撞唯一约束时的 rejudge 与此相同。
+      append_entry 写 CORRECTION 撞上流水表的 (tenant_id, corrects_entry_id) 唯一约束（并发的另一笔更正先提交）时，同样抛 BusinessRefTaken，
+      在 with_document 里与单据撞约束走同一个 rejudge，不返回 500。rejudge 里再次撞上唯一约束（第三个并发请求）按 500 处理，
       同键重试会重新执行。代价是被拒的单据命令多一次事务。
       六，entry_representation：契约 6.8 的流水表示（deltas、after 两个对象各含四个量，时间为 UTC 的 RFC 3339 微秒加 Z，不含 idempotency_key 与 credential_id），
       供本任务与之后的流水查询、更正共用。
