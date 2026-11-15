@@ -977,6 +977,8 @@ tasks:
       二，改 stock_pools：加 went_live_at（DATETIME(6)）、went_live_credential_id（复合外键指向同租户的凭据）、went_live_actor_ref、
       went_live_request_id，都可空；检查约束：四列要么全空要么全非空，且 status 为 live 当且仅当 went_live_at 非空。
       三，改 ledger_entries：加唯一约束 (tenant_id, corrects_entry_id)，一条流水最多被更正一次；MySQL 唯一索引允许多个 NULL。
+      0002 的外键 (tenant_id, corrects_entry_id) 用的是 MySQL 按外键名隐式建的索引，加了同列的唯一索引后 InnoDB 改用唯一索引支撑外键、删掉隐式索引，
+      直接删唯一约束会报 1553；所以降级时先删这个外键，再删唯一约束，然后重建外键，回到 0004 的结构（0003 的降级注释讲过同一现象）。
       四，新表 stock_imports（前缀 simp_，一次期初导入一行，永久保留）：列与检查约束照 CORE-TASK-012 的 catalog_imports
       （import_id 主键、tenant_id、status 取 previewed 或 confirmed、expires_at、rows 为 JSON 数组、result 为 JSON 可空、
       预览的 credential_id 与 actor_ref 与 request_id 非空、created_at、确认的四列可空；status 为 previewed 时 result 与确认四列都空，
@@ -1082,7 +1084,7 @@ tasks:
       reason_code 校验（字符串，1 到 32 个小写字母、数字或下划线，不去空白）；note 规范化复用 app/domain/catalog.py 的
       normalize_reason（契约 6.2 第 6 条规则同 2.6 的 reason）；occurred_at 解析：字符串，RFC 3339 的日期加 T 加时间，秒必须有，
       小数秒 0 到 6 位，时区必须是 Z 或正负 hh:mm，换算成 UTC 的不带时区 datetime（微秒精度），不合规抛错；分隔的 T 与 Z 只接受大写；
-      秒为 00 到 59（不接受闰秒 60）；年份为 2000 到 9998（DATETIME(6) 只到 9999 年，留一年余量，换算时区不会溢出）；
+      秒为 00 到 59（不接受闰秒 60）；年份为 1001 到 9998（DATETIME(6) 存 1000 到 9999 年，两头各留一年余量，换算时区不会越界）；
       件数校验：正件数为 1 到 1000000 的整数，非负件数为 0 到 1000000 的整数，布尔一律不算整数；
       sku_ids 查询参数解析：逗号分隔，1 到 100 个，不能有空项、不能重复，不校验 ID 格式；
       流水查询的 from、to 解析同 occurred_at，两个都带而 from 不早于 to 时报错；limit 复用 app/domain/catalog.py 的 parse_limit；
@@ -1189,7 +1191,7 @@ tasks:
       OPENING_BALANCE 把 opening_entry_id 设为这条流水，CORRECTION 在原流水的 entry_id 等于 opening_entry_id 时清空它；UPDATE 余额行、
       INSERT 流水（entry_id 前缀 ent_；channel_id 取凭据的销售入口；credential_id、actor_ref、actor_role、request_id、idempotency_key 取自本请求；
       source_type、source_ref、line_ref、reason_code、note、occurred_at、corrects_entry_id 由调用方给，occurred_at 为空时取 command_now；recorded_at 也显式写 command_now，不靠列默认值，所以同一命令的各条流水 recorded_at 相同），
-      返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_，由 new_command_id 生成）。append_entry 另收可选的 reconciled_version：
+      返回流水的表示；同一命令的各条流水共用一个 command_id（前缀 cmd_；在本模块定义 new_command_id()，用 app/domain/ids.py 已有的 new_id 生成，不改 ids.py）。append_entry 另收可选的 reconciled_version：
       给了时 last_reconciled_version 取它而不按默认规则（盘点确认取快照版本，契约 0.10 的 4.1 例外），它小于当前值或大于写后的 last_book_only_version 时抛异常（程序错误）。
       mark_verified(execution, balance, reconciled_version=None)：差额为 0、不写流水的核实，把 last_book_only_version 设为当前 balance_version，
       last_reconciled_version 设为当前 balance_version 或给定的 reconciled_version（同样的检查）。
@@ -1197,7 +1199,7 @@ tasks:
       按契约 6.2 第 7 条判定（摘要不同时的回答可由调用方替换，供更正报 already_corrected）：request_hash 等于 execution.request_digest 时返回 200 与 result，否则抛 409 BUSINESS_REF_CONFLICT 并登记
       business_ref_conflict 事件（details 带引用类型与值）；new_document_id(document_type) 生成单据 ID（前缀按类型 rcp_、adj_、cor_），命令先拿到 ID 与 command_now 再拼 result；
       insert_document(execution, document_type, document_ref, document_id, created_at, result) 写一行，撞唯一约束时抛 CORE-TASK-025 的
-      BusinessRefTaken，rejudge 重新 find_document 并按同一规则回答。
+      BusinessRefTaken，rejudge 一律用下面 with_document 的那一个。
       业务引用的检查用普通读，读快照建立在幂等记录的查询时，看不到并发的另一个请求在那之后提交的同一引用；那个请求的写入又会改变本命令
       锁行后看到的账面，使本命令被业务规则拒绝（例如同一不可售调整换键重报，先到者已用掉可售量，后到者得 409 INSUFFICIENT_STOCK 而不是原结果）。
       所以单据命令统一经 with_document(execution, document_type, document_ref, command, on_conflict=None) 执行（on_conflict 是摘要不同时的回答，
@@ -1380,8 +1382,8 @@ tasks:
       document_ref 为原 entry_id）——已有单据且摘要相同返回 200 与 result；摘要不同时不报
       BUSINESS_REF_CONFLICT，改为 409 ENTRY_NOT_CORRECTABLE，details.reason 为 already_corrected，带已有单据的 document_id，不记安全事件
       （用 with_document 的 on_conflict 参数）；
-      然后 FOR SHARE 读池行，FOR UPDATE 锁原流水的余额行，用 CORE-TASK-026 的 require_not_merged 查原流水的 SKU（已合并 409 SKU_MERGED，
-      照契约 6.2 第 4 条先于本命令自己的规则；合并在来源 SKU 全为 0 时可能不写迁移流水，不能只靠判定列拦），再按 correction_blocker 判定（409 ENTRY_NOT_CORRECTABLE，details.reason 为 entry_type、
+      然后 FOR SHARE 读池行，FOR UPDATE 锁原流水的余额行，按 correction_blocker 判定（契约 6.7 的步骤里没有“SKU 已合并”一步：合并按 2.4 第 1 步总会成对写迁移流水，
+      来源 SKU 上更早的流水由判定列判为 superseded，所以不另查 SKU）（409 ENTRY_NOT_CORRECTABLE，details.reason 为 entry_type、
       pool_live 或 superseded，superseded 时带 details.last_reconciled_version）；apply_correction 违反不变量时 409 CORRECTION_BREAKS_INVARIANTS，
       details 为一个对象：sku_id、stock_balance、reserved、unavailable、paid_pending_dispatch（落账后的值）与 shortfall；通过则写一条 CORRECTION（四个增量为原流水的相反数，corrects_entry_id 为原流水，source_type correction，
       source_ref 为原 entry_id），append_entry 照 CORE-TASK-026 更新判定列并在原流水是有效期初时清空 opening_entry_id，写单据，
@@ -1397,7 +1399,7 @@ tasks:
     acceptance_criteria:
       - 接口与写入加在 app/api/stock_documents.py 与 app/services/stock_documents.py；CORE-TASK-029 的测试照常通过
       - 集成测试在真 MySQL 上验证成功的更正：收货后更正得 201，余额回到收货前、流水的四个增量为原流水的相反数、corrects_entry_id 正确、判定列更新；initializing 池上更正期初后 opening_entry_id 清空，可以用新导入再导期初（用服务层或接口造期初）
-      - 集成测试验证类型与池状态：原流水的 SKU 已合并（测试直接改 SKU 行，不写迁移流水）得 409 SKU_MERGED；更正 RESERVE 类流水（测试直接造流水）、COUNT_ADJUSTMENT、CORRECTION 得 entry_type；池已 live 时更正期初得 pool_live
+      - 集成测试验证类型与池状态：合并之后（测试照契约 2.4 写一对迁移流水并设好判定列）更正来源 SKU 上更早的收货得 superseded；更正 RESERVE 类流水（测试直接造流水）、COUNT_ADJUSTMENT、CORRECTION 得 entry_type；池已 live 时更正期初得 pool_live
       - 集成测试验证已被吸收：收货之后有一条定数类流水时得 superseded；同一行上两笔收货都录错时，更正后一笔之后前一笔照样能更正（契约 0.10）；两次收货后差额为 0 的核实（测试经服务层 mark_verified 或盘点确认造出）之后更正后一次收货也得 superseded
       - 集成测试验证不变量：收货之后被预留用掉，更正得 409 CORRECTION_BREAKS_INVARIANTS 且 details 的四个量与缺口数正确，什么也没写
       - 集成测试验证业务引用与并发：同一条流水换键同内容得 200 与原结果；换键不同内容得 409 ENTRY_NOT_CORRECTABLE（already_corrected）且不记 business_ref_conflict 事件；两个不同键并发更正同一条只有一条 CORRECTION 生效，后到者得到 200 原结果（同内容）或 already_corrected（不同内容），不得 superseded
@@ -1473,9 +1475,7 @@ tasks:
       规则用 CORE-TASK-001 的 apply_count_adjustment 与 CORE-TASK-023 的 is_stale，锁行与写流水用 CORE-TASK-026 的 app/services/stock.py。
       一，stock.write，角色 stock_admin；正文 reason_code（必填）、可选 note；池授权按盘点单所属的池（404 COUNT_NOT_FOUND）。
       二，命令里依次：FOR UPDATE 读盘点单行，不是 open 为 409 STATE_CONFLICT；命令以 CORE-TASK-025 的 read_committed 执行，盘点行在盘点单行锁之后用普通读读（看得到最新提交，不加间隙锁）；没有盘点行为 422（details.reason 为 count_has_no_lines）；
-      按 sku_id 升序 FOR UPDATE 锁全部盘点行 SKU 的余额行；提交之后被合并的 SKU（锁余额行后用 CORE-TASK-026 的 require_not_merged，FOR SHARE 读 SKU 行）：409 SKU_MERGED，
-      details 带按 sku_id 升序第一个这样的 sku_id 与 merged_into_sku_id（合并在来源 SKU 全为 0 时可能不写迁移流水，所以不能只靠 COUNT_STALE 拦）；
-      这张单只能取消、另开新单在规范 SKU 上重点；
+      按 sku_id 升序 FOR UPDATE 锁全部盘点行 SKU 的余额行；（契约 6.6 确认的步骤里没有“SKU 已合并”一步：提交之后被合并的 SKU 有成对的迁移流水，由下面的 COUNT_STALE 拦下）
       对每个 SKU 用 is_stale(判定列, 快照版本) 检查，有为真的整笔 409 COUNT_STALE，details.sku_ids 按 sku_id 升序列出；
       逐 SKU 用 apply_count_adjustment 算落账后的账面，有违反不变量的整笔 409 COUNT_BELOW_COMMITMENTS，details.skus 只列违反的 SKU（按 sku_id 升序），每项 sku_id、stock_balance、reserved、
       unavailable、paid_pending_dispatch（落账后的值）与 shortfall；
@@ -1488,14 +1488,16 @@ tasks:
     status: ready
     depends_on:
       - CORE-TASK-023
+      - CORE-TASK-029
+      - CORE-TASK-030
       - CORE-TASK-031
     acceptance_criteria:
       - 接口与写入加在 app/api/counts.py 与 app/services/counts.py；CORE-TASK-031 的测试照常通过
       - 集成测试在真 MySQL 上验证差额法：提交时点到 20、之后收货 10、确认时差额为 0 不写流水且账面仍是 30；点数少于账面时写 COUNT_ADJUSTMENT 且两个增量正确；只改不可售件数时 stock_balance 与 unavailable 同增；流水带正文的 reason_code 与 note
-      - 集成测试验证判定列：写了流水的 SKU 的 last_book_only_version 为该流水的版本、差额为 0 的为当时的 balance_version；两种 SKU 的 last_reconciled_version 都是快照版本；快照之后、确认之前录的收货在确认后仍可更正（判定列小于它的版本）；之后对这些 SKU 之前的收货做更正得 superseded（若 CORE-TASK-030 尚未合并，则直接断言判定列的值）
+      - 集成测试验证判定列：写了流水的 SKU 的 last_book_only_version 为该流水的版本、差额为 0 的为当时的 balance_version；两种 SKU 的 last_reconciled_version 都是快照版本；快照之后、确认之前录的收货在确认后仍可更正（判定列小于它的版本）；之后经更正接口对这些 SKU 快照之前的收货做更正得 superseded
       - 集成测试验证 COUNT_STALE：两张盘点单都提交了同一 SKU，先确认的写了流水后，后确认的得 409 COUNT_STALE 且列出该 SKU，什么也没写；重新提交该 SKU 后可确认；快照与差额为 0 的核实之间没有别的流水时不报
       - 集成测试验证 COUNT_BELOW_COMMITMENTS：预留占着的件点不到时得 409 且 details 的落账后四个量与缺口数正确；释放预留（测试直接造流水与余额）后换新幂等键、正文照旧再确认成功，沿用原快照
-      - 集成测试验证状态与授权：提交之后 SKU 被合并（测试直接改 SKU 行）得 409 SKU_MERGED 且什么也没写；没有盘点行 422；已确认再确认（换键）得 409 STATE_CONFLICT，同键重放得首次结果；缺 reason_code 422；stock_operator 得 403；两张单并发确认同一 SKU 不会把差额记两次
+      - 集成测试验证状态与授权：提交之后 SKU 被合并（测试照契约 2.4 写一对迁移流水并设好判定列）得 409 COUNT_STALE 且什么也没写；没有盘点行 422；已确认再确认（换键）得 409 STATE_CONFLICT，同键重放得首次结果；缺 reason_code 422；stock_operator 得 403；两张单并发确认同一 SKU 不会把差额记两次
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
       - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
