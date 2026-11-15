@@ -1006,7 +1006,7 @@ tasks:
       已有的 tests/integration/test_inventory_schema.py 里直接插入 live 池的测试，改为同时填上 went_live 四列（只改造数，不改它验证的内容）。
       已有的 tests/integration/test_cli_provisioning.py 里建池的测试把库里整行与 CLI 输出逐列比较，池加列后库里多出 went_live 四列；改为期望这四列为空（新池还没有上线记录），不改 CLI 代码，也不改它验证的其他内容。
       明确不做：写这些表的代码、接口、领域规则；不改流水类型的检查约束。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 模型改在 app/models/inventory.py（该模块已在 alembic/env.py 登记，不改 env.py）；迁移文件放 alembic/versions，revision 0005 接在 0004 之后，upgrade 与 downgrade 都写全；约束名遵循 app/db.py 的命名约定
