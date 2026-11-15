@@ -1148,7 +1148,7 @@ tasks:
       供盘点单命令在锁住盘点单行之后用普通读读盘点行（加锁读一个空范围会锁间隙，两张单的首次提交互相等待而死锁）。
       在模块文档里写明 balance_rows、request_digest、BusinessRefTaken、read_committed 的用法与开事务前的先后：幂等锁、目录写锁、余额行预建、开业务事务。
       明确不做：库存命令本身、锁余额行与写流水的服务函数（下一任务）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-022
     acceptance_criteria:
