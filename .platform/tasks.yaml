@@ -1396,7 +1396,7 @@ tasks:
       这个拒绝经 with_document 在新事务里重新判定，按第二条的业务引用规则得到 200 原结果或 already_corrected，而不是 superseded；
       撞流水表或单据表唯一约束时同样重新判定。
       明确不做：盘点、期初接口；不改 CORE-TASK-029 的两个命令。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-028
       - CORE-TASK-029
