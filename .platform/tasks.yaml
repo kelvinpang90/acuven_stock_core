@@ -1717,6 +1717,8 @@ tasks:
       (tenant_id, reservation_id, line_ref) 唯一，不加 (reservation_id, sku_id) 唯一；复合外键 (tenant_id, reservation_id) 指向 reservations、(tenant_id, pool_id, sku_id) 指向 stock_balances。
       时间列沿用现有模型的 DATETIME(6)，ID 与引用列沿用现有类型，约束名遵循 app/db.py 的命名约定。
       三，集成测试 tests/integration/test_reservation_schema.py 用现有夹具建数据，逐条验证上面的约束能拦住不合格的行、放行合格的行。
+      四，tests/integration/test_demo_reset_schema.py 里断言库在迁移头的两处写死了 0006（assert_production_head 与 core_instance 表无行时迁移失败的测试），
+      加了 0007 后它们会失败：改为与迁移脚本目录的当前 head 比较（用 alembic 的 ScriptDirectory 取），以后再加迁移不用再改；该文件其余断言不动。
       明确不做：任何接口、服务层与配置项（CORE-TASK-038 起）；不改流水表与已有迁移。
     status: ready
     depends_on:
@@ -1725,6 +1727,7 @@ tasks:
       - 迁移文件放 alembic/versions，revision 0007 接在 0006 之后，upgrade 与 downgrade 都写全；模型在新模块 app/models/orders.py，并已在 alembic/env.py 与 app/models/__init__.py 登记；CI 的迁移往返与 alembic check 通过
       - 集成测试验证 reservations：status 能存 late_payment_review、release_reason 能存 checkout_replaced；状态与原因的非法取值被拒；ttl_seconds 为 59 或 3601 被拒；同一租户同一入口同一 order_ref 的第二行被拒、换入口或换 order_ref 可以插入
       - 集成测试验证 reservations 的成组约束：released 缺 release_reason、released_credential_id 或 released_request_id 被拒，active 带这些列被拒；active 带 closed_at、released 或 expired 缺 closed_at 被拒；操作者两列只填一个被拒；expires_at 不晚于 created_at 被拒；池、入口或凭据属于别的租户被拒
+      - tests/integration/test_demo_reset_schema.py 不再写死迁移版本号，改为与当前 head 比较，其余断言不变并照常通过
       - 集成测试验证 order_lines：quantity 为 0 或 1000001 被拒；committed_qty 介于 0 与 quantity 之间被拒；发货加回库超过确认量、退货超过发货量被拒；同一预留同一 line_ref 的第二行被拒；同一预留两行同一 sku_id 可以插入；预留或余额行属于别的租户被拒
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
       - 集成测试与迁移检查由 PR 的必需 CI 检查 integration 执行并通过
@@ -1734,6 +1737,7 @@ tasks:
       - alembic/env.py
       - alembic/versions/20261116_0007_reservations.py
       - tests/integration/test_reservation_schema.py
+      - tests/integration/test_demo_reset_schema.py
     allowed_commands:
       - tests.unit
       - lint.check
@@ -1791,6 +1795,9 @@ tasks:
     purpose: >-
       按契约 docs/CONTRACT_V1.md 0.12 的 5.6（释放、到期关闭、隔离级别、锁序、订单行的 sku_id）与 5.2 第 4 条，在 CORE-TASK-038 的 app/api/reservations.py 与
       app/services/reservations.py 上加释放命令、到期关单、定时任务与新预留之前的关单。规则用 app/domain/reservations.py 的 release_decision、is_due。
+      零，app/services/stock.py 的 lock_balances 与 append_entry 都从请求的 Execution 取连接、租户与身份，关单没有请求：
+      各拆出一个只收连接、租户与身份的底层函数（身份即流水的 channel_id、idempotency_key、credential_id、actor_ref、actor_role、request_id 六项），
+      原来的两个函数改为从 Execution 取出这些再调用底层函数，签名与行为不变；关单调用底层函数，身份只给 channel_id（预留的入口），其余为空。不在 reservations.py 里另抄一份写流水的代码。
       一，到期关单 close_if_due：FOR UPDATE 读预留行，不是 active 或未到期什么也不做；否则 FOR SHARE 读订单行，按读到的 sku_id 升序锁余额行，每行一条 RELEASE
       （reason_code expired，不带凭据、幂等键、操作者与请求 ID，channel_id 取预留的入口，每次关单一个新的 command_id），预留改为 expired、记 closed_at。它在调用方给的事务里运行，自己不提交。
       二，POST /v1/reservations/{reservation_id}/release（操作类型 reservations.release，scope orders.write，不要求角色）：正文只有 reason（三个取值之一），其他 422。
@@ -1798,7 +1805,8 @@ tasks:
       命令 FOR UPDATE 读预留行后按 release_decision：RELEASE 时 FOR SHARE 读订单行、升序锁余额行、每行一条 RELEASE（reason_code 为请求的 reason），预留改为 released，记 release_reason、closed_at 与 released_ 一组列，200；
       EXPIRE 时在同一事务里按第一点关单，200，表示为 expired；UNCHANGED 不写任何东西，200 与当前表示；CONFLICT 为 409 STATE_CONFLICT。
       三，执行器钩子：app/services/idempotency.py 的 run_idempotent 加一个可选参数，在设好 READ COMMITTED 之后、开业务事务之前在同一连接上调用；不传的命令行为不变。
-      新预留用它做契约 5.6 的先关到期：用普通读查出所列 SKU 上 active 且已到期的预留（按 expires_at 升序最多 100 个），逐个在各自的事务里调用 close_if_due 并提交；某个出错记进程日志、回滚它、继续下一个。
+      新预留用它做契约 5.6 的先关到期：用普通读查出所列 SKU 上 active 且已到期的预留（按 expires_at 升序最多 100 个），逐个在各自的事务里调用 close_if_due 并提交；
+      某个关单出错时回滚它、记进程日志、继续下一个；但连接已作废、回滚本身出错或连接断开时（这时幂等命名锁与 READ COMMITTED 都已不在），不再继续，整个请求 503 UNAVAILABLE，什么也不保存，同键可以重试。
       四，定时任务：app/main.py 的 lifespan 再起一个 app/services/periodic.py 的 PeriodicTask，间隔 30 秒、首次等 30 秒，与安全事件清理并列，退出时一并停止；
       每次用普通读查 active 且已到期的预留，按 expires_at 升序逐个在各自的事务里关单；连接用 SQLAlchemy 的 execution_options(isolation_level 为 READ COMMITTED)，归还连接池时隔离级别自动复原；
       一个出错记进程日志、继续下一个。
@@ -1808,10 +1816,11 @@ tasks:
       - CORE-TASK-038
     acceptance_criteria:
       - 释放接口与命令加在 app/api/reservations.py 与 app/services/reservations.py；执行器钩子在 app/services/idempotency.py，不传时已有命令的测试照常通过；定时任务在 app/main.py 的 lifespan 起停
+      - app/services/stock.py 只做底层函数的拆分，lock_balances 与 append_entry 的签名与行为不变，已有的收货、调整、盘点、更正、Demo 重置测试照常通过
       - 集成测试验证释放：active 未到期释放后 reserved 按行减回、每行一条 RELEASE 且 reason_code 为请求的 reason、表示为 released 并带 released_at 与 release_reason；再释放（含换原因、换键）200 不写流水、原因不变；已到期未关的 active 释放后为 expired、流水 reason_code 为 expired 且不带凭据与请求 ID；状态为 committed 的预留 409 STATE_CONFLICT（测试直接把行改成 committed）
       - 集成测试验证释放的池授权与正文：别的租户的 reservation_id 404 RESERVATION_NOT_FOUND 并记 cross_tenant；凭据没有入口 403；reason 缺少或不在三个取值里 422
       - 集成测试验证到期关单：直接调用关单函数，已到期的关一次、写对流水、预留为 expired；再调一次什么也不写；未到期的不动；两个连接并发对同一预留关单只写一组 RELEASE
-      - 集成测试验证新预留之前的关单：一个已到期未关的预留占着某 SKU 的全部可售量时，对该 SKU 的新预留成功，且旧预留已关为 expired
+      - 集成测试验证新预留之前的关单：一个已到期未关的预留占着某 SKU 的全部可售量时，对该 SKU 的新预留成功，且旧预留已关为 expired；关单时连接出错（测试里让钩子用的连接失效）时请求 503、没有新预留也没有幂等记录
       - 集成测试验证定时任务的单次扫描函数：关掉全部已到期的 active，不碰未到期与非 active 的；扫描用过的连接放回池后隔离级别为默认值
       - 集成测试验证合并改挂的读取：把订单行的 sku_id 改成另一个 SKU 并把 reserved 挪过去（模拟合并）后，释放减的是新 SKU 的 reserved
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
@@ -1819,6 +1828,7 @@ tasks:
       - app/api/reservations.py
       - app/services/reservations.py
       - app/services/idempotency.py
+      - app/services/stock.py
       - app/main.py
       - tests/integration/test_reservation_release_api.py
       - tests/integration/test_reservation_expiry.py
