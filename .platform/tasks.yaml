@@ -1920,7 +1920,7 @@ tasks:
       二，(tenant_id, channel_id, payment_ref) 唯一；复合外键 (tenant_id, commit_credential_id) 与 (tenant_id, review_closed_credential_id) 指向 credentials（显式命名，避免与已有外键同名）。
       三，检查约束：payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id 在 status 为 committed、late_payment_review、closed_refunded 时都非空、其他状态都为空；
       committed_at 在 committed 时非空、其他状态为空；late 为真只在 committed；review_closed_at、review_closed_credential_id、review_closed_request_id 在 closed_refunded 时都非空、其他状态都为空；
-      status 为这三种时 closed_at 非空；commit_actor_ref 与 commit_actor_role、review_closed_actor_ref 与 review_closed_actor_role 各自同有同无。
+      status 为这三种时 closed_at 非空；commit_actor_ref 与 commit_actor_role、review_closed_actor_ref 与 review_closed_actor_role 各自同有同无（操作者列可选，不按状态约束，同 0007 的 released_actor）。
       四，tests/integration/test_reservation_schema.py 里已有的测试插入 committed 与 late_payment_review 的行时没给新列，加了约束后会被拒：
       只给这些插入补上新约束要求的列（payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id、closed_at，committed 的再加 committed_at），该文件其余断言不动。
       五，集成测试 tests/integration/test_sale_commit_schema.py 用现有夹具建数据，逐条验证上面的约束能拦住不合格的行、放行合格的行（含 expired 转 committed 后保留原 closed_at、故障补交新建的行）。
@@ -1932,7 +1932,7 @@ tasks:
       - 迁移文件为 alembic/versions/20261116_0008_sale_commits.py，down_revision 为 0007；模型在 app/models/orders.py；upgrade 后 alembic check 无差异（由 CI 的 integration 执行）；tests/integration/test_reservation_schema.py 只为新约束补列，其余断言不变并照常通过
       - 集成测试验证 committed 的行：缺 payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id 或 committed_at 任一被拒；closed_at 为空被拒；齐全时放行，late 真假都可
       - 集成测试验证 late_payment_review 与 closed_refunded 的行：committed_at 非空被拒、late 为真被拒；closed_refunded 缺 review_closed_ 三列任一被拒，late_payment_review 带它们被拒
-      - 集成测试验证 active、released、expired 的行：带 payment_ref 或任何 commit_、review_closed_ 列被拒；不带时与 0007 的行为相同
+      - 集成测试验证 active、released、expired 的行：带 payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id、committed_at 或 review_closed_at、review_closed_credential_id、review_closed_request_id 任一被拒；不带时与 0007 的行为相同（两组新操作者列只受同有同无约束，不按状态约束，同 0007 的 released_actor）
       - 集成测试验证唯一与外键：同一入口两行同一 payment_ref 被拒，payment_ref 都为空的多行放行；commit_credential_id 指向别的租户的凭据被拒；操作者两列只有一列被拒
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
