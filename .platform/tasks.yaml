@@ -2009,7 +2009,7 @@ tasks:
       - 接口在 app/api/sale_commits.py，命令在 app/services/sale_commits.py，路由在 app/main.py 挂上，表示的新字段在 app/services/reservations.py；已有的预留、释放与查询测试照常通过（只为表示的新字段改字段集合常量）
       - 集成测试验证正常确认：200 与表示（committed，payment_ref、paid_at、committed_at，late 与 fault_mode 为假）；余额 stock_balance 与 reserved 减、paid_pending_dispatch 加；每行一条 SALE_COMMIT，来源字段、occurred_at 与 reason_code 照契约；订单行 committed_qty 等于 quantity；reservation_id 为 null 时 reason_code 为 fault_mode、表示 fault_mode 为真
       - 集成测试验证拒绝：released、closed_refunded 与已用别的 payment_ref 确认的都 409 STATE_CONFLICT 且 details 带 status；测试直接造一个待审的预留，用别的 payment_ref 确认 409 STATE_CONFLICT 且 details 带 reason 与 status；payment_ref 已用在别的订单 409 BUSINESS_REF_CONFLICT 并写 business_ref_conflict 事件；reservation_id 不同 409 RESERVATION_MISMATCH（reason 为 reservation_id）；行多、少、数量或 SKU 不同 409 RESERVATION_MISMATCH 且 line_refs 升序；有 reservation_id 而订单没有预留 404 RESERVATION_NOT_FOUND；凭据没有入口 403
-      - 集成测试验证尚未实现的分支：已到期的预留与没有预留且 reservation_id 为 null 的请求都 503，没有幂等记录、没有流水
+      - 集成测试验证尚未实现的分支：测试直接造一个已关为 expired 的预留，确认它 503；没有预留且 reservation_id 为 null 的请求 503；两者都没有幂等记录、没有 SALE_COMMIT 或 LATE_SALE_COMMIT 流水
       - 集成测试验证业务引用与重放：同键原样重放带 Idempotency-Replayed；换键同内容 200 与当前表示；换键同 payment_ref 不同内容 409 BUSINESS_REF_CONFLICT
       - 集成测试验证合并比对：模拟合并（把来源 SKU 标为已合并、订单行改挂、reserved 挪到规范 SKU）后按原 SKU 确认成功、扣的是规范 SKU；模拟合并后已释放的订单确认 409 STATE_CONFLICT
       - 集成测试验证正文与查询：paid_at 不带时区、payment_ref 格式不对、reservation_id 超过 32 个字符、lines 重复 line_ref 或 sku_id、缺少 reservation_id 这个键都 422，101 行 413；按 ID 与按 order_ref 查询都返回新字段
