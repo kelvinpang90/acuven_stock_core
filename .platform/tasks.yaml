@@ -1663,3 +1663,197 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-036
+    title: 写出预留状态、到期判定与可售判定的纯函数
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.12 的 5.2 与 5.6，新建 app/domain/reservations.py，只放纯函数与常量（不 import FastAPI、SQLAlchemy
+      或任何做 I/O 的库），单元测试放 tests/unit/test_reservations.py，用标准库 unittest。之后的表结构、预留、释放与可售量任务都用它。
+      一，常量：预留状态六个取值 active、released、expired、committed、late_payment_review、closed_refunded；释放原因三个取值
+      cancelled、payment_failed、checkout_replaced；到期关单的 reason_code expired；流水 source_type reservation；ID 前缀 rsv_ 与 oln_；
+      有效期默认 900、下限 60、上限 3600；订单行数量下限 1、上限 1000000；可售状态 merged、inactive、sellable。
+      二，parse_ttl_seconds(value)：只接受 60 到 3600 的 int（不接受布尔与其他类型），返回它，否则抛 ValueError。
+      三，compute_expires_at(created_at, ttl_seconds)：返回 created_at 加 ttl_seconds 秒。
+      四，is_due(status, expires_at, now)：status 为 active 且 now 不早于 expires_at（相等算到期）时为真。
+      五，displayed_status(status, expires_at, now)：is_due 为真时返回 expired，否则原样返回 status（契约 5.6 读接口不写库，Q-54）。
+      六，release_decision(status, expires_at, now)：返回枚举 ReleaseDecision 的一个值——active 且未到期为 RELEASE；active 且已到期为 EXPIRE；
+      released 或 expired 为 UNCHANGED；committed、late_payment_review、closed_refunded 为 CONFLICT；其他值抛 ValueError（契约 5.6 释放，Q-55）。
+      七，find_shortfalls(lines, available_by_sku)：lines 是按请求顺序的 (line_ref, sku_id, quantity) 序列，available_by_sku 是 sku_id 到 available 的映射；
+      按请求顺序返回 quantity 大于 available 的行，每项 line_ref、sku_id、quantity、available；都够时返回空列表。
+      八，availability_status(merged_into_sku_id, sku_active, product_active)：merged_into_sku_id 非空返回 merged；否则 SKU 或商品不是 active 返回 inactive；
+      否则 sellable（契约 5.6 可售量的先后）。
+      明确不做：表结构、接口、配置项与服务层（CORE-TASK-037 到 040）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 函数与常量在 app/domain/reservations.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_reservations.py，用 unittest
+      - 单元测试验证 parse_ttl_seconds：60、900、3600 通过；59、3601、布尔、字符串、浮点数都抛 ValueError
+      - 单元测试验证到期边界：now 早于 expires_at 一微秒不到期，等于或晚于即到期；只有 active 会到期；displayed_status 对到期的 active 返回 expired、其余原样
+      - 单元测试逐个状态验证 release_decision 的四种结果，未知状态抛 ValueError
+      - 单元测试验证 find_shortfalls：全部够时为空；多行不足时按请求顺序全部列出、每项带 available；available 为 0 与 quantity 恰等于 available 的边界
+      - 单元测试验证 availability_status 的先后：已合并且停用报 merged，商品停用而 SKU 有效报 inactive，都有效报 sellable
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/reservations.py
+      - tests/unit/test_reservations.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-037
+    title: 建立预留表与订单行表及其约束
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.12 的 5.6 存放与 5.1，新增迁移 alembic/versions/20261116_0007_reservations.py（revision 0007，接在 0006 之后），
+      在新模块 app/models/orders.py 建 reservations 与 order_lines 两个模型，并在 alembic/env.py 与 app/models/__init__.py 登记。
+      状态、释放原因与数量上下限等取值从 CORE-TASK-036 的 app/domain/reservations.py 引用，不另写一份。
+      一，reservations：列与约束照 5.6——status 与 release_reason 用 VARCHAR(32)（契约写明的例外）并各加取值检查约束；ttl_seconds 检查 60 到 3600；
+      创建的 credential_id、request_id、created_at、expires_at、request_hash 非空；释放的 release_reason、released_credential_id、released_request_id 在 status 为 released 时都非空、
+      其他状态都为空；status 为 active 时 closed_at 为空、为 released 或 expired 时非空；两组操作者列（actor_ref 与 actor_role、released_actor_ref 与 released_actor_role）各自同有同无；
+      expires_at 大于 created_at；(tenant_id, channel_id, order_ref) 唯一、(tenant_id, reservation_id) 唯一、(status, expires_at) 索引；
+      复合外键 (tenant_id, pool_id)、(tenant_id, channel_id)、(tenant_id, credential_id)、(tenant_id, released_credential_id)。
+      二，order_lines：order_line_id 主键，quantity 检查 1 到 1000000，五个累计量默认 0、非负，committed_qty 为 0 或等于 quantity，
+      dispatched_qty 加 refund_restocked_qty 不超过 committed_qty，returned_sellable_qty 加 returned_unsellable_qty 不超过 dispatched_qty；
+      (tenant_id, reservation_id, line_ref) 唯一，不加 (reservation_id, sku_id) 唯一；复合外键 (tenant_id, reservation_id) 指向 reservations、(tenant_id, pool_id, sku_id) 指向 stock_balances。
+      时间列沿用现有模型的 DATETIME(6)，ID 与引用列沿用现有类型，约束名遵循 app/db.py 的命名约定。
+      三，集成测试 tests/integration/test_reservation_schema.py 用现有夹具建数据，逐条验证上面的约束能拦住不合格的行、放行合格的行。
+      明确不做：任何接口、服务层与配置项（CORE-TASK-038 起）；不改流水表与已有迁移。
+    status: ready
+    depends_on:
+      - CORE-TASK-036
+    acceptance_criteria:
+      - 迁移文件放 alembic/versions，revision 0007 接在 0006 之后，upgrade 与 downgrade 都写全；模型在新模块 app/models/orders.py，并已在 alembic/env.py 与 app/models/__init__.py 登记；CI 的迁移往返与 alembic check 通过
+      - 集成测试验证 reservations：status 能存 late_payment_review、release_reason 能存 checkout_replaced；状态与原因的非法取值被拒；ttl_seconds 为 59 或 3601 被拒；同一租户同一入口同一 order_ref 的第二行被拒、换入口或换 order_ref 可以插入
+      - 集成测试验证 reservations 的成组约束：released 缺 release_reason、released_credential_id 或 released_request_id 被拒，active 带这些列被拒；active 带 closed_at、released 或 expired 缺 closed_at 被拒；操作者两列只填一个被拒；expires_at 不晚于 created_at 被拒；池、入口或凭据属于别的租户被拒
+      - 集成测试验证 order_lines：quantity 为 0 或 1000001 被拒；committed_qty 介于 0 与 quantity 之间被拒；发货加回库超过确认量、退货超过发货量被拒；同一预留同一 line_ref 的第二行被拒；同一预留两行同一 sku_id 可以插入；预留或余额行属于别的租户被拒
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试与迁移检查由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/models/orders.py
+      - app/models/__init__.py
+      - alembic/env.py
+      - alembic/versions/20261116_0007_reservations.py
+      - tests/integration/test_reservation_schema.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-038
+    title: 实现整单预留命令与预留查询
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.12 的 5.6（预留有效期、预留、表示、查询）、5.2、7.1、8.1 与 10 第 3、4 条，新建 app/api/reservations.py 与 app/services/reservations.py，
+      在 app/main.py 挂路由。规则用 CORE-TASK-036 的 app/domain/reservations.py，表用 CORE-TASK-037 的 app/models/orders.py；
+      require_live、require_skus_exist、lock_balances、require_not_merged、append_entry 用 app/services/stock.py；写命令经 app/services/idempotency.py 的 run_idempotent，
+      传 balance_rows（凭据入口的池与各 sku_id）与 read_committed=True；池用 app/api/auth.py 的 require_sales_pool。
+      一，配置：app/config.py 加 reservation_ttl_seconds（环境变量 CORE_RESERVATION_TTL_SECONDS，默认 900），用 parse_ttl_seconds 校验，不合格时 Settings 构造失败；
+      .env.example 与 docker-compose.yml 写上这一项与默认值；create_app 在进程日志写一行当前值。
+      二，POST /v1/reservations（操作类型 reservations.create，scope orders.write，不要求角色，操作者头带了照常校验并记录）：正文只有 order_ref 与 lines
+      （1 到 100 个，批量数组，超过 413；每项只有 line_ref、sku_id、quantity，quantity 为 1 到 1000000 的 JSON 整数）；未知字段、引用格式不对、line_ref 重复、sku_id 重复都 422。
+      三，命令按契约 5.6 的七步：普通读按 (tenant_id, channel_id, order_ref) 查预留，有则摘要相同 200 与当前表示、不同 409 ORDER_REFERENCE_CONFLICT（details 为 ref_type order 与 ref）并记 business_ref_conflict；
+      然后 require_live、require_skus_exist、升序锁余额行、按 sku_id 升序 FOR SHARE 读 SKU 行与按 product_id 升序 FOR SHARE 读商品行判已合并（SKU_MERGED）与停用（SKU_INACTIVE，details.sku_ids 按请求顺序列全）、
+      find_shortfalls 判可售（INSUFFICIENT_STOCK，details.lines）；都通过则 created_at 取一次数据库时间，写预留行、订单行与每行一条 RESERVE 流水（source_type reservation、source_ref 为 order_ref、line_ref、reason_code 为空）；201 返回表示。
+      第 2 到 6 步得出业务拒绝时，在同一事务里再用普通读查一次 order_ref（READ COMMITTED 下看得到已提交的那一条）：查到则 raise BusinessRefTaken，按第 1 步重新判定；
+      查不到则照常抛出原来的拒绝，第 3 步登记的 cross_tenant 事件保留。插入撞 (tenant_id, channel_id, order_ref) 唯一约束同样走 BusinessRefTaken。
+      四，表示照 5.6：reservation_id、order_ref、pool_id、status（用 displayed_status，已到期的 active 显示 expired）、expires_at、created_at、released_at 与 release_reason（只在 released 时有值）、lines 按 line_ref 升序。
+      五，查询（scope orders.read）：GET /v1/reservations/{reservation_id}，不存在或属于别的租户 404 RESERVATION_NOT_FOUND，后者记 cross_tenant；
+      GET /v1/reservations?order_ref=…，按凭据的销售入口查，返回 reservations 数组 0 或 1 个，凭据没有入口时为空数组，order_ref 缺少或格式不对 422。
+      明确不做：释放、到期关单、定时任务与新预留之前的关单（CORE-TASK-039）；可售量查询（CORE-TASK-040）；确认销售。
+    status: ready
+    depends_on:
+      - CORE-TASK-036
+      - CORE-TASK-037
+    acceptance_criteria:
+      - 接口在 app/api/reservations.py，命令与表示在 app/services/reservations.py，路由在 app/main.py 挂上；配置项在 app/config.py，.env.example 与 docker-compose.yml 已写上
+      - 集成测试验证成功路径：201 的表示字段齐全，expires_at 等于 created_at 加配置的有效期；余额 reserved 按行增加；每行一条 RESERVE 流水，来源字段与 reason_code 照契约；同键重放原样返回且带 Idempotency-Replayed
+      - 集成测试验证拒绝：缺货 409 INSUFFICIENT_STOCK 且 details.lines 列全；SKU 停用、所属商品停用 409 SKU_INACTIVE；已合并 409 SKU_MERGED；SKU 不存在或属于别的租户 404；池未上线 409 POOL_NOT_LIVE；凭据没有销售入口 403；被拒后没有预留、订单行与流水，换新幂等键同一 order_ref 在补货后可以成功
+      - 集成测试验证正文：sku_id 重复、line_ref 重复、quantity 为 0 或布尔或字符串、未知字段都 422；101 行 413
+      - 集成测试验证业务引用：换键同内容 200 与当前表示；换键不同内容 409 ORDER_REFERENCE_CONFLICT 并写 business_ref_conflict 事件；先用一个键预留成功、再用另一个键以同内容在库存已不够时重报，得到 200 与第一次的预留而不是 INSUFFICIENT_STOCK
+      - 集成测试验证查询：按 ID 与按 order_ref 都返回表示，expires_at 已过的 active 显示 expired；别的租户的 ID 404 并记 cross_tenant；没有入口的凭据按 order_ref 查为空数组
+      - 集成测试验证配置：CORE_RESERVATION_TTL_SECONDS 为 59、3601 或非整数时 Settings 构造失败；不设时为 900
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/reservations.py
+      - app/services/reservations.py
+      - app/main.py
+      - app/config.py
+      - .env.example
+      - docker-compose.yml
+      - tests/integration/test_reservations_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-039
+    title: 实现预留的释放与到期关闭
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.12 的 5.6（释放、到期关闭、隔离级别、锁序、订单行的 sku_id）与 5.2 第 4 条，在 CORE-TASK-038 的 app/api/reservations.py 与
+      app/services/reservations.py 上加释放命令、到期关单、定时任务与新预留之前的关单。规则用 app/domain/reservations.py 的 release_decision、is_due。
+      一，到期关单 close_if_due：FOR UPDATE 读预留行，不是 active 或未到期什么也不做；否则 FOR SHARE 读订单行，按读到的 sku_id 升序锁余额行，每行一条 RELEASE
+      （reason_code expired，不带凭据、幂等键、操作者与请求 ID，channel_id 取预留的入口，每次关单一个新的 command_id），预留改为 expired、记 closed_at。它在调用方给的事务里运行，自己不提交。
+      二，POST /v1/reservations/{reservation_id}/release（操作类型 reservations.release，scope orders.write，不要求角色）：正文只有 reason（三个取值之一），其他 422。
+      池授权用 app/api/auth.py 的 require_object_pool（对象类型 reservation，404 RESERVATION_NOT_FOUND），经 run_idempotent，read_committed=True，不传 balance_rows（订单行的余额行在预留时已建好）。
+      命令 FOR UPDATE 读预留行后按 release_decision：RELEASE 时 FOR SHARE 读订单行、升序锁余额行、每行一条 RELEASE（reason_code 为请求的 reason），预留改为 released，记 release_reason、closed_at 与 released_ 一组列，200；
+      EXPIRE 时在同一事务里按第一点关单，200，表示为 expired；UNCHANGED 不写任何东西，200 与当前表示；CONFLICT 为 409 STATE_CONFLICT。
+      三，执行器钩子：app/services/idempotency.py 的 run_idempotent 加一个可选参数，在设好 READ COMMITTED 之后、开业务事务之前在同一连接上调用；不传的命令行为不变。
+      新预留用它做契约 5.6 的先关到期：用普通读查出所列 SKU 上 active 且已到期的预留（按 expires_at 升序最多 100 个），逐个在各自的事务里调用 close_if_due 并提交；某个出错记进程日志、回滚它、继续下一个。
+      四，定时任务：app/main.py 的 lifespan 再起一个 app/services/periodic.py 的 PeriodicTask，间隔 30 秒、首次等 30 秒，与安全事件清理并列，退出时一并停止；
+      每次用普通读查 active 且已到期的预留，按 expires_at 升序逐个在各自的事务里关单；连接用 SQLAlchemy 的 execution_options(isolation_level 为 READ COMMITTED)，归还连接池时隔离级别自动复原；
+      一个出错记进程日志、继续下一个。
+      明确不做：确认销售与晚到支付；SKU 合并之前的关单（登记合并任务时做）；可售量查询（CORE-TASK-040）。
+    status: ready
+    depends_on:
+      - CORE-TASK-038
+    acceptance_criteria:
+      - 释放接口与命令加在 app/api/reservations.py 与 app/services/reservations.py；执行器钩子在 app/services/idempotency.py，不传时已有命令的测试照常通过；定时任务在 app/main.py 的 lifespan 起停
+      - 集成测试验证释放：active 未到期释放后 reserved 按行减回、每行一条 RELEASE 且 reason_code 为请求的 reason、表示为 released 并带 released_at 与 release_reason；再释放（含换原因、换键）200 不写流水、原因不变；已到期未关的 active 释放后为 expired、流水 reason_code 为 expired 且不带凭据与请求 ID；状态为 committed 的预留 409 STATE_CONFLICT（测试直接把行改成 committed）
+      - 集成测试验证释放的池授权与正文：别的租户的 reservation_id 404 RESERVATION_NOT_FOUND 并记 cross_tenant；凭据没有入口 403；reason 缺少或不在三个取值里 422
+      - 集成测试验证到期关单：直接调用关单函数，已到期的关一次、写对流水、预留为 expired；再调一次什么也不写；未到期的不动；两个连接并发对同一预留关单只写一组 RELEASE
+      - 集成测试验证新预留之前的关单：一个已到期未关的预留占着某 SKU 的全部可售量时，对该 SKU 的新预留成功，且旧预留已关为 expired
+      - 集成测试验证定时任务的单次扫描函数：关掉全部已到期的 active，不碰未到期与非 active 的；扫描用过的连接放回池后隔离级别为默认值
+      - 集成测试验证合并改挂的读取：把订单行的 sku_id 改成另一个 SKU 并把 reserved 挪过去（模拟合并）后，释放减的是新 SKU 的 reserved
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/reservations.py
+      - app/services/reservations.py
+      - app/services/idempotency.py
+      - app/main.py
+      - tests/integration/test_reservation_release_api.py
+      - tests/integration/test_reservation_expiry.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-040
+    title: 实现按销售入口取池的可售量查询
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.12 的 5.6 可售量、6.2 第 1 条与 10 第 4 条，在 app/api/stock_queries.py 与 app/services/stock_queries.py 加 GET /v1/availability。
+      状态先后用 CORE-TASK-036 的 availability_status；sku_ids 的解析沿用 app/domain/stock.py 的 parse_sku_ids（1 到 100 个、逗号分隔、重复 422）。
+      一，scope stock.read，不要求角色；池取凭据的销售入口，用 app/api/auth.py 的 require_sales_pool，凭据没有入口（或入口停用）时 403 并记 forbidden 事件。
+      二，只做普通读、不加锁：返回 pool_id、pool_status 与按 sku_id 升序的 skus；每项 sku_id、available（stock_balance 减 reserved 减 unavailable，没有余额行为 0）、
+      status（merged、inactive 或 sellable）与 merged_into_sku_id（只在 merged 时有值）。不属于本租户的 SKU 不出现，也不报错。
+      明确不做：预留与释放（CORE-TASK-038、039）；不改余额与流水查询的已有行为。
+    status: ready
+    depends_on:
+      - CORE-TASK-036
+    acceptance_criteria:
+      - 接口加在 app/api/stock_queries.py，查询加在 app/services/stock_queries.py；已有的余额、流水与池查询测试照常通过
+      - 集成测试验证返回：pool_id 与 pool_status 正确；available 按余额行计算，没有余额行的为 0；按 sku_id 升序；别的租户的 SKU 不出现
+      - 集成测试验证状态：已合并的 SKU 报 merged 并带 merged_into_sku_id；SKU 停用、所属商品停用都报 inactive；其余 sellable
+      - 集成测试验证拒绝：凭据没有销售入口 403 并写 forbidden 事件；缺 stock.read 403；sku_ids 缺少、超过 100 个或有重复 422
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/stock_queries.py
+      - app/services/stock_queries.py
+      - tests/integration/test_availability_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
