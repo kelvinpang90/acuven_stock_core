@@ -75,17 +75,29 @@ jobs:
       - name: Install
         run: python -m pip install --disable-pip-version-check -e ".[dev]"
 
+      # 第二个库给标记为 production 的迁移与约束测试用（契约 6.1，CORE-TASK-033）：ci 用户只有 ci 库的权限，用 root 建库并授权。
+      - name: Production test database
+        run: >-
+          python -I -c "import pymysql;
+          c = pymysql.connect(host='127.0.0.1', user='root', password='ci');
+          k = c.cursor();
+          k.execute('CREATE DATABASE ci_production');
+          k.execute(\"GRANT ALL ON ci_production.* TO 'ci'@'%'\")"
+
       # 与 .platform/commands.yaml 的 tests.integration 参数逐字相同。连接串只指向上面的 CI 服务容器。
       - name: Integration tests (tests.integration)
         env:
           CORE_TEST_DATABASE_URL: mysql+pymysql://ci:ci@127.0.0.1:3306/ci
+          CORE_TEST_PRODUCTION_DATABASE_URL: mysql+pymysql://ci:ci@127.0.0.1:3306/ci_production
         run: python -I -m pytest
 
       # 对真 MySQL 跑迁移，再降到底、升回来，最后 alembic check 比对模型与迁移：
       # 迁移在 MySQL 上不成立、downgrade 没写对、模型改了迁移漏写，都在合并前失败。
+      # 0006 起迁移要求 CORE_ENV，并在已有实例标记时核对它（契约 6.1）；往返全程用 demo。
       - name: Migrations round-trip on MySQL
         env:
           CORE_DATABASE_URL: mysql+pymysql://ci:ci@127.0.0.1:3306/ci
+          CORE_ENV: demo
         run: |
           alembic upgrade head
           alembic downgrade base
