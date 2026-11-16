@@ -1582,7 +1582,7 @@ tasks:
       不执行命令也不写安全事件；--help 与参数错误在连库之前就结束，不做核对。
       四，测试：tests/integration/conftest.py 加一个上下文管理器，临时把测试库 core_instance 的 core_env 改成给定值并提交，退出时改回 demo；
       tests/integration/test_cli_service_auth.py 的 production_cli 在这个上下文里运行，生产拒签 demo.reset 的两个测试照旧通过；
-      不带数据库或连不上数据库创建应用的测试（tests/integration/test_health_api.py、test_api_requests.py、test_security_event_purge.py 里的）改为
+      不带数据库或连不上数据库创建应用的测试（tests/integration/test_health_api.py、test_api_requests.py、test_security_event_purge.py、test_api_auth.py 里的，后者是数据库连不上或为空时逐请求得 503 或 401 的几个测试）改为
       连测试库，或改为断言创建应用以 SystemExit 失败，不改它们原本验证的其他内容。
       明确不做：迁移与迁移前核对（CORE-TASK-033）、重置命令（CORE-TASK-035）；不改 CORE_ENV 的解析与健康检查的响应。
     status: ready
@@ -1605,6 +1605,7 @@ tasks:
       - tests/integration/test_health_api.py
       - tests/integration/test_api_requests.py
       - tests/integration/test_security_event_purge.py
+      - tests/integration/test_api_auth.py
     allowed_commands:
       - tests.unit
       - lint.check
