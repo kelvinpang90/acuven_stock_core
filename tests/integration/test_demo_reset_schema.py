@@ -12,6 +12,7 @@ from datetime import date
 
 import pytest
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import Connection, Engine, delete, insert, inspect, select, text, update
 from sqlalchemy.sql.expression import Executable
 
@@ -20,6 +21,7 @@ from app.domain.environment import DEMO, PRODUCTION, InstanceMismatch
 from app.models.instance import CoreInstance
 from app.models.inventory import DemoReset
 from tests.integration.conftest import (
+    ROOT,
     TEST_PRODUCTION_DATABASE_URL,
     add_balance,
     add_channel,
@@ -186,8 +188,15 @@ def has_table(engine: Engine, table: str) -> bool:
     return inspect(engine).has_table(table)
 
 
+def head_revision() -> str:
+    """迁移脚本目录的当前 head：以后再加迁移不用改这里的断言。"""
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    return ScriptDirectory.from_config(config).get_current_head()
+
+
 def assert_production_head(engine: Engine) -> None:
-    assert alembic_version(engine) == "0006"
+    assert alembic_version(engine) == head_revision()
     with engine.connect() as conn:
         assert marker_rows(conn) == [(1, PRODUCTION)]
     assert has_table(engine, "demo_resets")
@@ -232,7 +241,7 @@ def test_migrating_fails_when_the_marker_table_has_no_row(production_engine: Eng
     try:
         with pytest.raises(InstanceMismatch):
             migrate_production(command.upgrade, "head", PRODUCTION)
-        assert alembic_version(production_engine) == "0006"
+        assert alembic_version(production_engine) == head_revision()
     finally:
         with production_engine.begin() as conn:
             conn.execute(insert(CoreInstance).values(singleton=1, core_env=PRODUCTION))
