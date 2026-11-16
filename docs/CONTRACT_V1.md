@@ -207,7 +207,7 @@ stateDiagram-v2
   点数前的实物进出须先入账，规则同 §6。只有重新点过实物时才重新录入，后一次覆盖前一次的实数与快照。
 - **执行（`execute`）**：第 0 步的关单在开事务之前；之后的检查与第 1–3 步在 Core 的**一个事务**里，两个余额行按 `(pool_id, sku_id)` 升序加锁
   （0.12：要改挂订单行，所以锁余额行之前先按 `reservation_id` 升序锁住涉及的预留行，再按 §5.6 的锁序锁订单行与余额行，细节在登记合并任务前定。0.13：用普通读找出的预留名单，在等余额行期间可能漏掉并发提交的故障补交新建的订单行（§5.7 第 5 步），
-  所以合并的业务事务以 READ COMMITTED 开启，锁住余额行之后用普通读复核两个 SKU 上属于第 1 步四种状态的预留的订单行（REPEATABLE READ 下会漏看刚提交的行），多出名单的就回滚重来（次数上限由合并任务定）；
+  所以合并的业务事务以 READ COMMITTED 开启，锁住余额行之后用普通读复核来源 SKU 上属于第 1 步四种状态的预留的订单行（规范 SKU 上的订单行不用改挂，不在名单里，也不复核）（REPEATABLE READ 下会漏看刚提交的行），多出名单的就回滚重来（次数上限由合并任务定）；
   名单里的预留在锁住时已变成 `released`、`closed_refunded` 的，按锁住时的状态不改挂。名单含来源 SKU 上全部历史 `committed` 预留，会随时间增长，由合并任务估量；
   不能在锁住余额行之后再去锁新的预留行，那与“预留行 → 余额行”的锁序相反；也不能在锁余额行之前锁 SKU 行，否则与故障补交新建“余额行 → SKU 行”成环）：
   0. **前置检查**：开业务事务之前（§2.7 的先后里余额行预建之后），按 §5.6 的到期关闭把两个 SKU 上已到期的 `active` 预留逐个关掉，每个一个事务（0.12：不在锁住余额行之后关单，否则与释放、到期关单“预留行 → 余额行”的锁序成环）；
@@ -544,7 +544,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
   所属的池不是获准的池 403。这一步在取幂等锁之前，判出的 404、403 不保存。
 - 锁序：预留行（`FOR UPDATE`）→ 订单行（`FOR SHARE`）→ 池行（`FOR SHARE`）→ 余额行（`FOR UPDATE`，按 §8.1 升序）→ SKU 行（`FOR SHARE`，按 `sku_id` 升序）→ 商品行（`FOR SHARE`，按 `product_id` 升序）；
   命令用不到的那一层跳过。本节的命令一个事务最多锁一个预留行；以后的命令要锁多个时按 `reservation_id` 升序。
-- **隔离级别**：本节的写事务——预留、释放与所有到期关单的事务（定时任务、新预留之前、确认销售之前〔0.13〕、SKU 合并执行之前的关单）——都以 READ COMMITTED 开启（同盘点的提交与确认）。
+- **隔离级别**：本节的写事务——预留、释放与所有到期关单的事务（定时任务、新预留之前、确认销售之前〔0.13〕、SKU 合并执行之前的关单）——都以 READ COMMITTED 开启（同盘点的提交与确认）；确认销售、待审结案与 SKU 合并执行的业务事务也是（0.13，§5.7、§2.4）。
   不经幂等执行器的事务（定时任务的关单）用完要把连接的隔离级别复原再放回连接池，复原出错就作废这个连接，否则之后从池里取到它的命令会悄悄跑在 READ COMMITTED 下。
   原因：REPEATABLE READ 下按 `(tenant_id, reservation_id)` 加锁读订单行是范围扫描，会连同最后一行之后的间隙一起锁住；`reservation_id` 按时间递增，
   新预留的订单行正好插在那段间隙里，于是“新预留锁住余额行、插订单行被间隙锁挡住”与“释放锁住订单行间隙、再等余额行”成环。
@@ -617,7 +617,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
 - `reservation_id`（前缀 `rsv_`）、`order_ref`、`pool_id`、`status`、`expires_at`、`created_at`，以及只在 `released` 时有值的 `released_at` 与 `release_reason`（其他状态为 `null`）；
 - `status` 取值 `active`、`released`、`expired`、`committed`、`late_payment_review`、`closed_refunded`（后三种见 §5.7，表示另加的字段也见 §5.7）；`expired` 的时间就是 `expires_at`，所以关单前后表示相同；
 - `lines`：按 `line_ref` 升序，每行 `line_ref`、`sku_id`、`quantity`。订单行的累计量（§5.1）由订单库存查询（§5.4）返回，在登记它的任务里定。
-  SKU 合并改挂之后，`sku_id` 显示规范 SKU。网店按原 SKU 确认时按合并去向比对（§5.7，Q-59）。
+  SKU 合并改挂之后，`sku_id` 显示规范 SKU（`released`、`closed_refunded` 的订单行不改挂，仍显示原 SKU，§2.4）。网店按原 SKU 确认时按合并去向比对（§5.7，Q-59）。
 
 **查询**（`orders.read`）
 - `GET /v1/reservations/{reservation_id}`：不存在或属于别的租户 404 `RESERVATION_NOT_FOUND`，属于别的租户的记 `cross_tenant`（§7.2）。
@@ -685,10 +685,11 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
   2. `FOR UPDATE` 按 `(tenant_id, channel_id, order_ref)` 读预留行。
      - **没有**：`reservation_id` 不为 `null` 时 404 `RESERVATION_NOT_FOUND`（不按这个 ID 另查，不记事件）；为 `null` 时转第 5 步（故障补交新建）；
      - **有**：`reservation_id` 不为 `null` 且与它不同，409 `RESERVATION_MISMATCH`，`details` 为 `{"reason": "reservation_id"}`；`null` 视为同一个。
-  3. 行集比对（§5.2 第 5 条）：`FOR SHARE` 读订单行，之后再查请求 SKU 的合并去向（加锁读会等正在改挂订单行的合并提交，之后的普通读看得到它改的 SKU 行）。请求的 `line_ref` 集合与订单行的相同，且每行 `quantity` 相同、请求 `sku_id` 的合并去向等于订单行 `sku_id` 的合并去向，才算一致（Q-59；订单行一般已改挂到规范 SKU，`released`、`closed_refunded` 的不改挂，比对两边都取去向，它们照样走到第 4 步报 `STATE_CONFLICT`）；请求的 `sku_id` 不存在或属于别的租户时没有合并去向，算这一行不一致（不另报 `SKU_NOT_FOUND`，不记事件：比对的对象是本订单已有的行）；
+  3. 行集比对（§5.2 第 5 条）：`FOR SHARE` 读订单行，之后再查请求 SKU 的合并去向（加锁读会等正在改挂订单行的合并提交，之后的普通读看得到它改的 SKU 行）。请求的 `line_ref` 集合与订单行的相同，且每行 `quantity` 相同、请求 `sku_id` 的合并去向等于订单行 `sku_id` 的合并去向，才算一致（Q-59；`active`、`expired`、`late_payment_review`、`committed` 的订单行一定已改挂到规范 SKU，`released`、`closed_refunded` 的一定不改挂；比对两边都取去向，后两种照样走到第 4 步报 `STATE_CONFLICT`）；请求的 `sku_id` 不存在或属于别的租户时没有合并去向，算这一行不一致（不另报 `SKU_NOT_FOUND`，不记事件：比对的对象是本订单已有的行）；
      否则 409 `RESERVATION_MISMATCH`，`details` 为 `{"reason": "lines", "line_refs": [...]}`，按升序列出不一致的、请求里多出的与缺少的 `line_ref`。
-     第 2、3 步要报 `RESERVATION_MISMATCH` 之前，先用普通读重做第 1 步（READ COMMITTED 下看得到第 1 步之后才并发提交的确认）：命中“别的订单”或“本订单已 `committed`”就按第 1 步回答，
-     让并发与先后到达的同一 `payment_ref` 得到相同的结果（同 §5.6 并发重报）。
+     **报业务拒绝之前重查业务引用**：第 2–5 步要报不写东西的业务拒绝（404、`RESERVATION_MISMATCH`、`STATE_CONFLICT`、`POOL_NOT_LIVE`）之前，在同一事务里用普通读重做第 1 步
+     （READ COMMITTED 下看得到第 1 步之后才并发提交的确认；不回滚，不计入“重新判定”的一次）：命中“别的订单”或“本订单已 `committed`”就按第 1 步回答，
+     让并发与先后到达的同一 `payment_ref` 得到相同的结果；没命中才报原来的拒绝。`LATE_PAYMENT_INSUFFICIENT_STOCK` 不在此列（它写入状态变化，且第 1 步已在锁内之前查过）。
   4. 写入的分支（正常确认、晚到确认、关单）先 `FOR SHARE` 读池行（排在余额行之前，§5.6 锁序；预留建立时池已 `live`，池不会退回 `initializing`），再按预留状态：
      - `active` 且现在早于 `expires_at`：**正常确认**。按 §8.1 升序锁住各行 SKU 的余额行，每行写一条 `SALE_COMMIT`（`stock_balance`、`reserved` 各减该行 `quantity`，`paid_pending_dispatch` 加），
        订单行 `committed_qty` 设为 `quantity`，预留改为 `committed`，记下确认的各列（见存放），`late` 为 `false`。200，返回表示；
@@ -1816,5 +1817,8 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 §2.4 合并复核订单行用 READ COMMITTED 普通读、重来次数由合并任务定、不在锁余额行前锁 SKU 行；第 2、3 步报 `RESERVATION_MISMATCH` 前先看已 `committed` 且同 `payment_ref` 的；变更记录补 §2.4；列类型那句挪到清单之后。
 
 第四轮复审（提交 `09041d0`）结论为通过，另有非阻塞 7 条，都已改：行集比对两边都取合并去向（合并后已释放、已结案订单的付款仍报 `STATE_CONFLICT`，与 Q-57 一致）；
-报 `RESERVATION_MISMATCH` 前用普通读重做第 1 步（跨订单同一 `payment_ref` 的错误码不随时序变化）；新加的重判情形只在判可售时检查；
+报 `RESERVATION_MISMATCH` 前用普通读重做第 1 步；新加的重判情形只在判可售时检查；
 §2.4 合并以 READ COMMITTED 开启、复核按四种状态过滤、按锁住时的状态判、名单随时间增长留给合并任务估量，第 1 步合成一句；§7.1 措辞。
+
+第五轮复审（提交 `3fb3aee`）结论为通过，另有非阻塞 5 条，都已改：§2.4 合并只复核来源 SKU 上的订单行；报业务拒绝前重查业务引用扩到第 2–5 步全部不写东西的拒绝，
+写明在同一事务里查、不回滚、不计入重新判定；第 3 步写准哪些订单行一定改挂、§5.6 表示补上未改挂的仍显示原 SKU；§5.6 隔离级别一条列上确认销售、待审结案与合并执行的业务事务。
