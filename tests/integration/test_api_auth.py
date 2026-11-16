@@ -34,6 +34,7 @@ from app.api.auth import (
 from app.api.errors import ok
 from app.api.requests import ParsedBody, RequestBody, json_body, no_body, request_connection
 from app.config import Settings
+from app.db import make_engine
 from app.domain.requests import CATALOG_ADMIN, STOCK_ADMIN, STOCK_OPERATOR, Actor
 from app.domain.service_auth import (
     CATALOG_READ,
@@ -441,12 +442,15 @@ def test_revocation_takes_effect_on_the_next_request(client, engine):
 
 
 @pytest.fixture
-def unreachable_client() -> Iterator[TestClient]:
-    """连一个连不上的库：同一台 MySQL 的一个没人监听的端口。"""
-    if not TEST_DATABASE_URL:
-        pytest.skip("CORE_TEST_DATABASE_URL not set (CI only)")
+def unreachable_client(migrated_engine: Engine) -> Iterator[TestClient]:
+    """运行中连不上库：对测试库创建应用（启动核对要求能读到标记），
+
+    再把引擎换成连同一台 MySQL 的一个没人监听的端口的。
+    """
+    test_client = make_client(TEST_DATABASE_URL)
+    dispose(test_client)
     url = make_url(TEST_DATABASE_URL).set(port=1)
-    test_client = make_client(url.render_as_string(hide_password=False))
+    test_client.app.state.engine = make_engine(url.render_as_string(hide_password=False))
     try:
         yield test_client
     finally:
@@ -465,11 +469,11 @@ def test_a_missing_header_is_still_401_when_the_event_cannot_be_written(unreacha
     assert error_of(response, 401) == EXPECTED_401
 
 
-def test_authentication_is_503_without_a_configured_database():
-    test_client = make_client("")
-    headers = {"Authorization": f"Bearer {generate_token()}"}
-    error = error_of(test_client.get("/test/items/item-1", headers=headers), 503)
-    assert error["code"] == "UNAVAILABLE"
+def test_the_app_refuses_to_start_without_a_configured_database():
+    # 连接串必填（契约 6.1 启动核对）：不再有逐请求回 503 的未配置状态。
+    with pytest.raises(SystemExit) as exited:
+        make_client("")
+    assert exited.value.code == 1
 
 
 # --- scope（第 5 步） ---

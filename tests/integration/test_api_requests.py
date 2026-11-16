@@ -1,22 +1,26 @@
 """共用请求处理（契约 §8.1 检查顺序第 1、2、3、7 步，§8.3 错误封装）。
 
-不需要数据库：测试给 create_app 返回的应用挂测试专用路由。
+测试给 create_app 返回的应用挂测试专用路由。测试路由不用数据库，
+但应用要连测试库创建：启动核对要求库里的实例标记与 CORE_ENV 一致（契约 6.1）。
 """
 
 import json
 import logging
 import re
+from collections.abc import Iterator
 from typing import Annotated
 
 import pytest
 from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine
 
 from app.api.errors import ApiError, ok
 from app.api.requests import ParsedBody, RequestBody, json_body, no_body
 from app.config import Settings
 from app.main import create_app
+from tests.integration.conftest import TEST_DATABASE_URL
 
 GENERATED_ID = re.compile(r"req_[0-9A-HJKMNP-TV-Z]{26}")
 JSON = {"Content-Type": "application/json"}
@@ -40,8 +44,8 @@ CommandBody = Annotated[ParsedBody[Command], Depends(json_body(Command))]
 
 
 @pytest.fixture
-def client() -> TestClient:
-    app = create_app(Settings(env="demo", git_sha="b" * 40, database_url=""))
+def client(migrated_engine: Engine) -> Iterator[TestClient]:
+    app = create_app(Settings(env="demo", git_sha="b" * 40, database_url=TEST_DATABASE_URL))
 
     @app.get("/test/echo")
     def echo(request: Request) -> JSONResponse:
@@ -64,7 +68,10 @@ def client() -> TestClient:
         headers = {"Retry-After": "1"}
         raise ApiError(409, "REQUEST_IN_PROGRESS", "in progress", retryable=True, headers=headers)
 
-    return TestClient(app)
+    try:
+        yield TestClient(app)
+    finally:
+        app.state.engine.dispose()
 
 
 def lines(count: int) -> list[dict]:
@@ -114,8 +121,8 @@ def test_healthz_ignores_an_invalid_request_id_and_keeps_its_body(client):
 
 def test_readyz_ignores_an_invalid_request_id_and_keeps_its_body(client):
     response = client.get("/readyz", headers={"X-Request-ID": "has space"})
-    assert response.status_code == 503
-    assert response.json() == {"status": "unavailable", "reason": "database_not_configured"}
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
     assert GENERATED_ID.fullmatch(response.headers["X-Request-ID"])
 
 

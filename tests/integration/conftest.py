@@ -1,12 +1,13 @@
 import os
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import Connection, Engine, insert
+from sqlalchemy import Connection, Engine, insert, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql.expression import Executable
 
@@ -14,6 +15,7 @@ from alembic import command
 from app.db import make_engine
 from app.domain.environment import DEMO, PRODUCTION
 from app.models.catalog import Product, Sku, Tenant
+from app.models.instance import CoreInstance
 from app.models.inventory import LedgerEntry, Location, SalesChannel, StockBalance, StockPool
 from app.models.service_auth import Credential
 
@@ -79,6 +81,22 @@ def production_engine() -> Iterator[Engine]:
     finally:
         engine.dispose()
         migrate(command.downgrade, "base", TEST_PRODUCTION_DATABASE_URL, PRODUCTION)
+
+
+@contextmanager
+def instance_marked(engine: Engine, core_env: str) -> Iterator[None]:
+    """临时把测试库 core_instance 的 core_env 改成给定值并提交，退出时改回 demo。
+
+    启动核对（契约 6.1）读的是已提交的标记，所以要提交；用完立刻退出，
+    同一测试里的 demo 进程（命令行、应用）才能照常通过核对。
+    """
+    with engine.begin() as conn:
+        conn.execute(update(CoreInstance).values(core_env=core_env))
+    try:
+        yield
+    finally:
+        with engine.begin() as conn:
+            conn.execute(update(CoreInstance).values(core_env=DEMO))
 
 
 # 下面是 schema 测试共用的：每个测试在一个事务里跑、结束时回滚；

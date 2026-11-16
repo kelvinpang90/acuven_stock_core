@@ -1,41 +1,61 @@
-import os
+from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine
+from sqlalchemy.exc import OperationalError
 
 from app.config import Settings
 from app.main import create_app
-
-# 只指向 CI 的一次性 MySQL 服务容器；本地没设时跳过需要数据库的那条。
-TEST_DATABASE_URL = os.environ.get("CORE_TEST_DATABASE_URL", "")
+from tests.integration.conftest import TEST_DATABASE_URL
 
 
-def client(**overrides: str) -> TestClient:
-    values = {"env": "demo", "git_sha": "b" * 40, "database_url": ""} | overrides
+def make_client(**overrides: str) -> TestClient:
+    values = {"env": "demo", "git_sha": "b" * 40, "database_url": TEST_DATABASE_URL} | overrides
     return TestClient(create_app(Settings(**values)))
 
 
-def test_healthz_reports_commit_and_environment_without_touching_the_database():
-    response = client(database_url="mysql+pymysql://nobody:x@127.0.0.1:1/none").get("/healthz")
+@pytest.fixture
+def client(migrated_engine: Engine) -> Iterator[TestClient]:
+    """连测试库创建的应用（启动核对要求库里的标记与 CORE_ENV 一致）。"""
+    test_client = make_client()
+    try:
+        yield test_client
+    finally:
+        test_client.app.state.engine.dispose()
+
+
+def refuse_connections(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    """应用已经启动之后，让它的引擎再也连不上数据库。"""
+
+    def connect():
+        raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+    monkeypatch.setattr(client.app.state.engine, "connect", connect)
+
+
+def test_healthz_reports_commit_and_environment_without_touching_the_database(client, monkeypatch):
+    refuse_connections(monkeypatch, client)
+    response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "commit": "b" * 40, "env": "demo"}
 
 
-def test_readyz_is_unavailable_when_no_database_is_configured():
-    response = client().get("/readyz")
-    assert response.status_code == 503
-    assert response.json()["reason"] == "database_not_configured"
+def test_the_app_refuses_to_start_when_no_database_is_configured():
+    with pytest.raises(SystemExit) as exited:
+        make_client(database_url="")
+    assert exited.value.code == 1
 
 
-def test_readyz_is_unavailable_when_the_database_cannot_be_reached():
-    response = client(database_url="mysql+pymysql://nobody:x@127.0.0.1:1/none").get("/readyz")
+def test_readyz_is_unavailable_when_the_database_cannot_be_reached(client, monkeypatch):
+    refuse_connections(monkeypatch, client)
+    response = client.get("/readyz")
     assert response.status_code == 503
     assert response.json()["reason"] == "database_unreachable"
 
 
-@pytest.mark.skipif(not TEST_DATABASE_URL, reason="CORE_TEST_DATABASE_URL not set (CI only)")
-def test_readyz_is_ok_against_a_real_database():
-    response = client(database_url=TEST_DATABASE_URL).get("/readyz")
+def test_readyz_is_ok_against_a_real_database(client):
+    response = client.get("/readyz")
     assert response.status_code == 200
 
 

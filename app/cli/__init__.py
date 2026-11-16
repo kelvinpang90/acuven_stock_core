@@ -11,7 +11,8 @@ set_defaults(handler=...)。handler 收到同一事务里的连接与解析好�
 退出码与输出约定：
 - 0：成功，向标准输出写一行 JSON；安全事件没写进去时另向标准错误写一行警告，操作照样算成功；
 - 2：参数或校验错误，向标准错误写一行说明；
-- 1：数据库未配置、连不上等其他失败，向标准错误写一行说明。
+- 1：数据库未配置、连不上、库里的实例标记与 CORE_ENV 不同等其他失败，向标准错误写一行说明。
+--help 与参数错误在连库之前就结束，不做实例标记的核对（契约 6.1）。
 所有说明都不含连接串、密码、堆栈与运维传入的参数值（误传的明文令牌不会被打出来）。
 """
 
@@ -31,6 +32,7 @@ from app.config import Settings
 from app.db import make_engine
 from app.models.catalog import Tenant
 from app.models.inventory import SalesChannel
+from app.services.instance import instance_check_error
 from app.services.security_events import SecurityEventRecord, record_security_event
 
 EXIT_OK = 0
@@ -156,6 +158,12 @@ def run_command(
         engine = make_engine(settings.database_url)
     except Exception:
         fail(stderr, "database configuration is invalid")
+        return EXIT_FAILURE
+    # 启动核对（契约 6.1）：库里的实例标记与 CORE_ENV 不同、或读不到时不执行命令，也不写安全事件。
+    error = instance_check_error(engine, settings.env)
+    if error is not None:
+        engine.dispose()
+        fail(stderr, error)
         return EXIT_FAILURE
     args.core_env = settings.env
     try:

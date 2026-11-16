@@ -21,6 +21,7 @@ from sqlalchemy.exc import OperationalError
 from app.api.auth import authorize, get_access
 from app.api.errors import ok
 from app.config import Settings
+from app.domain.environment import PRODUCTION
 from app.domain.service_auth import (
     CATALOG_READ,
     DEMO_RESET,
@@ -37,7 +38,7 @@ from app.models.inventory import SalesChannel
 from app.models.service_auth import Credential, CredentialToken, SecurityEvent
 from app.services import security_events
 from app.services.security_events import SecurityEventRecord, record_security_event
-from tests.integration.conftest import TEST_DATABASE_URL, new_id
+from tests.integration.conftest import TEST_DATABASE_URL, instance_marked, new_id
 from tests.integration.test_cli_provisioning import Provisioned, Result, create, provision, run_cli
 
 ACTOR = "ops-7"
@@ -69,7 +70,17 @@ def cli(migrated_engine: Engine) -> Callable[..., Result]:
 
 @pytest.fixture
 def production_cli(migrated_engine: Engine) -> Callable[..., Result]:
-    return cli_for("production")
+    """CORE_ENV 为 production 的命令行：每次调用期间把库标记为 production，调用结束即改回 demo。
+
+    启动核对（契约 6.1）要求两者一致；同一测试里还交替调 demo 的命令行。
+    """
+    run = cli_for("production")
+
+    def production(*argv: str) -> Result:
+        with instance_marked(migrated_engine, PRODUCTION):
+            return run(*argv)
+
+    return production
 
 
 @pytest.fixture
