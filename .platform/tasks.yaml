@@ -1585,7 +1585,7 @@ tasks:
       不带数据库或连不上数据库创建应用的测试（tests/integration/test_health_api.py、test_api_requests.py、test_security_event_purge.py、test_api_auth.py 里的，后者是数据库连不上或为空时逐请求得 503 或 401 的几个测试）改为
       连测试库：没配连接串的改为断言创建应用以 SystemExit 失败；验证运行中连不上数据库的（鉴权回 503 UNAVAILABLE、安全事件写不进时缺头仍回 401、readyz 回 database_unreachable）先对测试库创建应用，再让引擎连不上（换掉 app.state.engine，或 monkeypatch 引擎的 connect），断言照旧；不改它们原本验证的其他内容。app/config.py 里 database_url 的注释改为说明 API 必填；readyz 的 database_not_configured 分支随之删去。
       明确不做：迁移与迁移前核对（CORE-TASK-033）、重置命令（CORE-TASK-035）；不改 CORE_ENV 的解析与健康检查的响应。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-033
     acceptance_criteria:

@@ -26,8 +26,7 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-034` 让 API 与运维命令行启动时核对库里的实例标记
-2. `CORE-TASK-035` 实现 Demo 专用的每日重置命令
+1. `CORE-TASK-035` 实现 Demo 专用的每日重置命令
 
 ### 已阻塞
 
