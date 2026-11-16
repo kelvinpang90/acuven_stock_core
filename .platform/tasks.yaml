@@ -1805,11 +1805,11 @@ tasks:
       命令 FOR UPDATE 读预留行后按 release_decision：RELEASE 时 FOR SHARE 读订单行、升序锁余额行、每行一条 RELEASE（reason_code 为请求的 reason），预留改为 released，记 release_reason、closed_at 与 released_ 一组列，200；
       EXPIRE 时在同一事务里按第一点关单，200，表示为 expired；UNCHANGED 不写任何东西，200 与当前表示；CONFLICT 为 409 STATE_CONFLICT。
       三，执行器钩子：app/services/idempotency.py 的 run_idempotent 加一个可选参数，在设好 READ COMMITTED 之后、开业务事务之前在同一连接上调用；不传的命令行为不变。
-      新预留用它做契约 5.6 的先关到期：用普通读查出所列 SKU 上 active 且已到期的预留（按 expires_at 升序最多 100 个），逐个在各自的事务里调用 close_if_due 并提交；
+      新预留用它做契约 5.6 的先关到期：用普通读查出所列 SKU 上 active 且已到期的预留，只查凭据的租户、凭据入口的池（订单行与预留都按 tenant_id 与 pool_id 过滤，别的租户的 sku_id 不会关到别人的预留），按 expires_at 升序最多 100 个，逐个在各自的事务里调用 close_if_due 并提交；
       某个关单出错时回滚它、记进程日志、继续下一个；但连接已作废、回滚本身出错或连接断开时（这时幂等命名锁与 READ COMMITTED 都已不在），不再继续，整个请求 503 UNAVAILABLE，什么也不保存，同键可以重试。
       四，定时任务：app/main.py 的 lifespan 再起一个 app/services/periodic.py 的 PeriodicTask，间隔 30 秒、首次等 30 秒，与安全事件清理并列，退出时一并停止；
       每次用普通读查 active 且已到期的预留，按 expires_at 升序逐个在各自的事务里关单；连接用 SQLAlchemy 的 execution_options(isolation_level 为 READ COMMITTED)，归还连接池时隔离级别自动复原；
-      一个出错记进程日志、继续下一个。
+      一个关单出错时回滚它、记进程日志、继续下一个；连接已作废、回滚出错或连接断开时停止本轮扫描（不在新连接上接着关），下一轮重新取连接。
       明确不做：确认销售与晚到支付；SKU 合并之前的关单（登记合并任务时做）；可售量查询（CORE-TASK-040）。
     status: ready
     depends_on:
