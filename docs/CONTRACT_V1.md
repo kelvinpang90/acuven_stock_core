@@ -1,6 +1,8 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.11｜2026-11-16｜状态：**Kelvin 已批准**——第 14 节第 66–69 条（§6.1 Demo 每日重置的正文、判定顺序、表示与存放，
+> 版本：0.12｜2026-11-16｜状态：**Kelvin 已批准**——第 14 节第 70–76 条（§5.6 预留、释放、到期关闭与可售量查询的接口、判定顺序、表示与存放，
+> 预留有效期的配置，读接口不关单，§5.2 第 3、4 条、§5.1、§2.4 第 0 步、§2.7、§6.2 第 1 条、§8.2、§10 第 4 条的相应条目；取舍见 Q-53～Q-56）于 2026-11-16 批准。
+> 0.11：第 14 节第 66–69 条（§6.1 Demo 每日重置的正文、判定顺序、表示与存放，
 > 同日同池内容不同 409，库里的实例标记、启动核对与生产库的流水类型约束；取舍见 Q-50～Q-52）于 2026-11-16 批准。
 > 0.10：第 14 节第 65 条（§4.1 余额行加 `last_reconciled_version`，§6.7 的“已被吸收”改用它、不再把更正算作吸收，
 > §2.4、§6.1、§6.3、§6.6 的相应步骤；取舍见 Q-49）于 2026-11-15 批准。
@@ -18,7 +20,7 @@
 > 第 14 节第 18–23 条的 0.6 改动（§7.1 幂等的作用域、摘要、处理中判定与保存范围，§7.2 安全日志，§8.1 请求头与检查顺序，§8.3 新增 405，
 > §10 凭据、令牌、scope、角色表与池授权）
 > 与第 24–37 条（审查与设计预审后的修改；取舍见 Q-31～Q-35，含 §7.1 第 2 条追加的“换键重报返回对象当前的表示”）于 2026-11-13 批准。
-> 0.11 及以前的设计闸门通过；实现进度见 [TODO.md](TODO.md)。
+> 0.12 及以前的设计闸门通过；实现进度见 [TODO.md](TODO.md)。
 > 按模板规则：设计有改动时，改动部分的批准作废、须重新批准。
 > 依据：[REQUIREMENTS.md](../REQUIREMENTS.md)（Core V1 需求，2026-10-08）、`acuven_hub/DECISIONS.md` 的 C-01～C-19、S-01～S-10、I-02、I-04，
 > 以及 `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md`（Inventory 草案，只读参照）。
@@ -200,8 +202,10 @@ stateDiagram-v2
 - **录入实数（`count`）**：两个 SKU 是同一种实物，运营人员（`stock_operator` 或 `stock_admin`，§10 第 3 条）录**合计**的两项实数——在架件数（含已付款待发的件）与不可售件数，
   都是不小于 0 的整数，否则 422。Core 在同一事务里按 `(pool_id, sku_id)` 升序锁两个余额行（某个 SKU 在该池还没有余额行时，照 §4.1 先建好，四个量为 0、版本 0），记下它们当时的四个账面量与 `balance_version` 作为**快照**。
   点数前的实物进出须先入账，规则同 §6。只有重新点过实物时才重新录入，后一次覆盖前一次的实数与快照。
-- **执行（`execute`）**，在 Core 的**一个事务**里，两个余额行按 `(pool_id, sku_id)` 升序加锁：
-  0. **前置检查**：先按 §5.2 第 4 条把两个 SKU 上已到期的 `active` 预留转 `expired`。再查快照之后两个 SKU 上有没有 §6 定义的**只改账的流水**（看锁住的余额行上的 `last_book_only_version` 是否大于快照版本，§4.1，0.9）；
+- **执行（`execute`）**：第 0 步的关单在开事务之前；之后的检查与第 1–3 步在 Core 的**一个事务**里，两个余额行按 `(pool_id, sku_id)` 升序加锁
+  （0.12：要改挂订单行，所以锁余额行之前先按 `reservation_id` 升序锁住涉及的预留行，再按 §5.6 的锁序锁订单行与余额行，细节在登记合并任务前定）：
+  0. **前置检查**：开业务事务之前（§2.7 的先后里余额行预建之后），按 §5.6 的到期关闭把两个 SKU 上已到期的 `active` 预留逐个关掉，每个一个事务（0.12：不在锁住余额行之后关单，否则与释放、到期关单“预留行 → 余额行”的锁序成环）；
+     开事务之后才到期的预留随订单行一起迁到规范 SKU，之后照常关单。再查快照之后两个 SKU 上有没有 §6 定义的**只改账的流水**（看锁住的余额行上的 `last_book_only_version` 是否大于快照版本，§4.1，0.9）；
      有则录入的实数已作废，整笔拒绝，409 `COUNT_STALE`，合并单留在 `counted`，须重新点数、重新录入。
   1. **整行迁移**：来源 SKU **执行时**的四个账面量全部转到规范 SKU——来源写 `MERGE_TRANSFER_OUT`（四个量各减去当前值，归零），
      规范写 `MERGE_TRANSFER_IN`（各加同样的量），成对出现；来源的未结预留、订单行累计量同时改挂到规范 SKU。
@@ -335,7 +339,7 @@ V1 用拉取，不做推送（Q-08）。
   不锁租户行：幂等记录、流水、余额等表都有外键指向 `tenants`，插入时对租户行加共享锁，锁租户行会让目录命令与本租户的全部写命令互相阻塞，
   锁序与销售命令相反时还会死锁。命名锁不是 InnoDB 行锁，不受外键影响；取它时还没开事务、不持有任何行锁，所以不会与行锁形成环。
   既写目录又锁余额行的命令（SKU 合并）照此先取目录写锁，开事务后再按 §8.1 的顺序锁余额行。批量导入的预览不写目录，不取这个锁。
-  开事务前的先后固定为：幂等锁（§7.1）→ 目录写锁（只有写目录的命令）→ 余额行预建的短事务（§4.1，只有要锁余额行的命令）→ 开业务事务。
+  开事务前的先后固定为：幂等锁（§7.1）→ 目录写锁（只有写目录的命令）→ 余额行预建的短事务（§4.1，只有要锁余额行的命令）→ 关掉相关到期预留的短事务（只有新预留与 SKU 合并执行，§5.6、§2.4，0.12）→ 开业务事务。
   两条规则：不在打开事务或持有行锁时带等待地 `GET_LOCK`；凡是写 `catalog_changes` 的路径都先取目录写锁。
 
 ---
@@ -432,7 +436,7 @@ Core 需求要求所有量非负、缺货时“暂停履约交管理员”（ORD
 
 ### 5.1 订单行累计量
 
-Core 按 `(tenant_id, channel_id, order_ref, line_ref)` 保存一行，`sku_id` 在首次预留时固定、以后不随映射变化：
+Core 按 `(tenant_id, channel_id, order_ref, line_ref)` 保存一行，`sku_id` 在首次预留时固定、以后不随网店的映射变化；只有 SKU 合并执行时改挂到规范 SKU（§2.4 第 1 步，0.12）：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -467,8 +471,8 @@ stateDiagram-v2
 2. **一个订单只有一个预留。**`(channel, order_ref)` 唯一；同订单同内容重复请求返回原预留，不同内容返回 409 `ORDER_REFERENCE_CONFLICT`。
    过期的订单不能原地“续期”，网店若要重新结账用新的 `order_ref`。
 3. **到期时间由 Core 算、网店照用。**预留 TTL 来自 Core 配置（默认 900 秒＝15 分钟，可配置且变更有审计）；Core 返回 `expires_at`，
-   网店把它作为支付截止时间显示和校验，两端不会各算一个（ORD-01）。网店**不能**在请求里指定 TTL。
-4. **到期由 Core 负责关闭**：后台任务定期扫描；任何读或写命中已到期的 `active` 预留时也先在锁内转 `expired`（不只依赖定时任务）。
+   网店把它作为支付截止时间显示和校验，两端不会各算一个（ORD-01）。网店**不能**在请求里指定 TTL。配置与审计的做法见 §5.6（0.12，Q-53）。
+4. **到期由 Core 负责关闭**：后台任务定期扫描；释放、确认销售在锁内先判是否到期，新预留与 SKU 合并执行之前先关掉相关的到期预留（不只依赖定时任务，路径列在 §5.6）；读接口不写库，把它显示为 `expired`（0.12，§5.6，Q-54）。
    判断用数据库 UTC 时间：`now ≥ expires_at` 即到期；网店报的“付款时间早于到期”不能复活预留，只能走晚到支付。
 5. **确认销售必须与原预留行集完全一致**（SKU、数量、行引用）；不一致 409 `RESERVATION_MISMATCH`。
 6. **晚到支付**（ORD-03）：确认请求命中 `expired` 的预留时，Core 在同一事务里检查**整单**当前 `available`：
@@ -516,6 +520,122 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 4. 当初没有成功预留的订单，取消时不调 Core 释放。
 
 **Core 侧**：`sale-commits` 的 `reservation_id` 可为空，流水的 `reason_code` 记 `fault_mode`。对账（§5.4）要单独列出故障期间放行的订单。
+
+### 5.6 预留、释放、到期与可售量的接口与存放（0.12，Q-53～Q-56）
+
+§5.2 的状态机与规则不变，这里补接口、判定顺序、表示、存放与到期关闭的做法。本节只覆盖预留、释放、到期与可售量查询；
+确认销售、晚到支付与故障收款补交（§5.2 第 5–7 条、§5.5）、付款后的分支（§5.3）与订单查询、对账（§5.4）在登记它们之前另行细化。
+
+**通用**
+- scope：预留、释放要 `orders.write`，预留查询要 `orders.read`，可售量要 `stock.read`（§10 第 4 条）；都不要求角色（§10 第 3 条）。
+- 池：预留与可售量用凭据的销售入口绑定的池（§10 第 4 条）；凭据没有销售入口（或入口已停用）时 403 `FORBIDDEN`，记 `forbidden` 事件（被拒的类别为池），不保存（§7.1）。
+  可售量是读接口里唯一要求销售入口的（§6.2 第 1 条、§10 第 4 条的例外），因为它没有 `pool_id` 参数、池只能从入口来。
+  释放按预留所属的池做池授权，顺序同 §10 第 4 条：凭据没有销售入口 403；预留不存在或属于别的租户 404 `RESERVATION_NOT_FOUND`（属于别的租户的记 `cross_tenant`）；
+  所属的池不是获准的池 403。这一步在取幂等锁之前，判出的 404、403 不保存。
+- 锁序：预留行（`FOR UPDATE`）→ 订单行（`FOR SHARE`）→ 池行（`FOR SHARE`）→ 余额行（`FOR UPDATE`，按 §8.1 升序）→ SKU 行（`FOR SHARE`，按 `sku_id` 升序）→ 商品行（`FOR SHARE`，按 `product_id` 升序）；
+  命令用不到的那一层跳过。本节的命令一个事务最多锁一个预留行；以后的命令要锁多个时按 `reservation_id` 升序。
+- **隔离级别**：本节的写事务——预留、释放与所有到期关单的事务（定时任务、新预留之前、SKU 合并执行之前的关单）——都以 READ COMMITTED 开启（同盘点的提交与确认）。
+  不经幂等执行器的事务（定时任务的关单）用完要把连接的隔离级别复原再放回连接池，复原出错就作废这个连接，否则之后从池里取到它的命令会悄悄跑在 READ COMMITTED 下。
+  原因：REPEATABLE READ 下按 `(tenant_id, reservation_id)` 加锁读订单行是范围扫描，会连同最后一行之后的间隙一起锁住；`reservation_id` 按时间递增，
+  新预留的订单行正好插在那段间隙里，于是“新预留锁住余额行、插订单行被间隙锁挡住”与“释放锁住订单行间隙、再等余额行”成环。
+  READ COMMITTED 下加锁读只锁匹配的行、不锁间隙，普通读每条语句都看到最新的已提交数据（第 1 步的业务引用与并发重报的重新判定都依赖这一点）。
+  以后读写预留或订单行的命令（确认销售、付款后的分支、SKU 合并的执行）在登记前按这个顺序细化（SKU 合并见 §2.4 第 0、1 步）。
+- 订单行的 `sku_id`：预留时取请求里的 SKU；SKU 合并执行时改挂到规范 SKU（§2.4 第 1 步、§5.1）。所以释放与到期关单在锁住预留行之后，用加锁读（`FOR SHARE`）读订单行，
+  按读到的 `sku_id` 锁余额行：加锁读会等正在进行、还没提交的合并结束，读到它改挂后的 `sku_id`；普通读不等，可能读到合并之前的 `sku_id`，去减已经迁走的 `reserved`。
+- 流水：预留写 `RESERVE`、释放与到期关闭写 `RELEASE`，每个订单行一条（§4.3）。`source_type` 为 `reservation`，`source_ref` 为 `order_ref`，`line_ref` 为该行的 `line_ref`；
+  `channel_id` 取预留的销售入口，`note` 为空，`occurred_at` 取数据库时间。`reason_code`：`RESERVE` 为空，释放为请求里的 `reason`，到期关闭为 `expired`。
+
+**预留有效期（Q-53）**：配置项 `CORE_RESERVATION_TTL_SECONDS`，60–3600 的整数，默认 900（§5.2 第 3 条）；不合格时进程拒绝启动——
+API 与运维命令行读同一份配置，所以命令行也拒绝启动，与它们同在一个容器、用同一套部署配置一致。部署配置里写明这一项及默认值。
+只在启动时读，运行中不能改；API 进程启动时在进程日志写一行当前值。每个预留记下创建时用的有效期（`ttl_seconds`）；
+`created_at` 取本次命令的数据库时间（同一命令只取一次），`expires_at` = `created_at` + `ttl_seconds`。“变更有审计”靠这两处：改有效期要改部署配置并重启，从哪个预留起换了值可以按预留查到。
+
+**预留** `POST /v1/reservations`（`reservations.create`）
+- 正文：`{"order_ref": …, "lines": [{"line_ref": …, "sku_id": …, "quantity": …}, …]}`，不接受别的字段。
+  - `order_ref`、`line_ref` 的格式见 §1；`lines` 1–100 个（超过 413，§8.1 第 7 步）；`quantity` 是 1–1,000,000 的 JSON 整数。
+  - 同一请求里 `line_ref` 重复 422（§8.1），`sku_id` 重复也 422（Q-56）：一个订单里同一个 SKU 只占一行，网店下单前把同 SKU 的购物车行合并。
+- **开业务事务之前**（取幂等锁之后，§7.1），依次：
+  1. 照 §4.1 对所列 SKU 预建余额行；
+  2. **先关到期**：查出所列 SKU 上 `active` 而数据库时间已到 `expires_at` 的预留，按 `expires_at` 升序最多 100 个，逐个按下面的“到期关闭”关掉
+     （每个一个事务，与本次预留的结果无关、各自提交；超出的留给定时任务）。某个关单出错时记进程日志，跳过它，继续本次预留。
+     这样刚到期、还没被定时任务扫到的预留不会让新预留误判缺货。这一步排在 §2.7 开事务前先后的余额行预建之后、开业务事务之前。
+- **事务里的判定与执行**，按顺序：
+  1. 业务引用：用普通读按 `(tenant_id, channel_id, order_ref)` 查预留。已有一行：规范化请求摘要（§7.1）相同，返回 200 与它的当前表示（状态可能已是释放或到期，§5.2 第 2 条：不能续期）；
+     不同，409 `ORDER_REFERENCE_CONFLICT`，`details` 为 `{"ref_type": "order", "ref": order_ref}`，记 `business_ref_conflict` 事件。两个不同幂等键的请求并发撞上唯一约束时，照 §7.1 第 2 条最后一段处理；
+  2. `FOR SHARE` 读池行；池不是 `live`：409 `POOL_NOT_LIVE`（§6.2 第 2 条）；
+  3. 普通读查 SKU：不存在或属于别的租户 404 `SKU_NOT_FOUND`（照 §6.2 第 3 条，`details.sku_ids` 按请求顺序列全）；
+  4. 按 §8.1 升序锁住所列 SKU 的余额行；
+  5. 按 `sku_id` 升序 `FOR SHARE` 读 SKU 行与所属商品行：已合并 409 `SKU_MERGED`（第一个，`details` 带 `sku_id` 与 `merged_into_sku_id`，§2.4）；
+     SKU 或所属商品 `inactive`：409 `SKU_INACTIVE`，`details.sku_ids` 按请求顺序列出全部这样的 SKU（Q-36）。
+     合并进行中（§2.4 的 `selling_paused`、`counted`）的 SKU 409 `SKU_SELLING_PAUSED`，由登记 SKU 合并的任务实现；合并单的表建立之前没有这种 SKU；
+  6. 可售：逐行比较 `quantity` 与锁住的余额行的 `available`；有任何一行不足，409 `INSUFFICIENT_STOCK`，`details.lines` 按请求顺序列出全部不足的行，
+     每项 `line_ref`、`sku_id`、`quantity`、`available`；
+  7. 写预留一行（`active`）、订单行（每行一条）与每行一条 `RESERVE` 流水，与幂等记录同一事务提交。
+
+  第 2–6 步的拒绝不写预留与订单行，`order_ref` 不被占用（§7.1 第 2 条），网店可以用新幂等键、同一 `order_ref` 再试（例如补货之后）。
+  **并发重报**：第 1 步是普通读，两个不同幂等键、同一 `order_ref` 的请求可能都读不到预留；先提交的一个用掉可售量后，后一个会在第 6 步（或第 2–5 步）被拒，而不是撞上唯一约束。
+  所以第 2–6 步得出业务拒绝时，先回滚，另开事务按第 1 步重新查 `order_ref`：已有预留就按第 1 步回答（摘要相同 200 与当前表示，不同 409 `ORDER_REFERENCE_CONFLICT`），
+  没有才把原来的拒绝作为确定结果保存（同 §6.2 第 7 条的单据命令）。重新判定的结果作为这个幂等键的确定结果保存。
+  安全事件：保存原来的拒绝时，一并保留它在第 3 步登记的 `cross_tenant` 事件；改按第 1 步回答时丢弃这些事件（那次判定没有生效），内容不同时照第 1 步记 `business_ref_conflict`。
+- 成功 201，返回预留的表示。
+
+**释放** `POST /v1/reservations/{reservation_id}/release`（`reservations.release`）
+- 正文：`{"reason": …}`，必填，取值 `cancelled`（付款前整单取消）、`payment_failed`（支付失败）或 `checkout_replaced`（换新结账，§5.2）；不接受别的字段。
+- 事务里先 `FOR UPDATE` 读预留行，再按状态：
+  - `active` 且数据库时间早于 `expires_at`：`FOR SHARE` 读订单行，按 §8.1 升序锁住各行 SKU 的余额行，每行写一条 `RELEASE`（`reserved` 减该行 `quantity`），预留改为 `released`，记释放原因、时间与请求方。200，返回表示；
+  - `active` 而已到 `expires_at`：在同一事务里按“到期关闭”关掉，200，返回表示，状态为 `expired`（Q-55）。库存已经放回；之后的晚到支付仍按 §5.2 第 6 条处理；
+  - 已是 `released` 或 `expired`：不写任何东西，200，返回当前表示（原来的释放原因不变，Q-55）；
+  - `committed`、`late_payment_review`、`closed_refunded`：409 `STATE_CONFLICT`（§5.3）。
+
+**到期关闭**（§5.2 第 4 条的做法，Q-54）
+- **一次关单**：`FOR UPDATE` 读预留行；不是 `active` 或数据库时间早于 `expires_at`，什么也不做。否则 `FOR SHARE` 读订单行，按 §8.1 升序锁住各行 SKU 的余额行，每行写一条 `RELEASE`
+  （`reason_code` 为 `expired`），预留改为 `expired`，记下关单时间。关单的流水不带凭据、幂等键、操作者与请求 ID，无论由哪条路径触发（它是 Core 按时间关单，不是哪个请求的结果）；
+  每次关单一个新的 `command_id`。锁内复核状态，所以几条路径同时关同一个预留，只关一次（ORD-03“到期重试只释放一次”）。
+- **触发路径**：
+  1. 定时任务：API 进程里每 30 秒扫描一次，启动后首次等 30 秒（与安全事件的保留期清理同一种进程内定时任务，§7.2），按 `expires_at` 升序取 `active` 而已到期的预留，逐个关单，每个一个事务；一个出错记进程日志、继续下一个；
+  2. 新预留在开业务事务之前，关掉所列 SKU 上已到期的预留（见上）；
+  3. 释放命中已到期的 `active` 预留，在同一事务里关单（见上）；以后的确认销售同样在锁内先判（§5.2 第 4、6 条）；
+  4. SKU 合并执行之前（§2.4 第 0 步）。
+
+  只有这几条路径关单。其他命令（收货、不可售调整、盘点确认、更正、Demo 重置）不关单，照库里的 `reserved` 判定。
+- **读接口不写库**：预留的查询与预留命令返回的表示里，`active` 而数据库时间已到 `expires_at` 的预留**显示**为 `expired`，与关单之后的表示相同。
+  可售量、余额与流水查询照库里的数读：已到期、还没被关掉的预留仍算在 `reserved` 里，最多晚一个扫描周期（约 30 秒）才放出来（Q-54）。
+
+**表示**
+- `reservation_id`（前缀 `rsv_`）、`order_ref`、`pool_id`、`status`、`expires_at`、`created_at`，以及只在 `released` 时有值的 `released_at` 与 `release_reason`（其他状态为 `null`）；
+- `status` 取值 `active`、`released`、`expired`（以及确认销售任务启用的 `committed`、`late_payment_review`、`closed_refunded`）；`expired` 的时间就是 `expires_at`，所以关单前后表示相同；
+- `lines`：按 `line_ref` 升序，每行 `line_ref`、`sku_id`、`quantity`。订单行的累计量（§5.1）由订单库存查询（§5.4）返回，在登记它的任务里定。
+  SKU 合并改挂之后，`sku_id` 显示规范 SKU。确认销售要求与原预留行集一致（§5.2 第 5 条），网店按原 SKU 确认时怎么比对改挂过的行，在细化确认销售时定。
+
+**查询**（`orders.read`）
+- `GET /v1/reservations/{reservation_id}`：不存在或属于别的租户 404 `RESERVATION_NOT_FOUND`，属于别的租户的记 `cross_tenant`（§7.2）。
+- `GET /v1/reservations?order_ref=…`：按凭据的销售入口查，返回 `reservations` 数组，0 或 1 个；凭据没有销售入口时返回空数组（同 §6.6 的 `count_ref` 查询）。`order_ref` 缺少或格式不对 422。
+
+**可售量** `GET /v1/availability?sku_ids=…`（`stock.read`，ORD-01）
+- `sku_ids` 是逗号分隔的 1–100 个 `sku_id`，有重复 422。不属于本租户的 SKU 不出现，也不报错（同 §6.8 的余额）。
+- 返回 `pool_id`、`pool_status`（`initializing` 或 `live`）与 `skus` 数组，按 `sku_id` 升序。每项：
+  - `sku_id`、`available`（还没有余额行的为 0）；
+  - `status`：`merged`（此时带 `merged_into_sku_id`，其他状态为 `null`）、`inactive`（SKU 或所属商品停用）或 `sellable`，按这个先后取第一个符合的（已合并的 SKU 也是停用的，报 `merged`）。
+    SKU 合并任务会加 `selling_paused`，排在 `inactive` 之后、`sellable` 之前（与新预留的判定顺序相同）；调用方把不认识的值当作不能新预留。
+- 只做普通读，不加锁；`available` 可能含已到期、还没关掉的预留（见上）。网店的故障收款封顶（§5.5）读的就是这个数。
+
+**存放**（复合外键照 §10 第 1 条）
+- `reservations`：一个订单一行。列有 `reservation_id`（主键）、`tenant_id`、`channel_id`、`pool_id`、`order_ref`、`status`、`ttl_seconds`（检查约束 60–3600）、`expires_at`、
+  预留请求的 `request_hash`，创建的 `credential_id`、`actor_ref`、`actor_role`、`request_id`、`created_at`（都非空，操作者两列除外），
+  释放的 `release_reason`、`released_credential_id`、`released_actor_ref`、`released_actor_role`、`released_request_id`，以及离开 `active` 的时间 `closed_at`（释放或到期关单的数据库时间）。
+  - **列宽**：`status` 与 `release_reason` 用 `VARCHAR(32)`，是 §2.2“状态列 `VARCHAR(16)`”的例外：`late_payment_review` 有 19 个字符、`checkout_replaced` 有 17 个；改列宽不在“只加不改”的迁移之内，所以建表时就定足；
+  - `(tenant_id, channel_id, order_ref)` 唯一；`(tenant_id, reservation_id)` 唯一，作复合外键的引用目标；`(status, expires_at)` 索引，供定时任务扫描；
+  - 检查约束：`status` 限六个取值，`release_reason` 限三个取值；`release_reason`、`released_credential_id`、`released_request_id` 在 `status` 为 `released` 时都非空、其他状态都为空；
+    `status` 为 `active` 时 `closed_at` 为空，为 `released` 或 `expired` 时非空（其他状态由确认销售任务定，这里不约束）；两组操作者列各自同有同无；
+    `expires_at = created_at + ttl_seconds` 由服务层保证，约束只查 `expires_at > created_at`；
+  - 外键：`(tenant_id, pool_id)` → `stock_pools`，`(tenant_id, channel_id)` → `sales_channels`，`(tenant_id, credential_id)` 与 `(tenant_id, released_credential_id)` → `credentials`。
+- `order_lines`：§5.1 的订单行，一行一条。列有 `order_line_id`（主键，前缀 `oln_`）、`tenant_id`、`reservation_id`、`pool_id`、`sku_id`、`line_ref`、`quantity`（检查约束 1–1,000,000），
+  以及 §5.1 的五个累计量（默认 0，非负）。
+  - `(tenant_id, reservation_id, line_ref)` 唯一（预留与订单一一对应，等价于 §5.1 的 `(tenant_id, channel_id, order_ref, line_ref)`）；
+    不加 `(reservation_id, sku_id)` 唯一：预留时同一订单的 `sku_id` 不重复由请求校验保证，合并改挂之后同一订单可能有两行指向同一个规范 SKU；
+  - 检查约束：`committed_qty` 为 0 或等于 `quantity`（V1 整单确认）；`dispatched_qty + refund_restocked_qty <= committed_qty`；`returned_sellable_qty + returned_unsellable_qty <= dispatched_qty`；
+  - 外键：`(tenant_id, reservation_id)` → `reservations`，`(tenant_id, pool_id, sku_id)` → `stock_balances`（预留前已预建）；`pool_id` 与所属预留的相同，由同一事务的服务层保证。
+- 两张表只在本节与以后登记的订单命令里写；预留与订单行不删除。
 
 ---
 
@@ -605,7 +725,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 
 1. **池授权**（§10 第 4 条，§8.1 第 9 步，在取幂等锁之前）：正文或路径带 `pool_id` 的（期初预览、池切 live、收货、不可售调整、盘点开单）按这个池判定；
    按 ID 指向对象的按对象所属的池判定：期初确认按导入所属的池，盘点的提交、确认、取消按盘点单所属的池，更正按原流水所属的池。
-   这一步判出的 404（池或对象不存在、属于别的租户）不保存（§7.1）。读接口不做池授权，只限定在本租户：路径或必填参数指向的池、SKU、对象属于别的租户时 404（与不存在相同），记 `cross_tenant`（§7.2）；
+   这一步判出的 404（池或对象不存在、属于别的租户）不保存（§7.1）。读接口不做池授权，只限定在本租户（例外：可售量查询按凭据的销售入口取池，没有入口 403，§5.6）：路径或必填参数指向的池、SKU、对象属于别的租户时 404（与不存在相同），记 `cross_tenant`（§7.2）；
    批量查询里查不到的 ID 不出现、不报错（§6.8 的余额，同 §2.6 第 6 条的 `ids`）。
 2. **池状态（Q-42）**：池建成时是 `initializing`。`initializing` 时只能做期初（预览、确认）、更正（§6.7，用于冲掉错的期初）和读；
    收货、不可售调整、盘点 409 `POOL_NOT_LIVE`。池切到 `live`（§6.3）后，期初的预览与确认 409 `POOL_ALREADY_LIVE`；`live` 不能回到 `initializing`。
@@ -964,14 +1084,14 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 | | `POST /v1/catalog-imports`，`POST /v1/catalog-imports/{id}/confirm`，`GET /v1/catalog-imports/{id}` | CAT-04 |
 | | `POST /v1/sku-merges`，`POST /v1/sku-merges/{id}/{pause,count,execute,complete,cancel}`，`GET /v1/sku-merges/{id}` | CAT-05 |
 | | `GET /v1/catalog-changes?after=&limit=` | CAT-03 |
-| 库存 | `GET /v1/availability?sku_id=…`（批量 ≤100，只回 `available` 与状态） | ORD-01 |
+| 库存 | `GET /v1/availability?sku_ids=…`（批量 ≤100，只回 `available` 与状态，§5.6） | ORD-01 |
 | | `GET /v1/balances?pool_id=&sku_ids=`（四个账面量＋版本，管理用，§6.8） | STK-01 |
 | | `POST /v1/stock-imports`、`/{id}/confirm`，`GET /v1/stock-imports/{id}`（期初，§6.3） | STK-03 |
 | | `POST /v1/pools/{pool_id}/go-live`，`GET /v1/pools/{pool_id}`（§6.3） | STK-02、03 |
 | | `POST /v1/receipts`，`POST /v1/counts`、`/v1/counts/{id}/submit`、`/confirm`、`/cancel`，`GET /v1/counts/{id}`、`GET /v1/counts?count_ref=`，`POST /v1/unavailable-adjustments`，`POST /v1/corrections`（§6.4–§6.7） | STK-02、05 |
 | | `GET /v1/ledger?pool_id=&sku_id=&from=&to=&after=&limit=`（§6.8） | STK-01 |
-| 订单 | `POST /v1/reservations`，`GET /v1/reservations/{id}`，`GET /v1/reservations?order_ref=` | ORD-01 |
-| | `POST /v1/reservations/{id}/release` | ORD-03 |
+| 订单 | `POST /v1/reservations`，`GET /v1/reservations/{id}`，`GET /v1/reservations?order_ref=`（§5.6） | ORD-01 |
+| | `POST /v1/reservations/{id}/release`（§5.6） | ORD-03 |
 | | `POST /v1/orders/{order_ref}/sale-commits`（`reservation_id` 可空〔故障收款，§5.5〕、`payment_ref`、`paid_at`） | ORD-02、03 |
 | | `POST /v1/orders/{order_ref}/dispatches`、`/refund-restocks`、`/return-receipts` | ORD-04、05、07 |
 | | `POST /v1/orders/{order_ref}/late-payment-review/close` | ORD-03 |
@@ -1150,7 +1270,7 @@ Core 健康检查返回的环境标记（`demo` / `production`）必须与网店
      - 按 ID 指向池内对象的命令（期初导入的确认，盘点单的提交、确认、取消，更正所指的原流水等）按这个对象所属的池判定，顺序同上：凭据没有销售入口 403；
        对象不属于本租户 404；对象所属的池不是获准的池 403。
      - 其余命令（目录命令，SKU 合并的新建、暂停、完成、取消与查询）不做池授权，只查 scope 与角色。
-     - 读接口不做池授权，只限定在本租户（0.9，§6.2 第 1 条）。
+     - 读接口不做池授权，只限定在本租户（0.9，§6.2 第 1 条）；例外是可售量查询，池取凭据的销售入口，没有入口 403（0.12，§5.6）。
 5. **网络（Q-12）：**Core 不暴露公网入口（不挂到 `infra_nginx` 的公开 vhost）。与网店同机时只挂在仅内部的容器网络上，
    **不加 TLS**：流量不出宿主机，靠凭据鉴权。这偏离 REQUIREMENTS OPS-02“服务间通信加密”的字面要求，Kelvin 已接受；
    将来跨机时改走加密隧道。Demo Core 与将来的生产 Core 使用不同实例、不同库、不同凭据，网络上互不可达。
@@ -1288,7 +1408,7 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 ---
 
-## 14. 变更记录（0.3、0.4 于 2026-11-10、0.5 于 2026-11-12、0.6 于 2026-11-13、0.7、0.8 于 2026-11-14、0.9、0.10 于 2026-11-15、0.11 于 2026-11-16 经 Kelvin 批准）
+## 14. 变更记录（0.3、0.4 于 2026-11-10、0.5 于 2026-11-12、0.6 于 2026-11-13、0.7、0.8 于 2026-11-14、0.9、0.10 于 2026-11-15、0.11、0.12 于 2026-11-16 经 Kelvin 批准）
 
 来源：登记 CORE-TASK-001、002 时跑的设计预审（`worker.design_precheck`），两个任务都判 `NOT_READY`，共 8 条发现。逐条处理如下：
 
@@ -1507,3 +1627,40 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 | # | 发现 | 类型 | 处理 | 改了哪里 |
 | --- | --- | --- | --- | --- |
 | 69 | ①先查“已合并”再锁余额行：普通读看不到第 1 步建立快照之后提交的合并，重置会把已迁出的 SKU 拉回 `target`；改用加锁读又与其他命令的加锁顺序相反。②只约束了标记迁移：以后重建流水类型约束的迁移会按静态列表把 `DEMO_RESET` 加回生产库；迁移在 API 启动之前跑，启动核对管不到迁移进程。③非阻塞：标记迁移的步骤顺序（DDL 隐式提交）、降级的语义、启动核对使 `CORE_DATABASE_URL` 必填、命令行哪些情形不核对、冲突的 `details`、合并对网店重置的影响 | 设计缺陷／未决定 | ①先普通读查 SKU 存在，锁余额行之后再加锁读查合并（同收货、盘点）；②以后的迁移按 `core_instance` 决定约束；迁移环境在已有标记时先比对 `CORE_ENV`；③标记迁移先校验、再收窄约束、最后写标记；降级只用于 CI 与开发库；启动核对覆盖所有连库进程，API 的连接串必填，`--help` 与参数错误不核对；`details` 为 `ref_type`、`ref`、`pool_id`；调用方影响补两条 | §6.1 |
+
+### 0.12（2026-11-16 起草，Kelvin 同日批准）
+
+来源：登记「整单预留、到期关闭与释放」前对 §5 的通读。§5.2 只写了状态机与规则，没有正文、判定顺序、表示、存放、有效期的配置方式与到期关闭的做法；
+§5.2 第 4 条“任何读命中已到期的预留先转 `expired`”会让读接口写库。第 70–72 条的取舍由 Kelvin 2026-11-16 定（Q-53～Q-55），第 73、74 条按 §6.1、§6.2、§6.6、§6.8 的既有写法补齐（Q-56）。
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 70 | 预留有效期“可配置且变更有审计”没写配置放在哪、审计怎么留 | 未决定 | 环境变量 `CORE_RESERVATION_TTL_SECONDS`（60–3600，默认 900），启动时读、不合格拒绝启动；启动日志写当前值；每个预留记下创建时用的 `ttl_seconds`（Q-53） | §5.2 第 3 条、§5.6 |
+| 71 | “任何读命中已到期的 `active` 预留先在锁内转 `expired`”让读接口写库加锁；可售量查询要按 SKU 找出到期预留逐个关 | 未决定 | 读接口不写库：预留的表示把已到期的 `active` 显示为 `expired`（`expired` 的时间就是 `expires_at`，关单前后表示相同）；可售量与余额最多晚一个扫描周期（约 30 秒）放出到期的数量；定时任务每 30 秒扫描；新预留之前先关所列 SKU 上已到期的预留；释放在锁内先判（Q-54） | §5.2 第 4 条、§5.6 |
+| 72 | 释放已到期或已释放的预留返回什么没定 | 未决定 | 200 与当前表示，不改状态、不写流水（已到期的保持 `expired`，晚到支付仍可走 §5.2 第 6 条）；已确认等状态 409 `STATE_CONFLICT`（Q-55） | §5.6 |
+| 73 | 预留与释放的正文、判定顺序、`INSUFFICIENT_STOCK` 的 `details`、流水的来源字段、表示、查询与存放都没定 | 未决定 | 预留正文 `order_ref`、`lines`（1–100 个 `{line_ref, sku_id, quantity}`，`quantity` 1–1,000,000，`sku_id` 不能重复）；判定顺序 业务引用 → 池状态 → SKU 存在 → 锁余额行 → 合并与停用 → 可售；释放正文 `reason`（三个取值）；流水 `source_type` 为 `reservation`、`source_ref` 为 `order_ref`；表 `reservations` 与 `order_lines`（§5.1 的累计量与约束一并建）；锁序 预留行 → 余额行 → SKU 行 → 商品行（Q-56） | §5.6 |
+| 74 | `GET /v1/availability` 的参数、池、返回的“状态”没定 | 未决定 | `sku_ids` 逗号分隔 1–100 个；池取凭据的销售入口；返回 `pool_status` 与逐 SKU 的 `available`、`status`（`sellable`、`inactive`、`merged`，合并任务加 `selling_paused`）（Q-56） | §5.6、§8.2 |
+
+不影响库存数量规则（§4.3 的 `RESERVE`、`RELEASE` 与 §5.2 的状态机不变）。
+对调用方（网店）的影响：
+- 一个订单里同一个 SKU 只能占一行，下单前合并同 SKU 的购物车行；
+- 被拒的预留（缺货、停用等）不占用 `order_ref`，补货后可以用新幂等键、同一 `order_ref` 再试；释放或到期之后要重新结账，仍须用新的 `order_ref`（§5.2 第 2 条）；
+- 可售量查询可能最多晚约 30 秒才反映刚到期的预留；
+- 释放已到期的预留得到 200、状态 `expired`，网店按“已放回库存”处理即可。
+
+首轮独立审查（PR #96，提交 `5cf465a`，要求修改：阻塞 3 条、非阻塞 8 条）之后的修改：
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 75 | ①`late_payment_review`（19 个字符）、`checkout_replaced`（17 个）放不进 §2.2 的 `VARCHAR(16)` 状态列，以后改列宽不在“只加不改”的迁移之内。②两个不同幂等键、同一 `order_ref` 的请求并发时，后一个在可售判定被拒、走不到插入，会把错误的拒绝存成确定结果。③“SKU 合并照这个锁序”与 §2.4 第 0 步（锁余额行之后关单）矛盾、成环；合并改挂订单行的 `sku_id` 与 §5.1“固定不变”矛盾，释放用普通读可能读到合并前的 `sku_id`；多个预留行的锁序没写。④非阻塞：关单路径的范围、新预留前关单的位置与上限与出错处理、锁序缺池行与商品行、释放的池授权与安全事件、可售量 403 是读接口的例外、`status` 的先后、释放一组列重名与非空约束、`created_at` 与 `expires_at` 同一时间、配置对命令行的影响与首次等待 | 设计缺陷／未决定 | ①两列用 `VARCHAR(32)`，写明是 §2.2 的例外；②第 2–6 步的拒绝先回滚、另开事务按 `order_ref` 重新判定，同 §6.2 第 7 条；③§2.4 第 0 步改在开事务前关单，开事务后才到期的随订单行迁走；订单行 `sku_id` 只在合并时改挂（§5.1）；释放与关单锁住预留行后加锁读订单行；完整锁序，一个事务最多锁一个预留行，多个时按 `reservation_id` 升序；④列出关单的四条路径，其余命令照库里的 `reserved`；新预留前关单排在余额行预建之后、最多 100 个、出错跳过；释放照 §10 先判销售入口、跨租户记 `cross_tenant`；可售量的例外写进 §6.2、§10；`status` 先后 `merged` → `inactive` →（`selling_paused`）→ `sellable`；释放列加 `released_` 前缀并定非空约束；`created_at` 取命令时间、`expires_at` 由它加有效期；命令行同样校验配置；首次等 30 秒 | §5.1、§5.2 第 4 条、§5.6、§2.4 第 0 步、§2.7、§6.2 第 1 条、§10 第 4 条 |
+
+第 75 条③改了已批准的 §2.4 第 0 步（关单的时机），SKU 合并还没有实现，不影响已上线的行为。
+
+复审（PR #96，提交 `995848c`，要求修改：阻塞 1 条、非阻塞 4 条）之后的修改：
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 76 | ①释放与到期关单在 REPEATABLE READ 下 `FOR SHARE` 读订单行会锁住索引末端的间隙，与正在插订单行的新预留成环死锁（`reservation_id` 按时间递增）。②非阻塞：合并改挂订单行的锁序没细化；改挂后表示里的 `sku_id` 与确认销售的行集比对；并发重报重新判定时安全事件的去留；§2.4 执行开头仍写“一个事务” | 设计缺陷／未决定 | ①本节的写事务（预留、释放、各路径的关单）都以 READ COMMITTED 开启，同盘点；②合并在锁余额行之前按 `reservation_id` 升序锁预留行，细节登记前定；表示注明改挂后显示规范 SKU，比对规则留给确认销售；保存原拒绝时保留 `cross_tenant`，改按第 1 步回答时丢弃；§2.4 写明第 0 步在事务之前 | §5.6、§2.4 |
+
+第三轮复审（提交 `50949fb`）结论为通过，另有非阻塞 4 条：隔离级别一条补上 SKU 合并执行之前的关单，并写明定时任务用完连接要复原隔离级别；订单行加锁读的理由改为“等未提交的合并”；
+合并要锁的预留行怎么找出（停售期间不会有新的订单行指向这两个 SKU），留到登记合并任务前定。前三条已改，不改变语义。
