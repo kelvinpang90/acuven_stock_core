@@ -1720,7 +1720,7 @@ tasks:
       四，tests/integration/test_demo_reset_schema.py 里断言库在迁移头的两处写死了 0006（assert_production_head 与 core_instance 表无行时迁移失败的测试），
       加了 0007 后它们会失败：改为与迁移脚本目录的当前 head 比较（用 alembic 的 ScriptDirectory 取），以后再加迁移不用再改；该文件其余断言不动。
       明确不做：任何接口、服务层与配置项（CORE-TASK-038 起）；不改流水表与已有迁移。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-036
     acceptance_criteria:
