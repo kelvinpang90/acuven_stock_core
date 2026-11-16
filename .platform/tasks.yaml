@@ -1815,8 +1815,7 @@ tasks:
     depends_on:
       - CORE-TASK-038
     acceptance_criteria:
-      - 释放接口与命令加在 app/api/reservations.py 与 app/services/reservations.py；执行器钩子在 app/services/idempotency.py，不传时已有命令的测试照常通过；定时任务在 app/main.py 的 lifespan 起停
-      - app/services/stock.py 只做底层函数的拆分，lock_balances 与 append_entry 的签名与行为不变，已有的收货、调整、盘点、更正、Demo 重置测试照常通过
+      - 释放接口与命令加在 app/api/reservations.py 与 app/services/reservations.py；执行器钩子在 app/services/idempotency.py，不传时已有命令的测试照常通过；定时任务在 app/main.py 的 lifespan 起停；app/services/stock.py 只做底层函数的拆分，lock_balances 与 append_entry 的签名与行为不变，已有的收货、调整、盘点、更正、Demo 重置测试照常通过
       - 集成测试验证释放：active 未到期释放后 reserved 按行减回、每行一条 RELEASE 且 reason_code 为请求的 reason、表示为 released 并带 released_at 与 release_reason；再释放（含换原因、换键）200 不写流水、原因不变；已到期未关的 active 释放后为 expired、流水 reason_code 为 expired 且不带凭据与请求 ID；状态为 committed 的预留 409 STATE_CONFLICT（测试直接把行改成 committed）
       - 集成测试验证释放的池授权与正文：别的租户的 reservation_id 404 RESERVATION_NOT_FOUND 并记 cross_tenant；凭据没有入口 403；reason 缺少或不在三个取值里 422
       - 集成测试验证到期关单：直接调用关单函数，已到期的关一次、写对流水、预留为 expired；再调一次什么也不写；未到期的不动；两个连接并发对同一预留关单只写一组 RELEASE
