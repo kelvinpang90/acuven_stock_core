@@ -1515,3 +1515,148 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-033
+    title: 建立实例标记与 Demo 重置表并在生产库上收窄流水类型约束
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.11 的 6.1（实例区分、库里的实例标记、迁移前核对、以后的迁移、存放、生产实例的防护），
+      写第六个 Alembic 迁移（revision 0006，接在 0005 之后），为 Demo 重置命令与启动核对打底。
+      列约定沿用 CORE-TASK-022：稳定 ID 为 VARCHAR(32) utf8mb4_bin；tenant_id 外键到 tenants；表间引用用 tenant_id 加 ID 的复合外键；
+      时间列 DATETIME(6)，created_at 默认 CURRENT_TIMESTAMP(6)；request_id、actor_ref 为 VARCHAR(128) utf8mb4_bin；actor_role 为 VARCHAR(32) utf8mb4_bin；
+      request_hash 为 CHAR(64) utf8mb4_bin。
+      一，纯函数：在 app/domain/environment.py 加 check_instance_marker(marker, core_env)，marker 为库里的 core_env 或 None（有表无行），
+      不一致或为 None 时抛 InstanceMismatch（继承 ValueError），消息一行，只含两个环境名，不含连接串；单元测试放 tests/unit/test_environment.py。
+      二，新模型模块 app/models/instance.py 定义 core_instance（singleton 为 TINYINT 主键，检查约束等于 1；core_env 为 VARCHAR(16) utf8mb4_bin，
+      检查约束取 demo 或 production；created_at），在 alembic/env.py 与 app/models/__init__.py 登记；
+      在 app/models/inventory.py 加 demo_resets（契约 6.1 的存放）：reset_id 主键；tenant_id；channel_id、pool_id、credential_id 非空，各以复合外键指向同租户的
+      销售入口、池与凭据；business_date 为 DATE 非空；request_hash 非空；result 为 JSON 非空，检查约束要求是对象；actor_ref、actor_role 可空，
+      检查约束两者要么都空要么都非空（重置不要求角色）；request_id 非空；created_at；唯一约束 (tenant_id, pool_id, business_date)。
+      三，迁移 0006 的升级按契约 6.1 的顺序：先用 parse_core_env 校验执行进程的 CORE_ENV（没有设或不合法则抛错，不改库）；
+      为 production 时删掉 0002 建的流水类型检查约束、重建为不含 DEMO_RESET 的同名约束（类型列表在 0006 里抄写，不 import 0002）；
+      再建 demo_resets；最后建 core_instance 并写入一行 core_env。降级：先读 core_instance 的 core_env，删 core_instance 与 demo_resets，
+      为 production 时把流水类型约束恢复为含 DEMO_RESET 的版本。
+      四，alembic/env.py 的在线模式：执行迁移之前，库里已有 core_instance 表时读它的行，用 check_instance_marker 与执行进程的 CORE_ENV 比对，
+      不一致、行不存在或 CORE_ENV 没有设或不合法时抛错、不执行任何迁移；还没有这张表时跳过。离线模式（--sql）不做这一步，在文档串里注明。
+      文档串里“迁移与运行环境无关”的说法改为说明 0006 起迁移要求 CORE_ENV、以及迁移前核对。
+      五，测试：tests/integration/conftest.py 的 migrated_engine 在升降迁移时把 CORE_ENV 设为 demo；新增会话级夹具，对环境变量
+      CORE_TEST_PRODUCTION_DATABASE_URL 指向的第二个库以 CORE_ENV 为 production 升到 head、结束时降到 base，变量没设时 skip（CI 设了它）。
+      明确不做：API 与运维命令行的启动核对（CORE-TASK-034）、重置命令本身（CORE-TASK-035）；不改 CI 与部署配置。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 迁移文件放 alembic/versions，revision 0006 接在 0005 之后，upgrade 与 downgrade 都写全；core_instance 模型在新模块 app/models/instance.py，并已在 alembic/env.py 与 app/models/__init__.py 登记；约束名遵循 app/db.py 的命名约定；CI 的迁移往返与 alembic check 通过
+      - 单元测试验证 check_instance_marker：相同通过；不同、marker 为 None 都抛 InstanceMismatch，消息里只有环境名
+      - 集成测试在 demo 库上验证：迁移后 core_instance 恰有一行 demo；插入第二行、singleton 不为 1、core_env 为其他值都被拒；DEMO_RESET 流水照常可插入
+      - 集成测试验证 demo_resets：同一租户同一池同一 business_date 的第二行被拒，换一天或换池可以插入；result 不是对象被拒；actor_ref 与 actor_role 只填一个被拒、都空可以；入口、池或凭据属于别的租户被拒
+      - 集成测试在 production 库上验证：core_instance 为 production；DEMO_RESET 流水被流水类型约束拒绝，RECEIPT 照常插入；以 CORE_ENV 为 demo 对它执行升级时迁移前核对失败、库不变；降到 0005 后 DEMO_RESET 又可插入（回滚），且此时 CORE_ENV 没有设时升级失败、没有 core_instance 表；最后再以 production 升回 head
+      - 这些 production 库的测试在 CI 里实际运行，不是 skipped
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试与迁移检查由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/domain/environment.py
+      - tests/unit/test_environment.py
+      - app/models/instance.py
+      - app/models/inventory.py
+      - app/models/__init__.py
+      - alembic/env.py
+      - alembic/versions/20261116_0006_demo_resets.py
+      - tests/integration/conftest.py
+      - tests/integration/test_demo_reset_schema.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-034
+    title: 让 API 与运维命令行启动时核对库里的实例标记
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.11 的 6.1（启动核对、生产实例的防护），让连库的 Core 进程在开始处理请求或命令之前比对
+      库里 core_instance 的 core_env 与 CORE_ENV，用 CORE-TASK-033 的 check_instance_marker 判定。
+      一，新建 app/services/instance.py：read_instance_marker(connection) 返回 core_instance 那一行的 core_env，表存在而没有行时返回 None；
+      表不存在等数据库错误照常抛出。
+      二，API：app/main.py 的 create_app 在建好引擎之后、构造应用之前做核对。CORE_DATABASE_URL 为空、连不上或读失败、表或行不存在、
+      与 CORE_ENV 不同，都向标准错误写一行原因（固定文本加两个环境名，不含连接串与异常文本）后抛 SystemExit(1)，
+      uvicorn 以工厂方式加载时进程因此以非 0 退出。原来“没配数据库照常启动、readyz 回 503”的行为取消（契约 0.11 写明 API 的连接串从此必填）；
+      readyz 对运行中连不上数据库的处理不变。
+      三，运维命令行：app/cli/__init__.py 的 run_command 在建好引擎之后、执行 handler 之前做同样的核对，失败时用已有的 fail 输出一行、返回失败退出码，
+      不执行命令也不写安全事件；--help 与参数错误在连库之前就结束，不做核对。
+      四，测试：tests/integration/conftest.py 加一个上下文管理器，临时把测试库 core_instance 的 core_env 改成给定值并提交，退出时改回 demo；
+      tests/integration/test_cli_service_auth.py 的 production_cli 在这个上下文里运行，生产拒签 demo.reset 的两个测试照旧通过；
+      不带数据库或连不上数据库创建应用的测试（tests/integration/test_health_api.py、test_api_requests.py、test_security_event_purge.py 里的）改为
+      连测试库，或改为断言创建应用以 SystemExit 失败，不改它们原本验证的其他内容。
+      明确不做：迁移与迁移前核对（CORE-TASK-033）、重置命令（CORE-TASK-035）；不改 CORE_ENV 的解析与健康检查的响应。
+    status: ready
+    depends_on:
+      - CORE-TASK-033
+    acceptance_criteria:
+      - 读标记的函数在 app/services/instance.py；API 的核对在 app/main.py 的 create_app，命令行的核对在 app/cli/__init__.py 的 run_command；已有测试除按 purpose 第四点调整的以外照常通过
+      - 集成测试验证 API：库标记为 demo、CORE_ENV 为 demo 时创建应用成功；标记改成 production 时以 SystemExit 失败，标准错误只有一行且不含连接串；连接串为空或连不上时同样以 SystemExit 失败
+      - 集成测试验证命令行：标记与 CORE_ENV 不同时返回失败退出码、输出一行、不执行命令（库里没有新增行）且不写安全事件；--help 不连库照常输出
+      - 生产拒签 demo.reset 签发与轮换的两个已有测试在 production 标记下照旧通过；测试结束后测试库的标记回到 demo
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/instance.py
+      - app/main.py
+      - app/cli/__init__.py
+      - tests/integration/conftest.py
+      - tests/integration/test_instance_check.py
+      - tests/integration/test_cli_service_auth.py
+      - tests/integration/test_health_api.py
+      - tests/integration/test_api_requests.py
+      - tests/integration/test_security_event_purge.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-035
+    title: 实现 Demo 专用的每日重置命令
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.11 的 6.1（重置命令）、6.2、7.1、8.1 与 10 第 3、4 条，新建 app/api/demo_resets.py 与 app/services/demo_resets.py，
+      只在 CORE_ENV 为 demo 时在 app/main.py 挂路由（为 production 时不挂，路径按 8.1 第 1 步得 404 NOT_FOUND，不鉴权）。
+      数量规则用 CORE-TASK-001 的 apply_demo_reset；锁池、SKU 两步检查、锁余额行、写流水与 mark_verified 用 CORE-TASK-026 的 app/services/stock.py；
+      经 CORE-TASK-025 的执行器（balance_rows 取正文 pool_id 与各 sku_id）。
+      一，纯函数：在 app/domain/stock.py 加 parse_business_date(value)，只接受 YYYY-MM-DD 形式（数字为 ASCII，月日两位）的合法日历日期字符串，
+      年份 1001 到 9998（同 occurred_at 的余量），返回 date，否则抛 ValueError；不与当前日期比较。单元测试放 tests/unit/test_stock.py。
+      二，接口 POST /v1/demo/resets（操作类型 demo_resets.create）：scope demo.reset，不要求角色（操作者头带了照常校验并记录）；
+      正文只有 pool_id、business_date、skus（1 到 100 个，批量数组，超过 413；每项只有 sku_id 与 target，target 为 0 到 1000000 的 JSON 整数）；
+      未知字段、business_date 不合格、sku_id 重复都 422。池授权按正文 pool_id。
+      三，命令（契约 6.1 的九步）：用普通读按 (tenant_id, pool_id, business_date) 查 demo_resets，有则摘要相同返回 200 与 result，
+      不同则 409 BUSINESS_REF_CONFLICT 并记 business_ref_conflict 事件，事件与错误的 details 为 ref_type demo_reset、ref 为 business_date、pool_id；
+      然后 require_live、require_skus_exist、按升序锁余额行、require_not_merged；逐 SKU 用 apply_demo_reset 算新账面，增量不为 0 时 append_entry 写 DEMO_RESET
+      （四个增量为 delta、0、0、0；source_type demo_reset，source_ref 为 reset_id，无 line_ref，reason_code 与 note 为空，occurred_at 为命令时间），
+      增量为 0 时调 mark_verified；最后写 demo_resets 一行（reset_id 前缀 drs_，由命令先生成；channel_id 取凭据的销售入口）。
+      业务引用的并发照 with_document 的做法在本模块实现：命令的业务 4xx 与写 demo_resets 撞唯一约束都改抛 BusinessRefTaken，
+      重新判定时重新查 demo_resets，有则按上面回答，没有则再运行一次命令，这一次的结果为确定结果。
+      返回 201 与重置的表示：reset_id、pool_id、business_date、created_at、skus 按请求顺序，每项 sku_id、target、delta、entry_id（delta 为 0 时为 null）、
+      写后的四个量、available 与 balance_version；result 存的就是这个 data。
+      明确不做：重置的查询接口（契约 6.1：结果未知时原内容重报取回）、网店侧的调用与定时；不改迁移与启动核对。
+    status: ready
+    depends_on:
+      - CORE-TASK-033
+      - CORE-TASK-034
+    acceptance_criteria:
+      - 接口放 app/api/demo_resets.py，数据库写入放 app/services/demo_resets.py，路由只在 CORE_ENV 为 demo 时由 app/main.py 挂上；已有测试照常通过
+      - 单元测试验证 parse_business_date：合法日期通过；2月30日、13月、少位数、带时间、非 ASCII 数字、非字符串、年份越界都抛 ValueError
+      - 集成测试在真 MySQL 上验证数量规则：有预留与不可售时 new_balance 为 max(target, reserved 加 unavailable)；available 为 max(target 减 reserved 减 unavailable, 0)；reserved、unavailable、paid_pending_dispatch 不变；增量为 0 的 SKU 不写流水、entry_id 为 null 但出现在结果里；没列的 SKU 不动；两个判定列在写与不写流水时都等于写后的 balance_version
+      - 集成测试验证业务引用与幂等：同键重放得首次结果；换键同内容得 200 与原结果；换键改 target 或改 SKU 顺序得 409 BUSINESS_REF_CONFLICT 并记事件且 details 如 purpose；换一天可再次重置；两个不同键并发重置同池同日只生效一次
+      - 集成测试验证拒绝：池为 initializing 得 409 POOL_NOT_LIVE；不存在与别的租户的 SKU 得 404 SKU_NOT_FOUND 且跨租户记事件；已合并的得 409 SKU_MERGED；停用的 SKU 照常重置；target 为负、非整数、超过 1000000、sku_id 重复、未知字段均 422；101 个 SKU 得 413；缺 demo.reset scope 得 403；被拒时没有流水也没有 demo_resets 行
+      - 集成测试验证生产实例：在 CORE-TASK-034 的标记上下文里以 CORE_ENV 为 production 创建应用，POST 该路径得 404 NOT_FOUND，不鉴权也不写任何东西
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+      - 集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/domain/stock.py
+      - tests/unit/test_stock.py
+      - app/api/demo_resets.py
+      - app/services/demo_resets.py
+      - app/main.py
+      - tests/integration/conftest.py
+      - tests/integration/test_demo_resets_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
