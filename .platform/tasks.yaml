@@ -1869,3 +1869,211 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-041
+    title: 写出确认销售的状态判定、行集比对与按 SKU 合计缺货的纯函数
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.13 的 5.7（与 5.2 第 5–7 条），新建 app/domain/sale_commits.py，只放纯函数与常量（不 import FastAPI、SQLAlchemy
+      或任何做 I/O 的库），单元测试放 tests/unit/test_sale_commits.py，用标准库 unittest。之后的确认销售、故障补交与待审结案任务都用它。
+      状态取值、is_due 等沿用 app/domain/reservations.py，流水类型沿用 app/domain/ledger.py 的 EntryType，请求摘要沿用 app/domain/idempotency.py 的 request_digest，不另写一份。
+      一，常量：流水 source_type sale_commit；reason_code late_payment 与 fault_mode。
+      二，merge_destination(sku_id, merged_into)：merged_into 是 sku_id 到 merged_into_sku_id（未合并为 None）的映射；顺着映射一直走到未合并的 SKU 并返回它；
+      sku_id 不在映射里返回 None；走的步数超过映射的大小（成环）抛 ValueError。
+      三，mismatched_line_refs(request_lines, order_lines, destinations)：两组都是 (line_ref, sku_id, quantity) 序列，destinations 是 sku_id 到合并去向（或 None）的映射；
+      返回升序的 line_ref 列表：只在一边出现的、quantity 不同的、请求 SKU 的去向为 None 或与订单行 SKU 的去向不同的；全部一致时为空列表（契约 5.7 第 3 步，Q-59）。
+      四，commit_decision(status, expires_at, now, recorded_payment_ref, payment_ref)：返回枚举 CommitDecision 的一个值——active 且未到期为 COMMIT；active 且已到期为 EXPIRE_THEN_LATE；
+      expired 为 LATE；late_payment_review 且 recorded_payment_ref 等于 payment_ref 为 LATE，不等为 PAYMENT_REF_CONFLICT；committed 且 recorded_payment_ref 等于 payment_ref 为 ANSWER_EXISTING，
+      不等为 STATE_CONFLICT；released、closed_refunded 为 STATE_CONFLICT；其他值抛 ValueError（契约 5.7 第 4 步，Q-57）。
+      五，sku_shortfalls(lines, available_by_sku)：lines 是按请求顺序的 (line_ref, sku_id, quantity)；按 sku_id 合计后与 available 比较，
+      按请求顺序返回所在 SKU 合计超过 available 的全部行，每项 line_ref、sku_id、quantity、available（该 SKU 的可售量）；都够时为空列表（契约 5.7 按 SKU 合计）。
+      六，commit_reason_code(entry_type, fault_mode)：fault_mode 为真时返回 fault_mode；否则 LATE_SALE_COMMIT 返回 late_payment、SALE_COMMIT 返回 None；其他流水类型抛 ValueError。
+      七，reserve_request_digest(order_ref, lines)：返回“同内容的预留请求”的摘要，即 request_digest 对 path 为空对象、body 为 order_ref 与 lines（每项 line_ref、sku_id、quantity）的结果（契约 5.7 第 5 步）。
+      明确不做：表结构、接口与服务层（CORE-TASK-042 起）。
+    status: ready
+    depends_on:
+      - CORE-TASK-036
+    acceptance_criteria:
+      - 函数与常量在 app/domain/sale_commits.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_sale_commits.py，用 unittest
+      - 单元测试验证 merge_destination：未合并返回自己；一级与两级合并链返回最终 SKU；不在映射里返回 None；成环抛 ValueError
+      - 单元测试验证 mismatched_line_refs：完全一致为空；多出、缺少、数量不同、请求 SKU 不存在都列出且升序；请求报原 SKU、订单行在规范 SKU 时算一致；订单行未改挂（仍在已合并的来源 SKU）时两边去向相同也算一致
+      - 单元测试逐个状态验证 commit_decision 的全部结果，含到期边界（now 等于 expires_at 算到期）、待审与已确认的 payment_ref 相同与不同，未知状态抛 ValueError
+      - 单元测试验证 sku_shortfalls：两行同一 SKU 各自够但合计不够时两行都列出；不足的 SKU 与够的 SKU 混在一起时只列不足的、按请求顺序；available 为 0 与恰好够的边界
+      - 单元测试验证 commit_reason_code 的三种结果与非法类型；reserve_request_digest 与对同一预留正文直接调用 request_digest 的结果相同，且与行的顺序无关
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/sale_commits.py
+      - tests/unit/test_sale_commits.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-042
+    title: 给预留表加确认销售与待审结案的列和约束
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.13 的 5.7 存放，新增迁移 alembic/versions/20261116_0008_sale_commits.py（revision 0008，接在 0007 之后），
+      在 app/models/orders.py 的 Reservation 上加列与约束。迁移只加列、加索引、加约束（契约 2.2），不改已有列与约束；downgrade 照 0007 的写法删去本次加的东西。
+      状态取值从 app/domain/reservations.py 引用，不另写一份。
+      一，加列：payment_ref、paid_at、commit_request_hash、committed_at、late（布尔，非空，默认 false）、fault_mode（布尔，非空，默认 false），
+      commit_credential_id、commit_actor_ref、commit_actor_role、commit_request_id，review_closed_at、review_closed_credential_id、review_closed_actor_ref、review_closed_actor_role、review_closed_request_id；
+      类型照现有列：ID 列同 credential_id、引用列同 order_ref、时间同 created_at、摘要同 request_hash、角色同 actor_role；两个布尔以外都可空。
+      二，(tenant_id, channel_id, payment_ref) 唯一；复合外键 (tenant_id, commit_credential_id) 与 (tenant_id, review_closed_credential_id) 指向 credentials（显式命名，避免与已有外键同名）。
+      三，检查约束：payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id 在 status 为 committed、late_payment_review、closed_refunded 时都非空、其他状态都为空；
+      committed_at 在 committed 时非空、其他状态为空；late 为真只在 committed；review_closed_at、review_closed_credential_id、review_closed_request_id 在 closed_refunded 时都非空、其他状态都为空；
+      status 为这三种时 closed_at 非空；commit_actor_ref 与 commit_actor_role、review_closed_actor_ref 与 review_closed_actor_role 各自同有同无。
+      四，集成测试 tests/integration/test_sale_commit_schema.py 用现有夹具建数据，逐条验证上面的约束能拦住不合格的行、放行合格的行（含 expired 转 committed 后保留原 closed_at、故障补交新建的行）。
+      明确不做：任何接口与服务层（CORE-TASK-044 起）；不改 order_lines 与流水表。
+    status: ready
+    depends_on:
+      - CORE-TASK-037
+    acceptance_criteria:
+      - 迁移文件为 alembic/versions/20261116_0008_sale_commits.py，down_revision 为 0007；模型在 app/models/orders.py；upgrade 后 alembic check 无差异（由 CI 的 integration 执行），已有的预留表结构测试照常通过
+      - 集成测试验证 committed 的行：缺 payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id 或 committed_at 任一被拒；closed_at 为空被拒；齐全时放行，late 真假都可
+      - 集成测试验证 late_payment_review 与 closed_refunded 的行：committed_at 非空被拒、late 为真被拒；closed_refunded 缺 review_closed_ 三列任一被拒，late_payment_review 带它们被拒
+      - 集成测试验证 active、released、expired 的行：带 payment_ref 或任何 commit_、review_closed_ 列被拒；不带时与 0007 的行为相同
+      - 集成测试验证唯一与外键：同一入口两行同一 payment_ref 被拒，payment_ref 都为空的多行放行；commit_credential_id 指向别的租户的凭据被拒；操作者两列只有一列被拒
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/models/orders.py
+      - alembic/versions/20261116_0008_sale_commits.py
+      - tests/integration/test_sale_commit_schema.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-043
+    title: 给幂等执行器加回滚后整个命令重做一次的机制
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.13 的 5.7 通用一节的“重新判定”与 7.1 第 2 条的例外，在 app/services/idempotency.py 的 run_idempotent 加一种重做：
+      命令抛新的异常 RedoCommand 时，执行器回滚业务事务，丢弃这次登记的安全事件与被拒仍保留的写入，在同一连接上（幂等命名锁与 READ COMMITTED 仍在）
+      从开业务事务之前的余额行预建那一步整个重做一遍：重新调用 balance_rows 取要预建的行并预建、重新调用 CORE-TASK-039 加的开事务前钩子，再开新事务执行同一个命令。
+      每个请求最多重做一次；重做里命令再抛 RedoCommand 时回滚，返回 503 UNAVAILABLE（retryable 为真），不保存幂等记录，两次登记的安全事件都丢弃。
+      已有的 BusinessRefTaken 行为不变；不抛 RedoCommand 的命令行为不变。
+      明确不做：确认销售本身（CORE-TASK-044）。
+    status: ready
+    depends_on:
+      - CORE-TASK-039
+    acceptance_criteria:
+      - RedoCommand 与重做逻辑在 app/services/idempotency.py；已有的幂等、预留、释放、库存管理命令的测试照常通过
+      - 集成测试验证重做一次：命令第一次写一行并登记一个安全事件后抛 RedoCommand，第二次正常返回；结果是第二次的响应并作为确定结果保存，第一次的写入与事件都不在，第二次的事件写入
+      - 集成测试验证重做时重新预建与调用钩子：balance_rows 与钩子各被调用两次，第二次 balance_rows 返回的新行被预建；重做期间同一幂等键的并发请求得到 409 REQUEST_IN_PROGRESS
+      - 集成测试验证重做后再抛：返回 503 UNAVAILABLE 且 retryable 为真，没有幂等记录、两次的写入与事件都不在，同键再发会重新执行
+      - 集成测试验证重做在 READ COMMITTED 下：read_committed 为真时重做的事务仍是 READ COMMITTED，请求结束后连接的隔离级别复原
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/idempotency.py
+      - tests/integration/test_idempotency.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-044
+    title: 实现对已有预留的确认销售与晚到确认
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.13 的 5.7（通用、确认销售的第 1–4 步与报业务拒绝之前重查业务引用、晚到确认、表示）与 5.2 第 5–7 条，
+      新建 app/api/sale_commits.py 与 app/services/sale_commits.py，在 app/main.py 挂路由；规则用 CORE-TASK-041 的 app/domain/sale_commits.py，
+      关单用 CORE-TASK-039 的 close_if_due，写流水用 app/services/stock.py 的函数，重做用 CORE-TASK-043 的 RedoCommand。
+      一，POST /v1/orders/{order_ref}/sale-commits（操作类型 sale_commits.create，scope orders.write，不要求角色）：路径 order_ref 不合格 422；
+      正文 reservation_id（1 到 32 个字符的字符串或 null）、payment_ref、paid_at（带时区的 RFC 3339，存为 UTC）、lines（规则同预留，沿用 app/api/reservations.py 的行校验），四个都必填，其他 422；
+      池用 app/api/auth.py 的 require_sales_pool，没有入口 403。经 run_idempotent，read_committed=True；balance_rows 为所列 SKU 及其合并去向（普通读）；
+      开事务前钩子对同样这些 SKU 先关到期（复用 CORE-TASK-039 新预留用的那段逻辑与它的出错处理）。
+      二，事务里照 5.7 第 1–4 步：普通读按 payment_ref 查；FOR UPDATE 按 order_ref 读预留行；FOR SHARE 读订单行后比对行集；commit_decision 分支——写入分支先 FOR SHARE 读池行，
+      COMMIT 每行一条 SALE_COMMIT，EXPIRE_THEN_LATE 在同一事务里 close_if_due 后走晚到确认，LATE 走晚到确认；晚到确认按 sku_shortfalls 判，够则每行一条 LATE_SALE_COMMIT，
+      不够则转 late_payment_review 并作为被拒仍保留的写入提交，409 LATE_PAYMENT_INSUFFICIENT_STOCK。流水 source_type sale_commit、source_ref order_ref、occurred_at 取 5.7 定的付款时间、reason_code 用 commit_reason_code。
+      报不写东西的业务拒绝之前在同一事务里重查业务引用；写 payment_ref 撞唯一约束、或要判可售时合并去向不在开事务前处理过的 SKU 里，抛 RedoCommand。
+      三，没有预留且 reservation_id 为 null（故障补交新建，CORE-TASK-045 实现）：本任务先返回 503 UNAVAILABLE，不保存。
+      四，app/services/reservations.py 的表示加 5.7 的字段（payment_ref、paid_at、committed_at、late、fault_mode、review_closed_at），预留查询与本命令都返回。
+      明确不做：故障补交新建（CORE-TASK-045）；待审结案（CORE-TASK-046）；付款后的分支与订单查询。
+    status: ready
+    depends_on:
+      - CORE-TASK-039
+      - CORE-TASK-041
+      - CORE-TASK-042
+      - CORE-TASK-043
+    acceptance_criteria:
+      - 接口在 app/api/sale_commits.py，命令在 app/services/sale_commits.py，路由在 app/main.py 挂上，表示的新字段在 app/services/reservations.py；已有的预留、释放与查询测试照常通过
+      - 集成测试验证正常确认：200 与表示（committed，payment_ref、paid_at、committed_at，late 与 fault_mode 为假）；余额 stock_balance 与 reserved 减、paid_pending_dispatch 加；每行一条 SALE_COMMIT，来源字段、occurred_at 与 reason_code 照契约；订单行 committed_qty 等于 quantity；reservation_id 为 null 时 reason_code 为 fault_mode、表示 fault_mode 为真
+      - 集成测试验证晚到确认：已关为 expired 的与已到期未关的 active 都在有货时 200、late 为真、每行一条 LATE_SALE_COMMIT（未关的同一事务里先有 RELEASE expired）；缺货时 409 LATE_PAYMENT_INSUFFICIENT_STOCK、details.lines 按 SKU 合计列出、数量不变、状态 late_payment_review 并记下 payment_ref 与 paid_at，同键重放 409；补货后换键同 payment_ref 成功且流水 occurred_at 为第一次的 paid_at；换 payment_ref 409 STATE_CONFLICT 且 details 带 reason 与 status
+      - 集成测试验证拒绝：released、closed_refunded 与已用别的 payment_ref 确认的都 409 STATE_CONFLICT 且 details 带 status；payment_ref 已用在别的订单 409 BUSINESS_REF_CONFLICT 并写 business_ref_conflict 事件；reservation_id 不同 409 RESERVATION_MISMATCH（reason 为 reservation_id）；行多、少、数量或 SKU 不同 409 RESERVATION_MISMATCH 且 line_refs 升序；有 reservation_id 而订单没有预留 404 RESERVATION_NOT_FOUND；凭据没有入口 403；没有预留且 reservation_id 为 null 时 503 且没有幂等记录
+      - 集成测试验证业务引用与重放：同键原样重放带 Idempotency-Replayed；换键同内容 200 与当前表示；换键同 payment_ref 不同内容 409 BUSINESS_REF_CONFLICT；两个键同一 payment_ref 并发确认同一订单只写一组流水、后到的得到 200；两个订单并发用同一 payment_ref 时后到的 409 BUSINESS_REF_CONFLICT
+      - 集成测试验证合并与先关到期：模拟合并（把来源 SKU 标为已合并、订单行改挂、reserved 挪到规范 SKU）后按原 SKU 确认成功；模拟合并后已释放的订单确认 409 STATE_CONFLICT；一个已到期未关的预留占着同一 SKU 的全部可售量时，晚到确认仍判为有货
+      - 集成测试验证正文与查询：paid_at 不带时区、payment_ref 格式不对、reservation_id 超过 32 个字符、lines 重复 line_ref 或 sku_id 都 422，101 行 413；按 ID 与按 order_ref 查询都返回新字段
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/sale_commits.py
+      - app/services/sale_commits.py
+      - app/services/reservations.py
+      - app/main.py
+      - tests/integration/test_sale_commits_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-045
+    title: 实现找不到预留时的故障补交新建
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.13 的 5.7 第 5 步、晚到确认与通用一节的重新判定，以及 5.5，在 CORE-TASK-044 的 app/services/sale_commits.py 里
+      把“没有预留且 reservation_id 为 null”从 503 换成故障补交新建。
+      一，FOR SHARE 读池行，不是 live 409 POOL_NOT_LIVE；普通读查 SKU，不存在或属于别的租户 404 SKU_NOT_FOUND（details.sku_ids 按请求顺序列全，属于别的租户的登记 cross_tenant，同预留第 3 步）。
+      二，各行取请求 SKU 的合并去向，按 (pool_id, sku_id) 升序锁余额行，再按 sku_id 升序 FOR SHARE 读这些 SKU 行；有一个已合并，或合并去向不在开事务前处理过的 SKU 里，抛 RedoCommand。
+      三，按 sku_shortfalls 判可售（停用、合并进行中都不拦）；写预留一行与订单行：fault_mode 为真，created_at 与 closed_at 为现在，ttl_seconds 取当前配置，expires_at 为 created_at 加它，
+      request_hash 用 reserve_request_digest，创建的凭据、操作者与请求 ID 取本次请求；够则每行一条 LATE_SALE_COMMIT（reason_code fault_mode）、订单行 committed_qty 等于 quantity、状态 committed、late 为真；
+      不够则不写流水、订单行 committed_qty 为 0、状态 late_payment_review，作为被拒仍保留的写入提交，409 LATE_PAYMENT_INSUFFICIENT_STOCK。
+      四，写入撞上 order_ref 或 payment_ref 的唯一约束时抛 RedoCommand（重做后按已有的预留回答）。
+      报 404 SKU_NOT_FOUND 之前照 5.7 重查业务引用；重查命中改按第 1 步回答时，丢弃本次登记的 cross_tenant 事件，没命中时保留（同 5.6 并发重报）。
+      明确不做：待审结案（CORE-TASK-046）；SKU 合并本身。
+    status: ready
+    depends_on:
+      - CORE-TASK-044
+    acceptance_criteria:
+      - 改动在 app/services/sale_commits.py；CORE-TASK-044 的测试照常通过（其中没有预留时 503 的那条改为本任务的行为，在新测试文件里验证）
+      - 集成测试验证有货：200，表示为 committed、fault_mode 与 late 为真；每行一条 LATE_SALE_COMMIT 且 reason_code 为 fault_mode；预留行的 closed_at 等于 created_at、expires_at 等于 created_at 加有效期；之后用同样的行调预留得到 200 与这个预留，行不同 409 ORDER_REFERENCE_CONFLICT
+      - 集成测试验证缺货：409 LATE_PAYMENT_INSUFFICIENT_STOCK，预留为 late_payment_review、订单行 committed_qty 为 0、没有流水；补货后换键同 payment_ref 确认成功并转 committed
+      - 集成测试验证拒绝：SKU 不存在 404 SKU_NOT_FOUND，别的租户的 SKU 404 并写 cross_tenant 事件；停用的 SKU 照常确认；被拒后没有预留与订单行
+      - 集成测试验证合并：请求报已合并的 SKU 时订单行挂在规范 SKU 上；用闸门让一笔模拟合并在算出去向之后、锁余额行之前提交时，命令重做一次后挂到新去向并成功
+      - 集成测试验证并发：故障补交与同一 order_ref 的预留并发时，后到的重做后按已有预留回答；两个键同一 order_ref 并发故障补交只建一个预留、只写一组流水
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/sale_commits.py
+      - tests/integration/test_sale_commit_fault_api.py
+      - tests/integration/test_sale_commits_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-046
+    title: 实现晚到支付待审的结案
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.13 的 5.7 待审结案，在 CORE-TASK-044 的 app/api/sale_commits.py 与 app/services/sale_commits.py 加
+      POST /v1/orders/{order_ref}/late-payment-review/close（操作类型 late_payment_reviews.close，scope orders.write，不要求角色）。
+      路径 order_ref 不合格 422；没有请求体，收到非空请求体 422（契约 8.1 第 7 步）；池用 require_sales_pool，没有入口 403；经 run_idempotent，read_committed=True，不传 balance_rows。
+      事务里 FOR UPDATE 按 order_ref 读预留行：没有 404 RESERVATION_NOT_FOUND；late_payment_review 改为 closed_refunded，记 review_closed_at 与 review_closed_ 一组列，不写流水，200 与表示；
+      已是 closed_refunded 不写任何东西，200 与当前表示；其他状态 409 STATE_CONFLICT，details 带表示里的状态（已到期未关的 active 报 expired）。
+      明确不做：确认销售与故障补交（CORE-TASK-044、045）。
+    status: ready
+    depends_on:
+      - CORE-TASK-044
+    acceptance_criteria:
+      - 接口在 app/api/sale_commits.py，命令在 app/services/sale_commits.py；已有的确认销售测试照常通过
+      - 集成测试验证结案：待审的预留结案后 200，表示为 closed_refunded、review_closed_at 有值；预留行记下凭据与请求 ID，带操作者头时记下操作者；没有流水；数量不变
+      - 集成测试验证重复与状态：再结案（含换键）200 不改；active、expired、released、committed 都 409 STATE_CONFLICT 且 details 带 status，已到期未关的 active 报 expired；结案后再确认销售 409 STATE_CONFLICT
+      - 集成测试验证拒绝：订单没有预留 404 RESERVATION_NOT_FOUND；凭据没有入口 403；非空请求体 422；order_ref 格式不对 422
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/sale_commits.py
+      - app/services/sale_commits.py
+      - tests/integration/test_late_payment_review_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
