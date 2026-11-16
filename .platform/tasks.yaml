@@ -1748,7 +1748,7 @@ tasks:
       require_live、require_skus_exist、lock_balances、require_not_merged、append_entry 用 app/services/stock.py；写命令经 app/services/idempotency.py 的 run_idempotent，
       传 balance_rows（凭据入口的池与各 sku_id）与 read_committed=True；池用 app/api/auth.py 的 require_sales_pool。
       一，配置：app/config.py 加 reservation_ttl_seconds（环境变量 CORE_RESERVATION_TTL_SECONDS，默认 900），用 parse_ttl_seconds 校验，不合格时 Settings 构造失败；
-      .env.example 与 docker-compose.yml 写上这一项与默认值；create_app 在进程日志写一行当前值。
+      docker-compose.yml 把这一项传进容器、没设时取 900（.env.example 已由登记 PR 写好）；create_app 在进程日志写一行当前值。
       二，POST /v1/reservations（操作类型 reservations.create，scope orders.write，不要求角色，操作者头带了照常校验并记录）：正文只有 order_ref 与 lines
       （1 到 100 个，批量数组，超过 413；每项只有 line_ref、sku_id、quantity，quantity 为 1 到 1000000 的 JSON 整数）；未知字段、引用格式不对、line_ref 重复、sku_id 重复都 422。
       三，命令按契约 5.6 的七步：普通读按 (tenant_id, channel_id, order_ref) 查预留，有则摘要相同 200 与当前表示、不同 409 ORDER_REFERENCE_CONFLICT（details 为 ref_type order 与 ref）并记 business_ref_conflict；
@@ -1765,7 +1765,7 @@ tasks:
       - CORE-TASK-036
       - CORE-TASK-037
     acceptance_criteria:
-      - 接口在 app/api/reservations.py，命令与表示在 app/services/reservations.py，路由在 app/main.py 挂上；配置项在 app/config.py，.env.example 与 docker-compose.yml 已写上
+      - 接口在 app/api/reservations.py，命令与表示在 app/services/reservations.py，路由在 app/main.py 挂上；配置项在 app/config.py，docker-compose.yml 已把它传进容器且默认 900
       - 集成测试验证成功路径：201 的表示字段齐全，expires_at 等于 created_at 加配置的有效期；余额 reserved 按行增加；每行一条 RESERVE 流水，来源字段与 reason_code 照契约；同键重放原样返回且带 Idempotency-Replayed
       - 集成测试验证拒绝：缺货 409 INSUFFICIENT_STOCK 且 details.lines 列全；SKU 停用、所属商品停用 409 SKU_INACTIVE；已合并 409 SKU_MERGED；SKU 不存在或属于别的租户 404；池未上线 409 POOL_NOT_LIVE；凭据没有销售入口 403；被拒后没有预留、订单行与流水，换新幂等键同一 order_ref 在补货后可以成功
       - 集成测试验证正文：sku_id 重复、line_ref 重复、quantity 为 0 或布尔或字符串、未知字段都 422；101 行 413
@@ -1778,7 +1778,6 @@ tasks:
       - app/services/reservations.py
       - app/main.py
       - app/config.py
-      - .env.example
       - docker-compose.yml
       - tests/integration/test_reservations_api.py
     allowed_commands:
