@@ -1765,7 +1765,7 @@ tasks:
       五，查询（scope orders.read）：GET /v1/reservations/{reservation_id}，不存在或属于别的租户 404 RESERVATION_NOT_FOUND，后者记 cross_tenant；
       GET /v1/reservations?order_ref=…，按凭据的销售入口查，返回 reservations 数组 0 或 1 个，凭据没有入口时为空数组，order_ref 缺少或格式不对 422。
       明确不做：释放、到期关单、定时任务与新预留之前的关单（CORE-TASK-039）；可售量查询（CORE-TASK-040）；确认销售。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-036
       - CORE-TASK-037
