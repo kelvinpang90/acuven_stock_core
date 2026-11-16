@@ -1,5 +1,5 @@
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -12,35 +12,73 @@ from sqlalchemy.sql.expression import Executable
 
 from alembic import command
 from app.db import make_engine
+from app.domain.environment import DEMO, PRODUCTION
 from app.models.catalog import Product, Sku, Tenant
 from app.models.inventory import LedgerEntry, Location, SalesChannel, StockBalance, StockPool
 from app.models.service_auth import Credential
 
 # 只指向 CI 的一次性 MySQL 服务容器；本地没设时，用到下面夹具的测试跳过。
 TEST_DATABASE_URL = os.environ.get("CORE_TEST_DATABASE_URL", "")
+# 同一容器里的第二个库，标记为 production（契约 6.1）。
+TEST_PRODUCTION_DATABASE_URL = os.environ.get("CORE_TEST_PRODUCTION_DATABASE_URL", "")
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def migrate(
+    step: Callable[[Config, str], object], revision: str, database_url: str, core_env: str | None
+) -> None:
+    """以给定的 CORE_ENV（None 表示没有设）对库执行 command.upgrade 或 command.downgrade。
+
+    0006 起迁移要求 CORE_ENV，并在库里已有实例标记时先核对它（契约 6.1）。
+    调用之前，测试对这个库开着的连接与事务都要先结束，否则 DDL 等元数据锁直到超时。
+    """
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    with pytest.MonkeyPatch.context() as env:
+        # alembic/env.py 只从 CORE_DATABASE_URL 读连接串。
+        env.setenv("CORE_DATABASE_URL", database_url)
+        if core_env is None:
+            env.delenv("CORE_ENV", raising=False)
+        else:
+            env.setenv("CORE_ENV", core_env)
+        step(config, revision)
 
 
 @pytest.fixture(scope="session")
 def migrated_engine() -> Iterator[Engine]:
-    """需要表结构的测试共用：会话开始时升级到 head，结束时降到 base。
+    """需要表结构的测试共用：会话开始时以 demo 升级到 head，结束时降到 base。
 
     结束时降到底，CI 之后的迁移往返才能照常从空库开始。
     """
     if not TEST_DATABASE_URL:
         pytest.skip("CORE_TEST_DATABASE_URL not set (CI only)")
-    config = Config(str(ROOT / "alembic.ini"))
-    config.set_main_option("script_location", str(ROOT / "alembic"))
     with pytest.MonkeyPatch.context() as env:
-        # alembic/env.py 只从 CORE_DATABASE_URL 读连接串。
+        # 会话期间照旧留着 CORE_DATABASE_URL；CORE_ENV 只在升降迁移时设。
         env.setenv("CORE_DATABASE_URL", TEST_DATABASE_URL)
-        command.upgrade(config, "head")
+        migrate(command.upgrade, "head", TEST_DATABASE_URL, DEMO)
         engine = make_engine(TEST_DATABASE_URL)
         try:
             yield engine
         finally:
             engine.dispose()
-            command.downgrade(config, "base")
+            migrate(command.downgrade, "base", TEST_DATABASE_URL, DEMO)
+
+
+@pytest.fixture(scope="session")
+def production_engine() -> Iterator[Engine]:
+    """标记为 production 的第二个库：会话开始时以 production 升级到 head，结束时降到 base。
+
+    CI 设了 CORE_TEST_PRODUCTION_DATABASE_URL；本地没设时，用到它的测试跳过。
+    """
+    if not TEST_PRODUCTION_DATABASE_URL:
+        pytest.skip("CORE_TEST_PRODUCTION_DATABASE_URL not set (CI only)")
+    migrate(command.upgrade, "head", TEST_PRODUCTION_DATABASE_URL, PRODUCTION)
+    engine = make_engine(TEST_PRODUCTION_DATABASE_URL)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        migrate(command.downgrade, "base", TEST_PRODUCTION_DATABASE_URL, PRODUCTION)
 
 
 # 下面是 schema 测试共用的：每个测试在一个事务里跑、结束时回滚；

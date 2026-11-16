@@ -1,5 +1,6 @@
-"""库存侧的表：地点、库存池、销售入口、余额、流水、幂等记录，以及期初导入、库存单据与盘点单
-（契约第 1 节、第 3 节、4.1、4.3、6.2、6.3、6.6、6.7、7.1；租户隔离见第 10 节第 1 条）。
+"""库存侧的表：地点、库存池、销售入口、余额、流水、幂等记录，以及期初导入、库存单据、盘点单
+与 Demo 重置（契约第 1 节、第 3 节、4.1、4.3、6.1、6.2、6.3、6.6、6.7、7.1；
+租户隔离见第 10 节第 1 条）。
 
 只有表结构与数据库约束。锁行顺序、balance_version 递增、幂等重放等
 由服务层在同一事务里做（契约 7.1、8.1）。
@@ -7,7 +8,7 @@
 这里只按 utf8mb4_bin 精确比较。
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -15,6 +16,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     CheckConstraint,
+    Date,
     ForeignKey,
     ForeignKeyConstraint,
     SmallInteger,
@@ -41,7 +43,8 @@ ZERO = text("0")
 
 QUANTITIES = ("stock_balance", "reserved", "unavailable", "paid_pending_dispatch")
 
-# 契约 4.3 表的十八种流水类型。
+# 契约 4.3 表的十八种流水类型。模型照 Demo 库；生产库上迁移 0006 把检查约束换成
+# 不含 DEMO_RESET 的版本（契约 6.1），以后的迁移按库里的 core_instance 保持这个差别。
 ENTRY_TYPES = (
     "OPENING_BALANCE",
     "RECEIPT",
@@ -434,6 +437,48 @@ class StockDocument(Base):
     credential_id: Mapped[str] = mapped_column(ID)
     actor_ref: Mapped[str] = mapped_column(REF)
     actor_role: Mapped[str] = mapped_column(CODE32)
+    request_id: Mapped[str] = mapped_column(REF)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=NOW)
+
+
+class DemoReset(Base):
+    """一次已生效的 Demo 重置一行，只追加，永久保留（契约 6.1 的存放）。
+
+    两种实例都建这张表，生产库上它始终是空的。reset_id 的前缀 drs_ 由应用生成。
+    """
+
+    __tablename__ = "demo_resets"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "channel_id"], ["sales_channels.tenant_id", "sales_channels.channel_id"]
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "pool_id"], ["stock_pools.tenant_id", "stock_pools.pool_id"]
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "credential_id"], ["credentials.tenant_id", "credentials.credential_id"]
+        ),
+        # 业务引用：同一池同一天只生效一次（契约 6.1、7.1 第 2 条）。
+        UniqueConstraint("tenant_id", "pool_id", "business_date"),
+        CheckConstraint("JSON_TYPE(result) = 'OBJECT'", name="result"),
+        # 重置不要求角色（契约第 10 节第 3 条）：有操作者时才有角色，反之亦然。
+        CheckConstraint("(actor_ref IS NULL) = (actor_role IS NULL)", name="actor"),
+        TABLE_OPTIONS,
+    )
+
+    reset_id: Mapped[str] = mapped_column(ID, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ID, ForeignKey("tenants.tenant_id"))
+    channel_id: Mapped[str] = mapped_column(ID)
+    pool_id: Mapped[str] = mapped_column(ID)
+    # 马来西亚日期，Core 不拿它与当前日期比较（契约 6.1）。
+    business_date: Mapped[date] = mapped_column(Date)
+    # 规范化请求摘要 SHA-256 的小写十六进制（契约 7.1）。
+    request_hash: Mapped[str] = mapped_column(CHAR(64, collation=EXACT_COLLATION))
+    # 首次 201 响应的 data。
+    result: Mapped[dict[str, Any]] = mapped_column(JSON)
+    credential_id: Mapped[str] = mapped_column(ID)
+    actor_ref: Mapped[str | None] = mapped_column(REF)
+    actor_role: Mapped[str | None] = mapped_column(CODE32)
     request_id: Mapped[str] = mapped_column(REF)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=NOW)
 
