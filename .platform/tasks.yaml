@@ -1540,7 +1540,7 @@ tasks:
       五，测试：tests/integration/conftest.py 的 migrated_engine 在升降迁移时把 CORE_ENV 设为 demo；新增会话级夹具，对环境变量
       CORE_TEST_PRODUCTION_DATABASE_URL 指向的第二个库以 CORE_ENV 为 production 升到 head、结束时降到 base，变量没设时 skip（CI 设了它）。对 production 库升降迁移之前，测试里对它开着的连接与事务都要先结束（否则 DDL 等元数据锁直到超时）；降到 0005 后插入的流水必须回滚，否则升回 head 时加检查约束会校验已有行而失败。
       明确不做：API 与运维命令行的启动核对（CORE-TASK-034）、重置命令本身（CORE-TASK-035）；不改 CI 与部署配置。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 迁移文件放 alembic/versions，revision 0006 接在 0005 之后，upgrade 与 downgrade 都写全；core_instance 模型在新模块 app/models/instance.py，并已在 alembic/env.py 与 app/models/__init__.py 登记；约束名遵循 app/db.py 的命名约定；CI 的迁移往返与 alembic check 通过
