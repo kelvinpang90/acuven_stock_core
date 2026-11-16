@@ -1636,7 +1636,7 @@ tasks:
       返回 201 与重置的表示：reset_id、pool_id、business_date、created_at、skus 按请求顺序，每项 sku_id、target、delta、entry_id（delta 为 0 时为 null）、
       写后的四个量、available 与 balance_version；result 存的就是这个 data。
       明确不做：重置的查询接口（契约 6.1：结果未知时原内容重报取回）、网店侧的调用与定时；不改迁移与启动核对。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-033
       - CORE-TASK-034
