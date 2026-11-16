@@ -25,6 +25,8 @@
 - **流水只追加**：不 UPDATE、不 DELETE 流水；纠错走 `CORRECTION`。
 - **Demo 与生产**：`CORE_ENV` 只在启动时读；Demo 专用能力（如每日重置）必须在 `CORE_ENV=production` 时不可达（契约 §6.1）。
 - **数据库迁移只做向前兼容的扩展**（加表、加列、加索引），部署脚本在换容器前跑 `alembic upgrade head`。
+- **流水类型约束因实例而异**：生产库的不含 `DEMO_RESET`。以后重建这条约束或流水表的迁移，按库里 `core_instance.core_env` 决定是否包含它，
+  不按 `CORE_ENV`，也不按模型里的静态列表（契约 §6.1）。
 - **共享文件清单**（登记同类任务时逐个对照，补进 `allowed_change_paths`）：
   - 新增 `/v1` 路由的任务：`app/main.py`（挂路由）；
   - 新增数据库模型模块的任务：`alembic/env.py`（在那里 import 新模型模块，登记到 `Base.metadata`）、`app/models/__init__.py` 与新迁移文件要一起列；`app/db.py` 不用改；
