@@ -207,12 +207,14 @@ stateDiagram-v2
   点数前的实物进出须先入账，规则同 §6。只有重新点过实物时才重新录入，后一次覆盖前一次的实数与快照。
 - **执行（`execute`）**：第 0 步的关单在开事务之前；之后的检查与第 1–3 步在 Core 的**一个事务**里，两个余额行按 `(pool_id, sku_id)` 升序加锁
   （0.12：要改挂订单行，所以锁余额行之前先按 `reservation_id` 升序锁住涉及的预留行，再按 §5.6 的锁序锁订单行与余额行，细节在登记合并任务前定。0.13：用普通读找出的预留名单，在等余额行期间可能漏掉并发提交的故障补交新建的订单行（§5.7 第 5 步），
-  所以锁住余额行之后要复核两个 SKU 上的订单行，多出名单的就回滚重来，不能在锁住余额行之后再去锁新的预留行，那与“预留行 → 余额行”的锁序相反）：
+  所以锁住余额行之后要用 READ COMMITTED 的普通读复核两个 SKU 上的订单行（REPEATABLE READ 下会漏看刚提交的行），多出名单的就回滚重来（次数上限由合并任务定），
+  不能在锁住余额行之后再去锁新的预留行，那与“预留行 → 余额行”的锁序相反；也不能在锁余额行之前锁 SKU 行，否则与故障补交新建“余额行 → SKU 行”成环）：
   0. **前置检查**：开业务事务之前（§2.7 的先后里余额行预建之后），按 §5.6 的到期关闭把两个 SKU 上已到期的 `active` 预留逐个关掉，每个一个事务（0.12：不在锁住余额行之后关单，否则与释放、到期关单“预留行 → 余额行”的锁序成环）；
      开事务之后才到期的预留随订单行一起迁到规范 SKU，之后照常关单。再查快照之后两个 SKU 上有没有 §6 定义的**只改账的流水**（看锁住的余额行上的 `last_book_only_version` 是否大于快照版本，§4.1，0.9）；
      有则录入的实数已作废，整笔拒绝，409 `COUNT_STALE`，合并单留在 `counted`，须重新点数、重新录入。
   1. **整行迁移**：来源 SKU **执行时**的四个账面量全部转到规范 SKU——来源写 `MERGE_TRANSFER_OUT`（四个量各减去当前值，归零），
-     规范写 `MERGE_TRANSFER_IN`（各加同样的量），成对出现；来源的未结预留、订单行累计量同时改挂到规范 SKU。
+     规范写 `MERGE_TRANSFER_IN`（各加同样的量），成对出现；来源的未结预留、订单行累计量同时改挂到规范 SKU。0.13：改挂的是来源 SKU 上 `active`、`expired`、`late_payment_review`、`committed` 四种状态的预留的全部订单行
+     （已到期、已在待审的订单仍可能晚到确认，§5.7 按订单行的 `sku_id` 比对与锁余额行），找出、锁住的预留名单也按这四种状态取；`released`、`closed_refunded` 的不改挂。
      两个各自满足不变量的账面相加仍满足不变量，这一步不会失败。两条迁移流水都是只改账的流水，照 §4.1 更新两个余额行的 `last_book_only_version` 与 `last_reconciled_version`（0.9、0.10）。
   2. **按差额定数**：`d_u` = 不可售实数 − 两个快照的 `unavailable` 之和；
      `d_shelf` = 在架实数 − 两个快照的（`stock_balance` − `unavailable` + `paid_pending_dispatch`）之和。
@@ -655,9 +657,11 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
   预留按 `(tenant_id, channel_id, order_ref)` 查找，只会找到本入口的预留；V1 一个入口对一个池（§1、§3），找到的预留的池就是获准的池。
 - 隔离级别与锁序同 §5.6：写事务以 READ COMMITTED 开启；预留行（`FOR UPDATE`）→ 订单行（`FOR SHARE`）→ 池行（`FOR SHARE`）→ 余额行（`FOR UPDATE`，按 §8.1 升序）→ SKU 行（`FOR SHARE`，按 `sku_id` 升序；只在故障补交新建时读，只为复核合并去向，不判停用），用不到的层跳过。不锁商品行（Q-58：停用不拦已付款的订单）。
 - 本节的 409 `STATE_CONFLICT`（确认销售与待审结案），`details` 都带 `{"status": …}`，取表示里的状态（已到期还没关掉的 `active` 报 `expired`，§5.6）。
-- **重新判定**：本节说“重新判定”的地方（撞唯一约束、故障补交复核合并去向时去向变了），都是回滚后从开业务事务之前的预建余额行那一步整个重做一遍（新的合并去向也预建、先关到期）。
+- **重新判定**：本节说“重新判定”的地方（撞唯一约束、故障补交复核合并去向时去向变了、事务里算出的合并去向不在开事务前处理过的 SKU 里），
+  都是回滚后在同一连接上（幂等命名锁仍持有）从开业务事务之前的预建余额行那一步整个重做一遍（新的合并去向也预建、先关到期）。
+  “不在开事务前处理过的 SKU 里”指开事务前后之间有合并提交：新去向没有先关到期，可能把有货的订单误判进待审，所以也重判。
   每个请求最多重新判定一次；重新判定里又遇到要回滚重判的情形，503 `UNAVAILABLE`（确定未生效，可同键重试）。这是 §7.1 第 2 条“不返回 5xx”的例外：
-  一次重判后读到的是已提交的对方结果，只有又碰上另一笔并发的合并或确认才会再撞，极少发生，不为它无限重试。
+  一次重判后读到的是已提交的对方结果，只有又碰上另一笔并发的合并或确认才会再撞，极少发生，不为它无限重试。以 503 结束时，两次尝试登记的安全事件都丢弃。
 - **合并去向**：一个 SKU 的合并去向是顺着 `merged_into_sku_id` 一直走到未合并的 SKU；没合并过的 SKU 就是它自己。在事务里用普通读查（READ COMMITTED 下看到最新已提交的合并）。
 - **按 SKU 合计**：判定可售时，把订单行按 `sku_id` 合计后与该 SKU 的 `available` 比较（合并改挂之后，同一订单可能有两行指向同一个 SKU，§5.6 存放）。
 - 流水：确认写 `SALE_COMMIT` 或 `LATE_SALE_COMMIT`，每个订单行一条（§4.3）。`source_type` 为 `sale_commit`，`source_ref` 为 `order_ref`，`line_ref` 为该行的 `line_ref`；
@@ -682,6 +686,8 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
      - **有**：`reservation_id` 不为 `null` 且与它不同，409 `RESERVATION_MISMATCH`，`details` 为 `{"reason": "reservation_id"}`；`null` 视为同一个。
   3. 行集比对（§5.2 第 5 条）：`FOR SHARE` 读订单行，之后再查请求 SKU 的合并去向（加锁读会等正在改挂订单行的合并提交，之后的普通读看得到它改的 SKU 行）。请求的 `line_ref` 集合与订单行的相同，且每行 `quantity` 相同、请求 `sku_id` 的合并去向等于订单行的 `sku_id`，才算一致（Q-59）；请求的 `sku_id` 不存在或属于别的租户时没有合并去向，算这一行不一致（不另报 `SKU_NOT_FOUND`，不记事件：比对的对象是本订单已有的行）；
      否则 409 `RESERVATION_MISMATCH`，`details` 为 `{"reason": "lines", "line_refs": [...]}`，按升序列出不一致的、请求里多出的与缺少的 `line_ref`。
+     第 2、3 步要报 `RESERVATION_MISMATCH` 之前，先看锁住的预留：已 `committed` 且记下的 `payment_ref` 与请求的相同（第 1 步之后才被并发提交），按第 1 步回答，
+     让并发与先后到达的同一 `payment_ref` 得到相同的结果。
   4. 写入的分支（正常确认、晚到确认、关单）先 `FOR SHARE` 读池行（排在余额行之前，§5.6 锁序；预留建立时池已 `live`，池不会退回 `initializing`），再按预留状态：
      - `active` 且现在早于 `expires_at`：**正常确认**。按 §8.1 升序锁住各行 SKU 的余额行，每行写一条 `SALE_COMMIT`（`stock_balance`、`reserved` 各减该行 `quantity`，`paid_pending_dispatch` 加），
        订单行 `committed_qty` 设为 `quantity`，预留改为 `committed`，记下确认的各列（见存放），`late` 为 `false`。200，返回表示；
@@ -727,8 +733,8 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
 
 **存放**（迁移只加列、加索引、加约束，§2.2）
 - `reservations` 加列：`payment_ref`、`paid_at`、确认摘要 `commit_request_hash`、`committed_at`、`late`（布尔，默认 `false`）、`fault_mode`（布尔，默认 `false`），
-  （列类型照现有约定：ID 列 `VARCHAR(32)`、引用列同 §1、时间同 `created_at`、摘要同 `request_hash`；`late`、`fault_mode` 非空）
   确认（或转入待审）的 `commit_credential_id`、`commit_actor_ref`、`commit_actor_role`、`commit_request_id`，结案的 `review_closed_at`、`review_closed_credential_id`、`review_closed_actor_ref`、`review_closed_actor_role`、`review_closed_request_id`。
+  以上列的类型照现有约定：ID 列 `VARCHAR(32)`、引用列同 §1、时间同 `created_at`、摘要同 `request_hash`；`late`、`fault_mode` 非空，其余可空。
   - `(tenant_id, channel_id, payment_ref)` 唯一（MySQL 唯一索引允许多个 `NULL`）；
   - 检查约束：`payment_ref`、`paid_at`、`commit_request_hash`、`commit_credential_id`、`commit_request_id` 在 `status` 为 `committed`、`late_payment_review`、`closed_refunded` 时都非空、其他状态都为空；
     `committed_at` 在 `committed` 时非空、其他状态为空；`late` 只在 `committed` 时可为真；`review_closed_at`、`review_closed_credential_id`、`review_closed_request_id` 在 `closed_refunded` 时都非空、其他状态都为空；
@@ -1096,7 +1102,8 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
    这里的“原结果”是该业务对象**当前**的表示（状态可能已变，如盘点单已取消）；同键重放（第 1 条）才是首次保存的响应原样。
    这一层防止“调用方崩溃后用新键重试”造成重复扣库。业务引用只被**已生效**的命令占用：被业务规则拒绝的命令（如确认一个已释放的订单、行集不一致）
    不占用该引用，改正后可以用新幂等键、同一引用再试。例外（0.13，§5.7）：晚到支付缺货转入待审是被拒时留下的状态变化，预留记下这个 `payment_ref`，
-   之后同一订单仍可用它重试，别的订单不能再用。
+   之后同一订单仍可用它重试，别的订单不能再用；故障补交新建时转入待审，还同时占用了 `order_ref`（新建的预留，§5.7）。
+   确认销售的“重新判定”再撞上并发时返回 503，是下一段“不返回 5xx”的例外（§5.7）。
    两个不同幂等键的请求并发占用同一业务引用、撞上唯一约束时，后到的回滚，按已生效的那一条重新判定（内容相同返回原结果，
    不同 409 `BUSINESS_REF_CONFLICT`），不返回 5xx；重新判定的结果作为后到请求那个幂等键的确定结果保存（它在取锁之后产生）。
 
@@ -1774,12 +1781,12 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 | # | 发现 | 类型 | 处理 | 改了哪里 |
 | --- | --- | --- | --- | --- |
-| 77 | 确认销售的正文、判定顺序、流水的来源字段、`RESERVATION_MISMATCH` 的 `details`、确认前要不要先关到期预留都没定 | 未决定 | 正文 `reservation_id`（可 `null`）、`payment_ref`、`paid_at`、`lines`；判定顺序 业务引用（`payment_ref`）→ 锁预留行 → 行集比对 → 按状态分支；流水 `source_type` 为 `sale_commit`、`source_ref` 为 `order_ref`、`occurred_at` 取 `paid_at`；开事务前照预留先关所列 SKU 及其合并去向上的到期预留；锁序与隔离级别同 §5.6（Q-61） | §5.7、§5.6 触发路径与隔离级别、§2.7、§5.2 第 4 条、§8.2、§8.3、§9.1 |
+| 77 | 确认销售的正文、判定顺序、流水的来源字段、`RESERVATION_MISMATCH` 的 `details`、确认前要不要先关到期预留都没定 | 未决定 | 正文 `reservation_id`（可 `null`）、`payment_ref`、`paid_at`、`lines`；判定顺序 业务引用（`payment_ref`）→ 锁预留行 → 行集比对 → 按状态分支；流水 `source_type` 为 `sale_commit`、`source_ref` 为 `order_ref`、`occurred_at` 取 `paid_at`；开事务前照预留先关所列 SKU 及其合并去向上的到期预留；锁序与隔离级别同 §5.6（Q-61） | §5.7、§5.6 触发路径与隔离级别、§2.4、§2.7、§5.2 第 4 条、§8.2、§8.3、§9.1 |
 | 78 | 已释放（取消、支付失败、换新结账）的预留又收到付款确认怎么办 | 未决定 | 409 `STATE_CONFLICT`，不改任何东西，网店退款；状态机不变（Q-57） | §5.7 |
 | 79 | 晚到支付或故障补交时 SKU 已停用，能否补扣 | 未决定 | 照常补扣，只看整单（按 SKU 合计）的可售量；停用只拦新预留（Q-58） | §5.7 |
 | 80 | SKU 合并改挂之后，网店按原 SKU 确认怎么比对 | 未决定 | 请求 `sku_id` 的合并去向等于订单行的 `sku_id` 即一致；故障补交新建时订单行取合并去向（Q-59） | §5.7、§5.6 表示 |
 | 81 | 待审结案带什么 | 未决定 | 没有请求体，记结案的时间、凭据、操作者与请求 ID；退款由网店自己记（Q-60） | §5.7、§8.2 |
-| 82 | 故障补交找不到预留时怎么存；“记一条待办”存在哪；转入待审后 `payment_ref` 算不算占用；故障补交新建遇上 SKU 合并 | 未决定 | 新建一个从未 `active` 的预留（`fault_mode`，`expires_at` 为形式值，`request_hash` 取同内容预留请求的摘要），§5.2 状态机加两条起点；待办就是 `late_payment_review` 状态，不另建表；转入待审时记下 `payment_ref`，只有同一订单能用它重试；合并进行中不拦，锁余额行后 `FOR SHARE` 读 SKU 行复核合并去向，变了就重新判定（Q-61、Q-62） | §5.7、§5.2 状态机与第 6 条、§5.5、§7.1 第 2 条 |
+| 82 | 故障补交找不到预留时怎么存；“记一条待办”存在哪；转入待审后 `payment_ref` 算不算占用；故障补交新建遇上 SKU 合并 | 未决定 | 新建一个从未 `active` 的预留（`fault_mode`，`expires_at` 为形式值，`request_hash` 取同内容预留请求的摘要），§5.2 状态机加两条起点；待办就是 `late_payment_review` 状态，不另建表；转入待审时记下 `payment_ref`，只有同一订单能用它重试；合并进行中不拦，锁余额行后 `FOR SHARE` 读 SKU 行复核合并去向，变了就重新判定（Q-61、Q-62） | §5.7、§5.2 状态机与第 6 条、§2.4、§5.5、§7.1 第 2 条 |
 | 83 | §5.6 先关到期与定时任务只写了“出错记日志、继续”，没区分连接本身出错 | 未决定 | 查候选出错、连接已作废、回滚出错或连接断开时：新预留之前的关单让整个请求 503 `UNAVAILABLE`、什么也不保存；定时任务停止本轮（CORE-TASK-039 登记时已写进任务） | §5.6 |
 
 不改库存数量规则：§4.3 的 `SALE_COMMIT`、`LATE_SALE_COMMIT` 不变；§5.2 的状态机只加故障补交新建的两条起点（`committed`、`late_payment_review`），原有转换不变。
@@ -1801,3 +1808,8 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 非阻塞——“重新判定”统一为从预建余额行那一步整个重做、每个请求最多一次、再遇到 503（写明是 §7.1 的例外）；§2.4 两处写明故障补交会在停售的 SKU 上新建订单行，合并锁住余额行后要复核订单行；
 §7.1 第 2 条的例子换成已释放的确认与行集不一致；页首待批准范围补齐；`STATE_CONFLICT` 的 `details` 挪到“通用”、取表示里的状态；待审重试仍不够时不改任何列；
 `reservation_id` 1–32 个字符或 `null`，否则 422；`available` 注明是整个 SKU 的可售量；新列类型照现有约定。“合并进行中不拦”单列为 Q-62，请 Kelvin 单独确认。
+
+第三轮复审（PR #104，提交 `5ceb37a`，要求修改：阻塞 1 条、非阻塞 8 条）之后的修改，同样并进第 77、82 条：
+阻塞——合并改挂来源 SKU 上 `active`、`expired`、`late_payment_review`、`committed` 四种状态的预留的全部订单行，名单也按这四种取（已到期、待审的订单仍可能晚到确认）。
+非阻塞——事务里算出的合并去向不在开事务前处理过的 SKU 里也重新判定；重新判定在同一连接上、以 503 结束时两次的安全事件都丢弃；§7.1 回指 503 例外并补上故障补交新建占用 `order_ref`；
+§2.4 合并复核订单行用 READ COMMITTED 普通读、重来次数由合并任务定、不在锁余额行前锁 SKU 行；第 2、3 步报 `RESERVATION_MISMATCH` 前先看已 `committed` 且同 `payment_ref` 的；变更记录补 §2.4；列类型那句挪到清单之后。
