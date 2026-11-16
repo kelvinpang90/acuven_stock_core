@@ -13,6 +13,7 @@ from app.api import (
     catalog_changes,
     catalog_imports,
     counts,
+    demo_resets,
     stock_documents,
     stock_imports,
     stock_queries,
@@ -21,7 +22,7 @@ from app.api.errors import install_error_handlers
 from app.api.requests import RequestMiddleware
 from app.config import Settings
 from app.db import make_engine
-from app.domain.environment import health_payload
+from app.domain.environment import DEMO, health_payload
 from app.services.instance import instance_check_error
 from app.services.periodic import PeriodicTask
 from app.services.security_events import purge_expired_security_events
@@ -89,6 +90,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(stock_imports.router)
     app.include_router(stock_documents.router)
     app.include_router(counts.router)
+    # Demo 重置只在 Demo 实例上存在；生产实例不挂，该路径同不存在的路径 404（契约 6.1）。
+    if settings.env == DEMO:
+        app.include_router(demo_resets.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

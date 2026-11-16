@@ -1,4 +1,4 @@
-"""库存命令与查询不碰数据库的规则（契约 §6.2 第 5、6 条、§6.8）。
+"""库存命令与查询不碰数据库的规则（契约 §6.1、§6.2 第 5、6 条、§6.8）。
 
 字段取值不合规抛 InvalidField（带字段名，接口回 422）；
 余额与流水查询的参数不合格抛 InvalidParameter（接口回 422 INVALID_REQUEST）。
@@ -6,7 +6,7 @@
 
 import hashlib
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from app.domain.catalog import (
     AFTER,
@@ -21,6 +21,7 @@ REASON_CODE = "reason_code"
 NOTE = "note"
 OCCURRED_AT = "occurred_at"
 QUANTITY = "quantity"
+BUSINESS_DATE = "business_date"
 
 SKU_IDS = "sku_ids"
 FROM = "from"
@@ -31,6 +32,9 @@ MAX_SKU_IDS = 100
 # DATETIME(6) 存 1000–9999 年；两头各留一年，换算时区后不会越界。
 MIN_YEAR = 1001
 MAX_YEAR = 9998
+# DATE 存 1000–9999 年；business_date 不换算时区，不留余量。
+DATE_MIN_YEAR = 1000
+DATE_MAX_YEAR = 9999
 
 LEDGER_CURSOR_PREFIX = "v1"
 LEDGER_DIGEST_LENGTH = 16
@@ -42,6 +46,8 @@ _TIMESTAMP = re.compile(
     r"(?:\.([0-9]{1,6}))?"
     r"(?:Z|([+-])([0-9]{2}):([0-9]{2}))"
 )
+# 只认 ASCII 数字，月日两位。
+_DATE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
 _VERSION = re.compile(r"[1-9][0-9]{0,18}")
 _DIGEST = re.compile(r"[0-9a-f]{16}")
 
@@ -105,6 +111,28 @@ def parse_occurred_at(value) -> datetime:
     if parsed is None:
         raise InvalidField(OCCURRED_AT)
     return parsed
+
+
+# ---- Demo 重置的日期（§6.1） ----
+
+
+def parse_business_date(value) -> date:
+    """YYYY-MM-DD 形式的合法日历日期，年份 1000–9999（MySQL DATE 的范围）。
+
+    不拿它与当前日期比较。不合规抛 InvalidField（ValueError 的子类）。
+    """
+    if not isinstance(value, str):
+        raise InvalidField(BUSINESS_DATE)
+    match = _DATE.fullmatch(value)
+    if match is None:
+        raise InvalidField(BUSINESS_DATE)
+    year, month, day = (int(part) for part in match.groups())
+    if not DATE_MIN_YEAR <= year <= DATE_MAX_YEAR:
+        raise InvalidField(BUSINESS_DATE)
+    try:
+        return date(year, month, day)
+    except ValueError:
+        raise InvalidField(BUSINESS_DATE) from None
 
 
 # ---- 件数（§6.2 第 5 条） ----

@@ -1,6 +1,6 @@
 import hashlib
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from app.domain.catalog import InvalidField, InvalidParameter, normalize_reason
 from app.domain.stock import (
@@ -10,6 +10,7 @@ from app.domain.stock import (
     ledger_filter_digest,
     normalize_note,
     normalize_reason_code,
+    parse_business_date,
     parse_ledger_cursor,
     parse_ledger_limit,
     parse_ledger_range,
@@ -167,6 +168,64 @@ class OccurredAtTest(FieldErrorMixin, unittest.TestCase):
         for value in (None, 1763195400, True, datetime(2026, 11, 15, tzinfo=UTC)):
             with self.subTest(value=value):
                 self.assert_invalid("occurred_at", parse_occurred_at, value)
+
+
+class BusinessDateTest(FieldErrorMixin, unittest.TestCase):
+    def test_valid_dates(self):
+        cases = {
+            "2026-11-16": date(2026, 11, 16),
+            "2028-02-29": date(2028, 2, 29),
+            "2026-01-01": date(2026, 1, 1),
+            "2026-12-31": date(2026, 12, 31),
+            "1000-01-01": date(1000, 1, 1),
+            "9999-12-31": date(9999, 12, 31),
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(parse_business_date(value), expected)
+
+    def test_not_compared_with_today(self):
+        self.assertEqual(parse_business_date("2001-05-05"), date(2001, 5, 5))
+        self.assertEqual(parse_business_date("2999-05-05"), date(2999, 5, 5))
+
+    def test_rejects_malformed(self):
+        for value in (
+            "2026-02-30",  # 不存在的日期
+            "2026-02-29",  # 平年
+            "2026-13-01",
+            "2026-00-10",
+            "2026-11-00",
+            "2026-11-31",
+            "2026-1-16",  # 少位数
+            "2026-11-6",
+            "26-11-16",
+            "20261116",
+            "2026/11/16",
+            "2026-11-16T00:00:00Z",  # 带时间
+            "2026-11-16T00:00:00",
+            "2026-11-16 00:00",
+            " 2026-11-16",
+            "2026-11-16 ",
+            "2026-11-16\n",
+            "+2026-11-16",
+            "２０２６-11-16",  # 非 ASCII 数字
+            "2026-１1-16",
+            "٢٠٢٦-11-16",
+            "0999-12-31",  # 年份越界
+            "0000-01-01",
+            "10000-01-01",
+            "",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_business_date(value)
+                self.assert_invalid("business_date", parse_business_date, value)
+
+    def test_rejects_non_strings(self):
+        for value in (None, 20261116, True, date(2026, 11, 16), datetime(2026, 11, 16), ["x"]):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_business_date(value)
 
 
 class QuantityTest(FieldErrorMixin, unittest.TestCase):
