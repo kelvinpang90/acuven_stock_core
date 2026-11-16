@@ -1,3 +1,4 @@
+import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ from app.api import (
     catalog_imports,
     counts,
     demo_resets,
+    reservations,
     stock_documents,
     stock_imports,
     stock_queries,
@@ -28,6 +30,8 @@ from app.services.periodic import PeriodicTask
 from app.services.security_events import purge_expired_security_events
 
 SECURITY_EVENT_PURGE = "security-event-purge"
+
+_log = logging.getLogger("app.api")
 
 
 def _purge_security_events(engine: Engine) -> None:
@@ -58,6 +62,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if error is not None:
         engine.dispose()
         _refuse_to_start(error)
+    # 有效期只在启动时读，进程日志记下当前值（契约 5.6）。
+    _log.info("reservation ttl: %d seconds", settings.reservation_ttl_seconds)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -79,6 +85,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     # 鉴权、授权与之后的命令按请求从这里取连接（app.api.requests.request_connection）。
     app.state.engine = engine
+    # 预留命令从这里取有效期（app.api.reservations）。
+    app.state.reservation_ttl_seconds = settings.reservation_ttl_seconds
     # 进入 lifespan 时设置。
     app.state.security_event_purge = None
     app.add_middleware(RequestMiddleware)
@@ -90,6 +98,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(stock_imports.router)
     app.include_router(stock_documents.router)
     app.include_router(counts.router)
+    app.include_router(reservations.router)
     # Demo 重置只在 Demo 实例上存在；生产实例不挂，该路径同不存在的路径 404（契约 6.1）。
     if settings.env == DEMO:
         app.include_router(demo_resets.router)
