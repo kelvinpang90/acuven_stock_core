@@ -341,11 +341,9 @@ def test_lifespan_starts_and_stops_the_purge_when_the_database_is_configured(
         app.state.engine.dispose()
 
 
-def test_lifespan_does_not_start_the_purge_without_a_database():
-    app = create_app(Settings(env="demo", git_sha="d" * 40, database_url=""))
-    with TestClient(app) as client:
-        assert app.state.security_event_purge is None
-        assert purge_threads() == []
-        assert client.get("/healthz").status_code == 200
-        assert client.get("/readyz").json()["reason"] == "database_not_configured"
-    assert app.state.security_event_purge is None
+def test_the_purge_never_starts_without_a_database_because_the_app_refuses_to_start():
+    # 连接串必填（契约 6.1 启动核对）：create_app 就失败，不会有应用进入 lifespan。
+    with pytest.raises(SystemExit) as exited:
+        create_app(Settings(env="demo", git_sha="d" * 40, database_url=""))
+    assert exited.value.code == 1
+    assert purge_threads() == []
