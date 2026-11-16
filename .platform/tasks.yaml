@@ -1774,7 +1774,7 @@ tasks:
       - 集成测试验证成功路径：201 的表示字段齐全，expires_at 等于 created_at 加配置的有效期；余额 reserved 按行增加；每行一条 RESERVE 流水，来源字段与 reason_code 照契约；同键重放原样返回且带 Idempotency-Replayed
       - 集成测试验证拒绝：缺货 409 INSUFFICIENT_STOCK 且 details.lines 列全；SKU 停用、所属商品停用 409 SKU_INACTIVE；已合并 409 SKU_MERGED；SKU 不存在或属于别的租户 404；池未上线 409 POOL_NOT_LIVE；凭据没有销售入口 403；被拒后没有预留、订单行与流水，换新幂等键同一 order_ref 在补货后可以成功
       - 集成测试验证正文：sku_id 重复、line_ref 重复、quantity 为 0 或布尔或字符串、未知字段都 422；101 行 413
-      - 集成测试验证业务引用：换键同内容 200 与当前表示；换键不同内容 409 ORDER_REFERENCE_CONFLICT 并写 business_ref_conflict 事件；两个键以同内容并发预留、可售量只够一单时（照 tests/integration/test_stock_service.py 里被并发先到者导致的拒绝那条测试的做法，让先到者在后到者第 1 步之后、第 6 步之前提交），后到者得到 200 与先到者的预留而不是 INSUFFICIENT_STOCK，且不留 cross_tenant 以外的多余事件
+      - 集成测试验证业务引用：换键同内容 200 与当前表示；换键不同内容 409 ORDER_REFERENCE_CONFLICT 并写 business_ref_conflict 事件；两个键以同内容并发预留、可售量只够一单时（参照 tests/integration/test_stock_service.py 里被并发先到者导致的拒绝那条测试；预留总要预建余额行，所以闸门要让后到者先过完预建与第 1 步，再让先到者锁余额行并提交），后到者得到 200 与先到者的预留而不是 INSUFFICIENT_STOCK，且不写任何安全事件（被拒那次登记的事件按契约丢弃）
       - 集成测试验证查询：按 ID 与按 order_ref 都返回表示，expires_at 已过的 active 显示 expired；别的租户的 ID 404 并记 cross_tenant；没有入口的凭据按 order_ref 查为空数组
       - 集成测试验证配置：CORE_RESERVATION_TTL_SECONDS 为 59、3601 或非整数时 Settings 构造失败；不设时为 900；create_app 在 app.api 日志器写一行当前有效期；命令行配置不合格的提示把这一项也列上
       - 改动只落在 allowed_change_paths；不改 .platform/、CI；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
