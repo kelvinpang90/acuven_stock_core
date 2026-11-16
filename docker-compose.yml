@@ -25,6 +25,8 @@ services:
     environment:
       CORE_ENV: ${CORE_ENV:?set CORE_ENV in .env (demo or production)}
       CORE_DATABASE_URL: ${CORE_DATABASE_URL:?set CORE_DATABASE_URL in .env (see .env.example)}
+      # 预留有效期（秒），60–3600；没设时取 900（契约 5.6）。
+      CORE_RESERVATION_TTL_SECONDS: ${CORE_RESERVATION_TTL_SECONDS:-900}
     networks: [data_net, stock_core_net]
     healthcheck:
       test:
