@@ -1682,7 +1682,7 @@ tasks:
       八，availability_status(merged_into_sku_id, sku_active, product_active)：merged_into_sku_id 非空返回 merged；否则 SKU 或商品不是 active 返回 inactive；
       否则 sellable（契约 5.6 可售量的先后）。
       明确不做：表结构、接口、配置项与服务层（CORE-TASK-037 到 040）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 函数与常量在 app/domain/reservations.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_reservations.py，用 unittest
