@@ -30,7 +30,7 @@
 - **共享文件清单**（登记同类任务时逐个对照，补进 `allowed_change_paths`）：
   - 新增 `/v1` 路由的任务：`app/main.py`（挂路由）；
   - 新增数据库模型模块的任务：`alembic/env.py`（在那里 import 新模型模块，登记到 `Base.metadata`）、`app/models/__init__.py` 与新迁移文件要一起列；`app/db.py` 不用改；
-  - 新增配置项的任务：`app/config.py`、`.env.example`、`docker-compose.yml`。
+  - 新增配置项的任务：`app/config.py`、`docker-compose.yml`；`.env.example` 的文件名被控制面当作敏感路径拒绝，不能列，由登记任务的 PR 先写好这一项。
 
 ## 角色与流程
 
