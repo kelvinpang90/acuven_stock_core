@@ -1815,7 +1815,7 @@ tasks:
       用普通读查 active 且已到期的预留，按 expires_at 升序逐个在各自的事务里关单；
       一个关单出错时回滚它、记进程日志、继续下一个；查候选出错、连接已作废、回滚出错或连接断开时停止本轮扫描（不在新连接上接着关），下一轮重新取连接。
       明确不做：确认销售与晚到支付；SKU 合并之前的关单（登记合并任务时做）；可售量查询（CORE-TASK-040）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-038
     acceptance_criteria:
