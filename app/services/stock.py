@@ -41,6 +41,10 @@ SKU 合并的执行先锁余额行再改 SKU 行，与此一致，不成环。
 require_skus_exist 在锁余额行之前用普通读查存在与归属（SKU 不删，也不换租户）；
 require_not_merged 在锁余额行之后用加锁读查合并，加锁读看得到最新提交。
 
+没有请求的调用方（预留的到期关单，§5.6）不经执行器：lock_balance_rows 与 write_entry
+只收连接、租户与流水的身份（EntryIdentity），lock_balances 与 append_entry 从 Execution
+取出这些再调用它们。
+
 命令时间：command_now 在命令开头读一次数据库时间，命令自己保存、
 传给 append_entry 与 insert_document；同一命令的各条流水（调用方没给 occurred_at 时）
 与单据的时间因此一致。with_document 在新事务里重新运行命令时，命令照样在开头重读一次。
@@ -60,7 +64,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, NoReturn
 
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import Connection, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from app.api.errors import ApiError
@@ -238,12 +242,30 @@ _BALANCE_COLUMNS = (
 )
 
 
-def _balance_where(execution: Execution, pool_id: str, sku_id: str) -> tuple:
+def _balance_where(tenant_id: str, pool_id: str, sku_id: str) -> tuple:
     return (
-        StockBalance.tenant_id == _tenant_id(execution),
+        StockBalance.tenant_id == tenant_id,
         StockBalance.pool_id == pool_id,
         StockBalance.sku_id == sku_id,
     )
+
+
+def lock_balance_rows(
+    connection: Connection, tenant_id: str, pool_id: str, sku_ids: Iterable[str]
+) -> dict[str, LockedBalance]:
+    """lock_balances 的底层：在给定连接的事务里按租户锁行，规则相同。"""
+    balances: dict[str, LockedBalance] = {}
+    for sku_id in sorted(set(sku_ids)):
+        statement = (
+            select(*_BALANCE_COLUMNS)
+            .where(*_balance_where(tenant_id, pool_id, sku_id))
+            .with_for_update()
+        )
+        row = connection.execute(statement).mappings().first()
+        if row is None:
+            raise RuntimeError(f"no balance row for pool {pool_id} and sku {sku_id}")
+        balances[sku_id] = LockedBalance(**row)
+    return balances
 
 
 def lock_balances(
@@ -254,18 +276,7 @@ def lock_balances(
     行已由执行器预建。某行不存在（SKU 在预建之后才建成，极少见）是程序错误：
     抛异常、500，同键重试时预建会补上。
     """
-    balances: dict[str, LockedBalance] = {}
-    for sku_id in sorted(set(sku_ids)):
-        statement = (
-            select(*_BALANCE_COLUMNS)
-            .where(*_balance_where(execution, pool_id, sku_id))
-            .with_for_update()
-        )
-        row = execution.connection.execute(statement).mappings().first()
-        if row is None:
-            raise RuntimeError(f"no balance row for pool {pool_id} and sku {sku_id}")
-        balances[sku_id] = LockedBalance(**row)
-    return balances
+    return lock_balance_rows(execution.connection, _tenant_id(execution), pool_id, sku_ids)
 
 
 def _checked_reconciled(balance: LockedBalance, reconciled_version: int, upper: int) -> int:
@@ -292,6 +303,32 @@ def _outside_with_document(execution: Execution) -> CommandResult:
     raise RuntimeError("a business reference was taken outside with_document")
 
 
+@dataclass(frozen=True)
+class EntryIdentity:
+    """流水上记的来源与身份（§4.3）。Core 自己的到期关单只有 channel_id，其余为空。"""
+
+    channel_id: str | None
+    idempotency_key: str | None = None
+    credential_id: str | None = None
+    actor_ref: str | None = None
+    actor_role: str | None = None
+    request_id: str | None = None
+
+
+def entry_identity(execution: Execution) -> EntryIdentity:
+    """本请求的身份：凭据的销售入口、幂等键、凭据、操作者与请求 ID。"""
+    access = execution.access
+    principal = access.principal
+    return EntryIdentity(
+        channel_id=principal.channel_id,
+        idempotency_key=access.idempotency_key,
+        credential_id=principal.credential_id,
+        actor_ref=None if access.actor is None else access.actor.ref,
+        actor_role=None if access.actor is None else access.actor.role,
+        request_id=execution.request.state.request_id,
+    )
+
+
 def append_entry(
     execution: Execution,
     balance: LockedBalance,
@@ -309,7 +346,50 @@ def append_entry(
     corrects_entry_id: str | None = None,
     reconciled_version: int | None = None,
 ) -> dict[str, Any]:
-    """在锁住的余额行上写一条流水（§4.3），返回它的表示（§6.8）。
+    """在锁住的余额行上写一条流水（§4.3），返回它的表示（§6.8）；身份取本请求的。
+
+    规则见 write_entry。
+    """
+    return write_entry(
+        execution.connection,
+        _tenant_id(execution),
+        entry_identity(execution),
+        balance,
+        entry_type,
+        deltas,
+        command_id,
+        now=now,
+        source_type=source_type,
+        source_ref=source_ref,
+        line_ref=line_ref,
+        reason_code=reason_code,
+        note=note,
+        occurred_at=occurred_at,
+        corrects_entry_id=corrects_entry_id,
+        reconciled_version=reconciled_version,
+    )
+
+
+def write_entry(
+    connection: Connection,
+    tenant_id: str,
+    identity: EntryIdentity,
+    balance: LockedBalance,
+    entry_type: EntryType | str,
+    deltas: Deltas,
+    command_id: str,
+    *,
+    now: datetime,
+    source_type: str | None = None,
+    source_ref: str | None = None,
+    line_ref: str | None = None,
+    reason_code: str | None = None,
+    note: str | None = None,
+    occurred_at: datetime | None = None,
+    corrects_entry_id: str | None = None,
+    reconciled_version: int | None = None,
+) -> dict[str, Any]:
+    """append_entry 的底层：在给定连接的事务里、以给定的租户与身份写一条流水。
 
     写后的四个量用 Quantities 校验，违反不变量时抛 InvariantViolation，由调用方处理。
     balance_version 加 1，两个判定列按 app/domain/ledger.py 的默认规则更新；
@@ -342,34 +422,31 @@ def append_entry(
         if corrects_entry_id == opening_entry_id:
             opening_entry_id = None
 
-    access = execution.access
-    principal = access.principal
     values: dict[str, Any] = {
         "entry_id": entry_id,
-        "tenant_id": principal.tenant_id,
+        "tenant_id": tenant_id,
         "pool_id": balance.pool_id,
         "sku_id": balance.sku_id,
         "entry_type": entry_type.value,
         **{f"{name}_delta": delta for name, delta in zip(QUANTITIES, deltas, strict=True)},
         **{f"{name}_after": getattr(after, name) for name in QUANTITIES},
         "balance_version_after": version,
-        "channel_id": principal.channel_id,
+        "channel_id": identity.channel_id,
         "source_type": source_type,
         "source_ref": source_ref,
         "line_ref": line_ref,
         "command_id": command_id,
-        "idempotency_key": access.idempotency_key,
-        "credential_id": principal.credential_id,
-        "actor_ref": None if access.actor is None else access.actor.ref,
-        "actor_role": None if access.actor is None else access.actor.role,
+        "idempotency_key": identity.idempotency_key,
+        "credential_id": identity.credential_id,
+        "actor_ref": identity.actor_ref,
+        "actor_role": identity.actor_role,
         "reason_code": reason_code,
         "note": note,
-        "request_id": execution.request.state.request_id,
+        "request_id": identity.request_id,
         "corrects_entry_id": corrects_entry_id,
         "occurred_at": now if occurred_at is None else occurred_at,
         "recorded_at": now,
     }
-    connection = execution.connection
     try:
         connection.execute(insert(LedgerEntry).values(values))
     except IntegrityError as exc:
@@ -382,7 +459,7 @@ def append_entry(
         "last_reconciled_version": reconciled,
         "opening_entry_id": opening_entry_id,
     }
-    where = _balance_where(execution, balance.pool_id, balance.sku_id)
+    where = _balance_where(tenant_id, balance.pool_id, balance.sku_id)
     connection.execute(update(StockBalance).where(*where).values(columns))
     for name, value in columns.items():
         setattr(balance, name, value)
@@ -401,7 +478,7 @@ def mark_verified(
     if reconciled_version is not None:
         reconciled = _checked_reconciled(balance, reconciled_version, version)
     columns = {"last_book_only_version": version, "last_reconciled_version": reconciled}
-    where = _balance_where(execution, balance.pool_id, balance.sku_id)
+    where = _balance_where(_tenant_id(execution), balance.pool_id, balance.sku_id)
     execution.connection.execute(update(StockBalance).where(*where).values(columns))
     balance.last_book_only_version = version
     balance.last_reconciled_version = reconciled

@@ -27,9 +27,13 @@ from app.db import make_engine
 from app.domain.environment import DEMO, health_payload
 from app.services.instance import instance_check_error
 from app.services.periodic import PeriodicTask
+from app.services.reservations import sweep_expired_reservations
 from app.services.security_events import purge_expired_security_events
 
 SECURITY_EVENT_PURGE = "security-event-purge"
+RESERVATION_EXPIRY = "reservation-expiry"
+# 到期扫描每 30 秒一次，启动后首次等 30 秒（契约 5.6）。
+RESERVATION_EXPIRY_INTERVAL = 30.0
 
 _log = logging.getLogger("app.api")
 
@@ -38,6 +42,14 @@ def _purge_security_events(engine: Engine) -> None:
     """定时任务的一次运行：从连接池取一个连接，清理满 1 年的安全事件（契约 7.2）。"""
     with engine.connect() as connection:
         purge_expired_security_events(connection)
+
+
+def _close_expired_reservations(engine: Engine) -> None:
+    """定时任务的一次运行：关掉已到期的 active 预留（契约 5.2 第 4 条、5.6）。
+
+    连接的取用、隔离级别的设置与复原都在 sweep_expired_reservations 里。
+    """
+    sweep_expired_reservations(engine)
 
 
 def _refuse_to_start(reason: str) -> NoReturn:
@@ -67,14 +79,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # uvicorn 单进程运行：进入时启动定时清理，应用关闭时停止。
-        task = PeriodicTask(SECURITY_EVENT_PURGE, lambda: _purge_security_events(engine))
-        task.start()
-        app.state.security_event_purge = task
+        # uvicorn 单进程运行：进入时启动定时清理与到期扫描，应用关闭时一并停止。
+        purge = PeriodicTask(SECURITY_EVENT_PURGE, lambda: _purge_security_events(engine))
+        expiry = PeriodicTask(
+            RESERVATION_EXPIRY,
+            lambda: _close_expired_reservations(engine),
+            interval=RESERVATION_EXPIRY_INTERVAL,
+            first_delay=RESERVATION_EXPIRY_INTERVAL,
+        )
+        purge.start()
+        app.state.security_event_purge = purge
         try:
-            yield
+            expiry.start()
+            app.state.reservation_expiry = expiry
+            try:
+                yield
+            finally:
+                expiry.stop()
         finally:
-            task.stop()
+            purge.stop()
 
     app = FastAPI(
         title="Acuven Stock Core",
@@ -89,6 +112,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.reservation_ttl_seconds = settings.reservation_ttl_seconds
     # 进入 lifespan 时设置。
     app.state.security_event_purge = None
+    app.state.reservation_expiry = None
     app.add_middleware(RequestMiddleware)
     install_error_handlers(app)
     app.include_router(catalog.router)

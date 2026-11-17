@@ -107,6 +107,15 @@ READ COMMITTED（契约 §4.1 下文、§6.6）：
   盘点单命令用它：锁住盘点单行之后用普通读读盘点行
   （REPEATABLE READ 下加锁读一个空范围会锁间隙，两张单的首次提交互相等待而死锁）。
 - 设隔离级别出错：503 UNAVAILABLE，什么也不写、不保存，同键重试会重新执行。
+
+开业务事务之前的钩子（契约 §5.6 新预留之前的关单）：
+
+- run_idempotent(..., before_transaction=函数)：函数收连接，在设好 READ COMMITTED 之后
+  （read_committed 为真时）、开业务事务之前在同一连接上调用；不传（默认 None）的命令行为不变。
+- 调用时连接上没有打开的事务；函数可以开自己的事务并各自提交，返回时也不留打开的事务。
+- 函数抛 ApiError 照常作为响应返回；抛别的异常记进程日志、503 UNAVAILABLE。
+  两种情况都不执行命令、不保存幂等记录，同键重试会重新执行。
+  命名锁与隔离级别照常由 _release_locks 收尾（连接已作废时作废它）。
 """
 
 import json
@@ -160,6 +169,8 @@ _NO_REFERENCED_ROW = 1452  # MySQL ER_NO_REFERENCED_ROW_2：外键指向的行�
 
 # 余额行预建函数：收连接，返回要预建的 (pool_id, sku_id)。
 BalanceRows = Callable[[Connection], Iterable[tuple[str, str]]]
+# 开业务事务之前的钩子：收连接，返回时不留打开的事务。
+BeforeTransaction = Callable[[Connection], None]
 
 _log = logging.getLogger("app.api")
 
@@ -247,12 +258,14 @@ def run_idempotent(
     catalog_lock: bool = False,
     balance_rows: BalanceRows | None = None,
     read_committed: bool = False,
+    before_transaction: BeforeTransaction | None = None,
 ) -> Response:
     """第 10 步：取命名锁，重放、冲突或执行命令，释放锁，再写安全事件。
 
     catalog_lock 为真时（写目录的命令）取到幂等锁之后、开事务之前再取本租户的目录写锁。
     balance_rows 给了时，取锁之后、开业务事务之前用单独的短事务预建它返回的余额行（§4.1）。
     read_committed 为真时业务事务（与重新判定事务）以 READ COMMITTED 开启。
+    before_transaction 给了时，设好隔离级别之后、开业务事务之前在同一连接上调用它。
     """
     if (
         not isinstance(operation, str)
@@ -288,6 +301,8 @@ def run_idempotent(
             _prepare_balances(request, connection, scope.tenant_id, balance_rows)
         if read_committed:
             _read_committed(request, connection)
+        if before_transaction is not None:
+            _before_transaction(request, connection, before_transaction)
         response, events = _execute(request, connection, scope, digest, command)
     finally:
         _release_locks(request, connection, reset_isolation=read_committed)
@@ -403,6 +418,20 @@ def _read_committed(request: Request, connection: Connection) -> None:
             "setting READ COMMITTED failed (request_id=%s)",
             request.state.request_id,
             exc_info=True,
+        )
+        raise unavailable() from None
+
+
+def _before_transaction(request: Request, connection: Connection, hook: BeforeTransaction) -> None:
+    """调用钩子；它抛 ApiError 原样传出，抛别的异常记进程日志、503。什么也不保存。"""
+    try:
+        hook(connection)
+    except ApiError:
+        raise
+    except Exception:
+        _log.exception(
+            "the step before the business transaction failed (request_id=%s)",
+            request.state.request_id,
         )
         raise unavailable() from None
 

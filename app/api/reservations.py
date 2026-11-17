@@ -1,13 +1,18 @@
-"""整单预留与预留的查询接口。
+"""整单预留、释放与预留的查询接口。
 
 契约 §5.2、§5.6、§7.1、§8.1、§10 第 3、4 条。
 预留要求 orders.write、不要求角色（操作者头带了照常校验并记录），经幂等执行器，
 业务事务以 READ COMMITTED 开启（§5.6 隔离级别）。池是凭据销售入口绑定的池：
 凭据没有销售入口或入口已停用 403（第 9 步，不保存）；余额行按这个池与各行 sku_id 预建。
+开业务事务之前先关掉所列 SKU 上已到期的预留（执行器的 before_transaction 钩子）；
+关单的连接作废、回滚出错或断开时 503，什么也不保存。
 正文只有 order_ref 与 lines：lines 是 1–100 行的批量数组（超过 413），
 未知字段、引用格式、quantity 不是 1–1,000,000 的 JSON 整数、
 line_ref 或 sku_id 重复在第 7 步 422。
 有效期取启动时读的配置（app.state.reservation_ttl_seconds），网店不能在请求里指定。
+释放要求 orders.write、不要求角色，经幂等执行器，以 READ COMMITTED 开启；
+池授权按预留所属的池（预留不存在或属于别的租户 404 RESERVATION_NOT_FOUND，后者记 cross_tenant，
+都不保存）。正文只有 reason（三个取值之一），其他 422。不预建余额行（预留时已建好）。
 两个查询要求 orders.read、不要求角色：按 ID 查只限定在本租户；按 order_ref 查按凭据的销售入口。
 查库与写库在 app/services/reservations.py。
 """
@@ -22,7 +27,13 @@ from pydantic import Field, field_validator, model_validator
 from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.auth import authorize, cross_tenant_not_found, get_access, require_sales_pool
+from app.api.auth import (
+    authorize,
+    cross_tenant_not_found,
+    get_access,
+    require_object_pool,
+    require_sales_pool,
+)
 from app.api.errors import ApiError, invalid_request, ok
 from app.api.requests import (
     ParsedBody,
@@ -34,6 +45,7 @@ from app.api.requests import (
 )
 from app.domain.catalog import InvalidField
 from app.domain.requests import is_reference
+from app.domain.reservations import RELEASE_REASONS
 from app.domain.service_auth import ORDERS_READ, ORDERS_WRITE
 from app.domain.stock import parse_positive_quantity
 from app.services import reservations
@@ -41,6 +53,7 @@ from app.services.idempotency import CommandResult, Execution, run_idempotent
 from app.services.reservations import RESERVATION, RESERVATION_NOT_FOUND, ReservationLine
 
 RESERVATIONS_CREATE = "reservations.create"
+RESERVATIONS_RELEASE = "reservations.release"
 
 ORDER_REF = "order_ref"
 LINES = "lines"
@@ -103,8 +116,35 @@ class ReservationRequest(RequestBody):
         return [ReservationLine(line.line_ref, line.sku_id, line.quantity) for line in self.lines]
 
 
+class ReleaseRequest(RequestBody):
+    """§5.6 释放：reason 必填，取值 cancelled、payment_failed 或 checkout_replaced。"""
+
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def check_reason(cls, value: str) -> str:
+        if value not in RELEASE_REASONS:
+            raise ValueError("unknown release reason")
+        return value
+
+
 reservation_body = json_body(ReservationRequest)
 ReservationBody = Annotated[ParsedBody[ReservationRequest], Depends(reservation_body)]
+release_body = json_body(ReleaseRequest)
+ReleaseBody = Annotated[ParsedBody[ReleaseRequest], Depends(release_body)]
+
+
+def _path_reservation_id(reservation_id: str) -> str:
+    return reservation_id
+
+
+_reservation_pool = require_object_pool(
+    _path_reservation_id,
+    reservations.find_reservation_pool,
+    object_type=RESERVATION,
+    not_found_code=RESERVATION_NOT_FOUND,
+)
 
 
 # --- 预留 ---
@@ -119,9 +159,15 @@ def create_reservation(
     order_ref = body.model.order_ref
     lines = body.model.reservation_lines()
     ttl_seconds = request.app.state.reservation_ttl_seconds
+    tenant_id = get_access(request).principal.tenant_id
+    sku_ids = [line.sku_id for line in lines]
 
     def balance_rows(connection: Connection) -> list[tuple[str, str]]:
-        return [(pool_id, line.sku_id) for line in lines]
+        return [(pool_id, sku_id) for sku_id in sku_ids]
+
+    def close_due(connection: Connection) -> None:
+        """先关到期（§5.6）：只关凭据的租户、入口的池里所列 SKU 上的。"""
+        reservations.close_due_before_reserving(connection, tenant_id, pool_id, sku_ids)
 
     def command(execution: Execution) -> CommandResult:
         return reservations.create_reservation(execution, pool_id, order_ref, lines, ttl_seconds)
@@ -132,6 +178,31 @@ def create_reservation(
         body=body,
         command=command,
         balance_rows=balance_rows,
+        read_committed=True,
+        before_transaction=close_due,
+    )
+
+
+# --- 释放 ---
+
+
+@router.post("/v1/reservations/{reservation_id}/release", dependencies=_WRITE)
+def release_reservation(
+    request: Request,
+    reservation_id: str,
+    body: ReleaseBody,
+    pool_id: Annotated[str, Depends(_reservation_pool)],
+) -> Response:
+    reason = body.model.reason
+
+    def command(execution: Execution) -> CommandResult:
+        return reservations.release_reservation(execution, reservation_id, reason)
+
+    return run_idempotent(
+        request,
+        operation=RESERVATIONS_RELEASE,
+        body=body,
+        command=command,
         read_committed=True,
     )
 
