@@ -1934,7 +1934,7 @@ tasks:
       - 迁移文件为 alembic/versions/20261116_0008_sale_commits.py，down_revision 为 0007；模型在 app/models/orders.py；upgrade 后 alembic check 无差异（由 CI 的 integration 执行）；tests/integration/test_reservation_schema.py、test_reservation_release_api.py、test_reservation_expiry.py 只为新约束补列，其余断言不变并照常通过
       - 集成测试验证 committed 的行：缺 payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id 或 committed_at 任一被拒；closed_at 为空被拒；齐全时放行，late 真假都可
       - 集成测试验证 late_payment_review 与 closed_refunded 的行：缺 payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id 任一被拒；committed_at 非空被拒、late 为真被拒；closed_refunded 缺 review_closed_ 三列任一被拒，late_payment_review 带它们被拒
-      - 集成测试验证 active、released、expired 的行：带 payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id、committed_at 或 review_closed_at、review_closed_credential_id、review_closed_request_id 任一被拒；不带时与 0007 的行为相同（两组新操作者列只受同有同无约束，不按状态约束，同 0007 的 released_actor）
+      - 集成测试验证 active、released、expired 的行：带 payment_ref、paid_at、commit_request_hash、commit_credential_id、commit_request_id、committed_at 或 review_closed_at、review_closed_credential_id、review_closed_request_id 任一被拒，late 为真被拒；不带时与 0007 的行为相同（两组新操作者列只受同有同无约束，不按状态约束，同 0007 的 released_actor）
       - 集成测试验证唯一与外键：同一入口两行同一 payment_ref 被拒，payment_ref 都为空的多行放行；commit_credential_id 或 review_closed_credential_id 指向别的租户的凭据被拒；操作者两列只有一列被拒
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
@@ -1990,6 +1990,8 @@ tasks:
       正文 reservation_id（1 到 32 个字符的字符串或 null）、payment_ref、paid_at（带时区的 RFC 3339，存为 UTC）、lines（规则同预留，沿用 app/api/reservations.py 的行校验），四个都必填，其他 422；
       池用 app/api/auth.py 的 require_sales_pool，没有入口 403。经 run_idempotent，read_committed=True；balance_rows 为所列 SKU 及其合并去向（普通读）；
       开事务前钩子对同样这些 SKU 先关到期（复用 CORE-TASK-039 新预留用的那段逻辑与它的出错处理）。
+      balance_rows 与钩子都在 app/services/sale_commits.py 里实现，由每个请求一个的对象记下最近一次算出的 SKU 集合（CORE-TASK-043 重做时重新算出、覆盖），
+      命令从同一个对象取它（CORE-TASK-046、047 判“合并去向不在开事务前处理过的 SKU 里”要用）；app/api/sale_commits.py 只把它们交给 run_idempotent。
       二，事务里照 5.7 第 1–4 步：普通读按 payment_ref 查；FOR UPDATE 按 order_ref 读预留行；FOR SHARE 读订单行后比对行集（mismatched_line_refs）；按 commit_decision 分支——
       COMMIT 先 FOR SHARE 读池行，每行一条 SALE_COMMIT（source_type sale_commit、source_ref order_ref、occurred_at 取请求的 paid_at、reason_code 用 commit_reason_code），
       订单行 committed_qty 设为 quantity，预留改为 committed 并记 payment_ref、paid_at、commit_request_hash、committed_at、commit_ 一组列与 closed_at（确认时间），late 为假，reservation_id 为 null 时 fault_mode 为真；
@@ -1997,7 +1999,8 @@ tasks:
       三，LATE 与 EXPIRE_THEN_LATE（CORE-TASK-045 实现），以及没有预留且 reservation_id 为 null（故障补交新建，CORE-TASK-047 实现）：本任务先返回 503 UNAVAILABLE，不保存。
       四，app/services/reservations.py 的表示加 5.7 的字段（payment_ref、paid_at、committed_at、late、fault_mode、review_closed_at），预留查询与本命令都返回；
       tests/integration/test_reservations_api.py 里核对表示字段集合的常量相应加上这六个字段，该文件其余断言不动。
-      若 CORE-TASK-039 把新预留的先关到期写在 app/api/reservations.py 或它的测试写死了表示字段集合，本任务只为复用把那段提成函数、只为新字段改字段集合，其余不动。
+      若 CORE-TASK-039 把新预留的先关到期写在 app/api/reservations.py 或它的测试写死了表示字段集合、直接构造 ReservationRecord，本任务只为复用把那段提成函数、只为新字段改字段集合与构造参数，其余不动。
+      合并即部署：PR 正文写明 044 合并后到 046 合并前，晚到确认与故障补交返回 503、报业务拒绝前还不重查业务引用（过渡状态，网店尚未接入）。
       明确不做：晚到确认与待审（CORE-TASK-045）；报业务拒绝前重查业务引用与合并去向变化的重做（CORE-TASK-046）；故障补交新建（CORE-TASK-047）；待审结案（CORE-TASK-048）。
     status: ready
     depends_on:
@@ -2022,6 +2025,7 @@ tasks:
       - tests/integration/test_sale_commits_api.py
       - tests/integration/test_reservations_api.py
       - tests/integration/test_reservation_release_api.py
+      - tests/integration/test_reservation_expiry.py
       - app/api/reservations.py
     allowed_commands:
       - tests.unit
@@ -2046,7 +2050,7 @@ tasks:
     depends_on:
       - CORE-TASK-044
     acceptance_criteria:
-      - 改动在 app/services/sale_commits.py；CORE-TASK-044 的测试照常通过（其中已到期返回 503 的那条改为本任务的行为，在新测试文件里验证）
+      - 改动在 app/services/sale_commits.py；CORE-TASK-044 的测试照常通过（其中已到期返回 503 的断言改为本任务的行为，在新测试文件里验证；没有预留且 reservation_id 为 null 返回 503 的断言保留，到 CORE-TASK-047 才改）
       - 集成测试验证有货：已关为 expired 的预留 200、late 为真、每行一条 LATE_SALE_COMMIT 且 reason_code 为 late_payment；原 closed_at 不变；reservation_id 为 null 时 reason_code 为 fault_mode、fault_mode 为真
       - 集成测试验证缺货：409 LATE_PAYMENT_INSUFFICIENT_STOCK、details.lines 按 SKU 合计、按请求顺序列出；数量不变；预留为 late_payment_review 并记下 payment_ref、paid_at 与 commit_ 一组列；同键重放 409
       - 集成测试验证待审重试：补货后换键同 payment_ref 成功，流水 occurred_at 为第一次的 paid_at，commit_ 一组列为成功那次的请求，payment_ref、paid_at 不变；重试仍缺货时预留各列不变
