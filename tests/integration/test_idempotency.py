@@ -9,6 +9,8 @@
 声明了 READ COMMITTED 的测试路由命令同上。
 业务引用路由的命令先插一个名为 marker 的地点，再插 location_id 为 marker 的引用地点
 （地点名记下请求摘要与先插那一行的 ID），撞主键时抛 BusinessRefTaken，按引用地点重新判定。
+重做路由声明了余额行预建、READ COMMITTED 与开事务前的钩子，命令同上插地点；
+预建函数与钩子可以按 marker 换掉，用来数调用次数、在重做期间停住。
 造数据与观察都用测试自己的连接；应用用自己的连接池。
 """
 
@@ -39,9 +41,12 @@ from app.main import create_app
 from app.models.inventory import IdempotencyRecord, Location, StockBalance
 from app.services import idempotency
 from app.services.idempotency import (
+    BalanceRows,
+    BeforeTransaction,
     BusinessRefTaken,
     CommandResult,
     Execution,
+    RedoCommand,
     run_idempotent,
 )
 from tests.integration.conftest import (
@@ -75,6 +80,8 @@ READ_COMMITTED_NOTES = "test-read-committed-notes.create"
 READ_COMMITTED_NOTES_URL = "/test/read-committed/notes"
 REFS = "test-refs.claim"
 REFS_URL = "/test/refs"
+REDO_NOTES = "test-redo-notes.create"
+REDO_NOTES_URL = "/test/redo/notes"
 KEY = "shop:note:1"
 REJECTED = "NOTE_REJECTED"
 REF_CONFLICT = "BUSINESS_REF_CONFLICT"
@@ -82,6 +89,9 @@ COMMAND_EVENT = "business_ref_conflict"
 
 # 按 marker 挂的钩子：命令插完地点、登记完事件之后运行。每个测试结束时清空。
 HOOKS: dict[str, Callable[[Execution], None]] = {}
+# 重做路由按 marker 换的预建函数与开事务前的钩子；没挂时预建请求体的 rows、不调钩子。
+BALANCE_ROWS: dict[str, BalanceRows] = {}
+BEFORE_TRANSACTION: dict[str, BeforeTransaction] = {}
 
 
 # --- 测试专用路由 ---
@@ -252,6 +262,21 @@ def add_test_routes(app) -> None:
             command=lambda execution: claim_ref(execution, body.model),
         )
 
+    @app.post(REDO_NOTES_URL, dependencies=[WRITE])
+    def create_redo_note(
+        request: Request, body: Annotated[ParsedBody[BalanceNote], Depends(balance_note_body)]
+    ) -> Response:
+        note = body.model
+        return run_idempotent(
+            request,
+            operation=REDO_NOTES,
+            body=body,
+            command=lambda execution: write_note(execution, note),
+            balance_rows=BALANCE_ROWS.get(note.marker, balance_rows_of(note)),
+            read_committed=True,
+            before_transaction=BEFORE_TRANSACTION.get(note.marker),
+        )
+
 
 @pytest.fixture
 def client(migrated_engine: Engine) -> Iterator[TestClient]:
@@ -272,6 +297,8 @@ def engine(migrated_engine: Engine) -> Engine:
 def clear_hooks() -> Iterator[None]:
     yield
     HOOKS.clear()
+    BALANCE_ROWS.clear()
+    BEFORE_TRANSACTION.clear()
 
 
 # --- 请求、造数据与观察 ---
@@ -1122,3 +1149,227 @@ def test_a_business_ref_taken_concurrently_is_rejudged_and_saved(client, engine,
     assert replay.json() == second.json()
     assert events(engine, rid_of(replay)) == []
     assert notes(engine, caller, ref) == 1
+
+
+# --- 回滚后整个重做 ---
+
+
+def redo_first(times: int, seen: list[int]) -> Callable[[Execution], None]:
+    """每次运行写一个名为 attempt-<第几次> 的地点、登记一条记下第几次的事件。
+
+    前 times 次运行在写完、登记完之后抛 RedoCommand。
+    """
+
+    def hook(execution: Execution) -> None:
+        attempt = len(seen) + 1
+        seen.append(attempt)
+        values = {
+            "location_id": new_id("loc"),
+            "tenant_id": execution.access.principal.tenant_id,
+            "name": f"attempt-{attempt}",
+            "status": "active",
+        }
+        execution.connection.execute(insert(Location).values(values))
+        execution.record_security_event(COMMAND_EVENT, {"ref_type": "attempt", "ref": str(attempt)})
+        if attempt <= times:
+            raise RedoCommand()
+
+    return hook
+
+
+def test_a_redo_runs_the_command_again_and_saves_the_second_result(client, engine):
+    caller = issue(engine)
+    seen: list[int] = []
+    HOOKS["m"] = redo_first(1, seen)
+    body = {"marker": "m", "event": True}
+    response = send(client, caller, json=body)
+    assert response.status_code == 201
+    assert "Idempotency-Replayed" not in response.headers
+    assert seen == [1, 2]
+
+    # 第一次的写入回滚了，只留第二次的；响应是第二次的。
+    assert notes(engine, caller, "attempt-1") == 0
+    assert notes(engine, caller, "attempt-2") == 1
+    assert notes(engine, caller, "m") == 1
+    where = (Location.tenant_id == caller.tenant_id, Location.name == "m")
+    with engine.connect() as db:
+        location_id = db.execute(select(Location.location_id).where(*where)).scalar_one()
+    assert response.json()["data"]["location_id"] == location_id
+    [record] = records(engine, caller)
+    assert record["response_status"] == 201
+    assert record["response_body"] == response.json()
+
+    # 第一次登记的事件丢弃，第二次的照常写。
+    recorded = events(engine, rid_of(response))
+    details = sorted((event["details"]["ref_type"], event["details"]["ref"]) for event in recorded)
+    assert details == [("attempt", "2"), ("note", "m")]
+
+    replay = send(client, caller, json=body)
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == response.json()
+    assert seen == [1, 2]
+
+
+def test_a_redo_pre_creates_again_and_calls_the_hook_again_under_the_lock(client, engine):
+    caller = issue(engine)
+    first_sku, second_sku = add_skus(engine, caller.tenant_id, 2)
+    calls: list[str] = []
+    seen: dict[str, object] = {}
+    redoing = threading.Event()
+    proceed = threading.Event()
+
+    def balance_rows(connection: Connection) -> list[tuple[str, str]]:
+        calls.append("balance_rows")
+        if calls.count("balance_rows") == 1:
+            return [(caller.pool_id, first_sku)]
+        # 重做：停在这里，让同键的请求来撞幂等锁；这次多返回一行。
+        redoing.set()
+        assert proceed.wait(10)
+        return [(caller.pool_id, first_sku), (caller.pool_id, second_sku)]
+
+    def before_transaction(connection: Connection) -> None:
+        calls.append("before_transaction")
+
+    def command(execution: Execution) -> None:
+        calls.append("command")
+        if calls.count("command") == 1:
+            raise RedoCommand()
+        # 重做的命令运行时，另一个连接已经看得到第二次预建的行。
+        seen["second"] = balance_of(engine, caller, caller.pool_id, second_sku)
+
+    BALANCE_ROWS["m"] = balance_rows
+    BEFORE_TRANSACTION["m"] = before_transaction
+    HOOKS["m"] = command
+    body = {"marker": "m", "rows": []}
+    other_client = TestClient(client.app)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            future = pool.submit(send, client, caller, url=REDO_NOTES_URL, json=body)
+            assert redoing.wait(10)
+            busy = send(other_client, caller, url=REDO_NOTES_URL, json=body)
+        finally:
+            proceed.set()
+        response = future.result()
+
+    error = error_of(busy, 409)
+    assert error["code"] == "REQUEST_IN_PROGRESS"
+    assert error["retryable"] is True
+
+    assert response.status_code == 201
+    assert calls == ["balance_rows", "before_transaction", "command"] * 2
+    assert seen["second"] is not None
+    assert balance_of(engine, caller, caller.pool_id, first_sku) is not None
+    assert notes(engine, caller, "m") == 1
+    [record] = records(engine, caller, operation=REDO_NOTES)
+    assert record["response_body"] == response.json()
+    assert_lock_free(engine, note_lock(caller, operation=REDO_NOTES))
+
+
+def test_a_write_kept_on_rejection_can_ask_for_a_redo(client, engine):
+    caller = issue(engine)
+    taken_id = new_id("loc")
+    with engine.begin() as db:
+        values = {"location_id": taken_id, "tenant_id": caller.tenant_id, "name": "taken"}
+        db.execute(insert(Location).values(status="active", **values))
+    # 第一次的写入撞上已有的主键，重做时换一个。
+    kept_ids = [taken_id, new_id("loc")]
+    attempts: list[int] = []
+
+    def reject_keeping(execution: Execution) -> None:
+        values = {
+            "location_id": kept_ids[len(attempts)],
+            "tenant_id": caller.tenant_id,
+            "name": "kept",
+            "status": "active",
+        }
+        attempts.append(len(attempts) + 1)
+
+        def keep(connection: Connection) -> None:
+            try:
+                connection.execute(insert(Location).values(values))
+            except IntegrityError as exc:
+                if exc.orig.args[0] != 1062:
+                    raise
+                raise RedoCommand() from None
+
+        execution.keep_on_rejection(keep)
+        reject(execution)
+
+    HOOKS["m"] = reject_keeping
+    body = {"marker": "m", "event": True}
+    rejected = send(client, caller, json=body)
+    assert error_of(rejected, 409)["code"] == REJECTED
+    assert attempts == [1, 2]
+
+    # 第二次的拒绝与它保留的写入一起保存；已有的那一行没变。
+    assert notes(engine, caller, "m") == 0
+    assert notes(engine, caller, "kept") == 1
+    assert notes(engine, caller, "taken") == 1
+    with engine.connect() as db:
+        statement = select(Location.name).where(Location.location_id == kept_ids[1])
+        assert db.execute(statement).scalar_one() == "kept"
+    [record] = records(engine, caller)
+    assert record["response_status"] == 409
+    assert record["response_body"] == rejected.json()
+    # 第一次登记的事件丢弃，第二次的照常写。
+    [event] = events(engine, rid_of(rejected))
+    assert event["event_type"] == COMMAND_EVENT
+
+    replay = send(client, caller, json=body)
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == rejected.json()
+    assert attempts == [1, 2]
+    assert notes(engine, caller, "kept") == 1
+
+
+def test_a_second_redo_is_unavailable_and_saves_nothing(client, engine):
+    caller = issue(engine)
+    seen: list[int] = []
+    HOOKS["m"] = redo_first(2, seen)
+    body = {"marker": "m", "event": True}
+    failed = send(client, caller, json=body)
+    error = error_of(failed, 503)
+    assert error["code"] == "UNAVAILABLE"
+    assert error["retryable"] is True
+    assert seen == [1, 2]
+
+    assert records(engine, caller) == []
+    for marker in ("m", "attempt-1", "attempt-2"):
+        assert notes(engine, caller, marker) == 0
+    # 两次登记的事件都丢弃。
+    assert events(engine, rid_of(failed)) == []
+    assert_lock_free(engine, note_lock(caller))
+
+    # 没保存幂等记录：同键重试会重新执行。
+    del HOOKS["m"]
+    retry = send(client, caller, json=body)
+    assert retry.status_code == 201
+    assert "Idempotency-Replayed" not in retry.headers
+    assert notes(engine, caller, "m") == 1
+    assert len(records(engine, caller)) == 1
+
+
+def test_a_redo_stays_read_committed_and_the_isolation_is_reset_afterwards(client, engine):
+    caller = issue(engine)
+    seen: list[tuple[str, int]] = []
+
+    def look(execution: Execution) -> None:
+        db = execution.connection
+        isolation = db.execute(text("SELECT @@transaction_isolation")).scalar_one()
+        seen.append((isolation, db.execute(text("SELECT CONNECTION_ID()")).scalar_one()))
+        if len(seen) == 1:
+            raise RedoCommand()
+
+    HOOKS["m"] = look
+    response = send(client, caller, url=REDO_NOTES_URL, json={"marker": "m", "rows": []})
+    assert response.status_code == 201
+    [(first_isolation, connection_id), (second_isolation, second_id)] = seen
+    assert first_isolation == second_isolation == "READ-COMMITTED"
+    # 重做在同一连接上。
+    assert second_id == connection_id
+
+    # 请求结束后同一连接再开的事务回到默认隔离级别。
+    with client.app.state.engine.connect() as db:
+        assert db.execute(text("SELECT CONNECTION_ID()")).scalar_one() == connection_id
+        isolation = db.execute(text("SELECT @@transaction_isolation")).scalar_one()
+        assert isolation == "REPEATABLE-READ"
