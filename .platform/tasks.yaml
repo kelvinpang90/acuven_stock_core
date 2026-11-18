@@ -1960,7 +1960,7 @@ tasks:
       RedoCommand 无论由命令本身抛出，还是由命令用 keep_on_rejection 登记、在业务拒绝之后执行的写入抛出，都按同样方式重做（被拒仍保留的写入撞唯一约束时也要能重做，契约 5.7 撞唯一约束一条）。
       已有的 BusinessRefTaken 行为不变；不抛 RedoCommand 的命令行为不变。
       明确不做：确认销售本身（CORE-TASK-044）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-039
     acceptance_criteria:
