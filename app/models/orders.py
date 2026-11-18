@@ -1,14 +1,17 @@
-"""网店订单的表：预留与订单行（契约 5.1、5.6、5.7 的存放；租户隔离见第 10 节第 1 条）。
+"""网店订单的表：预留、订单行与订单单据（契约 5.1、5.6、5.7、5.8 的存放）。
 
-只有表结构与数据库约束。状态、释放原因与数量上下限取自 app/domain/reservations.py。
-expires_at = created_at + ttl_seconds、订单行的 pool_id 与所属预留相同、
-同一预留里 sku_id 不重复，都由服务层在同一事务里保证（契约 5.6）。
+租户隔离见第 10 节第 1 条。只有表结构与数据库约束。
+状态、释放原因与数量上下限取自 app/domain/reservations.py，单据类型取自 app/domain/fulfilment.py。
+expires_at = created_at + ttl_seconds、订单行与单据的 pool_id 与所属预留相同、
+同一预留里 sku_id 不重复，都由服务层在同一事务里保证（契约 5.6、5.8）。
 """
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     CHAR,
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -21,6 +24,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+from app.domain.fulfilment import DOCUMENT_TYPES
 from app.domain.reservations import (
     ACTIVE,
     CLOSED_REFUNDED,
@@ -35,7 +39,7 @@ from app.domain.reservations import (
     TTL_MAX,
     TTL_MIN,
 )
-from app.models.catalog import EXACT_COLLATION, ID, TABLE_OPTIONS, TIMESTAMP
+from app.models.catalog import EXACT_COLLATION, ID, NOW, TABLE_OPTIONS, TIMESTAMP
 from app.models.inventory import CODE32, REF, ZERO
 
 # 释放时才有、且必有的列；释放的操作者两列可选，另行约束。
@@ -272,3 +276,71 @@ class OrderLine(Base):
     refund_restocked_qty: Mapped[int] = mapped_column(BigInteger, server_default=ZERO)
     returned_sellable_qty: Mapped[int] = mapped_column(BigInteger, server_default=ZERO)
     returned_unsellable_qty: Mapped[int] = mapped_column(BigInteger, server_default=ZERO)
+
+
+class OrderDocument(Base):
+    """发货、退款回库与退货验收的单据：每条已生效的命令一行（契约 5.8 的存放）。
+
+    只追加、不改不删。document_id 的前缀按类型分别是 shp_、rfr_、rtn_，由应用生成。
+    document_seq 只作订单库存查询的分页顺序，不对外当身份用。
+    """
+
+    __tablename__ = "order_documents"
+    __table_args__ = (
+        # 四条复合外键都以 tenant_id 开头，显式命名，名字里带上第二列。
+        ForeignKeyConstraint(
+            ["tenant_id", "reservation_id"],
+            ["reservations.tenant_id", "reservations.reservation_id"],
+            name="fk_order_documents_reservation_id_reservations",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "pool_id"],
+            ["stock_pools.tenant_id", "stock_pools.pool_id"],
+            name="fk_order_documents_pool_id_stock_pools",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "channel_id"],
+            ["sales_channels.tenant_id", "sales_channels.channel_id"],
+            name="fk_order_documents_channel_id_sales_channels",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "credential_id"],
+            ["credentials.tenant_id", "credentials.credential_id"],
+            name="fk_order_documents_credential_id_credentials",
+        ),
+        UniqueConstraint("document_id"),
+        # 业务引用按销售入口唯一（契约 5.8）。约束名超过 64 字符，建表时按命名约定截断加摘要。
+        UniqueConstraint("tenant_id", "channel_id", "document_type", "document_ref"),
+        # 订单库存查询按订单、按 document_seq 分页；也支撑指向预留的外键。
+        Index(
+            "ix_order_documents_tenant_id_reservation_id_document_seq",
+            "tenant_id",
+            "reservation_id",
+            "document_seq",
+        ),
+        CheckConstraint(_in("document_type", DOCUMENT_TYPES), name="document_type"),
+        CheckConstraint("JSON_TYPE(result) = 'OBJECT'", name="result"),
+        # 三个命令都不要求角色（契约第 10 节第 3 条）：有操作者时才有角色，反之亦然。
+        CheckConstraint("(actor_ref IS NULL) = (actor_role IS NULL)", name="actor"),
+        TABLE_OPTIONS,
+    )
+
+    # 设成主键，建表时才生成 AUTO_INCREMENT，插入后能直接取回（契约 5.8）。
+    document_seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[str] = mapped_column(ID)
+    tenant_id: Mapped[str] = mapped_column(ID, ForeignKey("tenants.tenant_id"))
+    channel_id: Mapped[str] = mapped_column(ID)
+    pool_id: Mapped[str] = mapped_column(ID)
+    reservation_id: Mapped[str] = mapped_column(ID)
+    document_type: Mapped[str] = mapped_column(CODE32)
+    # 发货是 shipment_ref，退款回库是 refund_ref，退货验收是 return_ref。
+    document_ref: Mapped[str] = mapped_column(REF)
+    # 规范化请求摘要 SHA-256 的小写十六进制（契约 7.1）。
+    request_hash: Mapped[str] = mapped_column(CHAR(64, collation=EXACT_COLLATION))
+    # 首次 201 响应的 data。
+    result: Mapped[dict[str, Any]] = mapped_column(JSON)
+    credential_id: Mapped[str] = mapped_column(ID)
+    actor_ref: Mapped[str | None] = mapped_column(REF)
+    actor_role: Mapped[str | None] = mapped_column(CODE32)
+    request_id: Mapped[str] = mapped_column(REF)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=NOW)
