@@ -1850,7 +1850,7 @@ tasks:
       二，只做普通读、不加锁：返回 pool_id、pool_status 与按 sku_id 升序的 skus；每项 sku_id、available（stock_balance 减 reserved 减 unavailable，没有余额行为 0）、
       status（merged、inactive 或 sellable）与 merged_into_sku_id（只在 merged 时有值）。不属于本租户的 SKU 不出现，也不报错。
       明确不做：预留与释放（CORE-TASK-038、039）；不改余额与流水查询的已有行为。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-036
     acceptance_criteria:
