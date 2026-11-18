@@ -2259,7 +2259,7 @@ tasks:
       - 集成测试验证业务引用与重放：同键原样重放带 Idempotency-Replayed；换键同内容 200 与首次的表示（余量已用完也是 200）；换键同引用不同内容或报到别的订单 409 BUSINESS_REF_CONFLICT，details 的 ref_type 发货为 shipment、退款回库为 refund，并写 business_ref_conflict 事件；发货与退款回库用同一个引用字符串互不冲突
       - 集成测试验证合并改挂：模拟合并（来源 SKU 标为已合并、订单行改挂、paid_pending_dispatch 挪到规范 SKU）后发货扣的是规范 SKU；同一订单两行指向同一 SKU 时一次发货两行各写一条流水
       - 集成测试验证正文：引用格式不对、quantity 为 0 或小数或超过上限、line_ref 重复、带未知字段、缺 lines 都 422，101 行 413，路径 order_ref 不合格 422
-      - 并发测试（照 tests/integration/test_sale_commit_concurrency.py 的做法，两个连接）验证同一 shipment_ref 换键同内容并发且只够一次的余量：两个请求都得到同一张单据（一个 201、一个 200），只写一份流水与一行单据，后到的不得 409 QUANTITY_EXCEEDS_OUTSTANDING；换键不同内容并发时后到的 409 BUSINESS_REF_CONFLICT
+      - 并发测试（照 tests/integration/test_sale_commit_concurrency.py 的做法，两个连接，用 gate_after_step_one 式的闸门让两个请求都过了第 1 步再去锁预留行）验证同一 shipment_ref 换键同内容并发：余量只够一次时（走报拒绝前重查）和余量够两次时（走撞唯一约束、回滚、另开事务重判），两个请求都得到同一张单据（一个 201、一个 200），只写一份流水与一行单据，不出 5xx，后到的不得 409 QUANTITY_EXCEEDS_OUTSTANDING；换键不同内容并发时后到的 409 BUSINESS_REF_CONFLICT
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
       - app/api/fulfilment.py
