@@ -26,8 +26,7 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-047` 实现找不到预留时的故障补交新建
-2. `CORE-TASK-048` 实现晚到支付待审的结案
+1. `CORE-TASK-048` 实现晚到支付待审的结案
 
 ### 已阻塞
 

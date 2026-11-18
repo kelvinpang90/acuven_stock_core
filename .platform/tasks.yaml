@@ -2107,7 +2107,7 @@ tasks:
       四，写入撞上 order_ref 或 payment_ref 的唯一约束时抛 RedoCommand（重做后按已有的预留回答）。
       报 409 POOL_NOT_LIVE 与 404 SKU_NOT_FOUND 之前照 5.7 重查业务引用；有效期取 create_app 放在应用状态里的配置（从 execution.request.app.state 读）；重查命中改按第 1 步回答时，丢弃本次登记的 cross_tenant 事件，没命中时保留（同 5.6 并发重报）。
       明确不做：待审结案（CORE-TASK-048）；SKU 合并本身。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-046
     acceptance_criteria:
