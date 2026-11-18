@@ -97,6 +97,18 @@
 - rejudge 抛别的异常（包括再抛 BusinessRefTaken）或数据库出错：回滚、不保存、500。
   写幂等记录撞唯一约束时照上面第 4 步重放或冲突。
 
+回滚后整个重做（契约 §5.7 通用的“重新判定”，§7.1 第 2 条“不返回 5xx”的例外）：
+
+- 命令要按回滚之后的数据从头再判时 raise RedoCommand()；由 keep_on_rejection 登记、
+  在业务拒绝之后执行的写入（例如撞上唯一约束时）与 BusinessRefTaken 的 rejudge 也可以抛，处理相同。
+- 执行器收到后：回滚业务事务，丢弃这次登记的安全事件与被拒仍保留的写入，
+  在同一连接上（幂等锁、目录写锁与 READ COMMITTED 仍在）从余额行预建那一步整个重做：
+  重新调用 balance_rows 并预建它这次返回的行、重新调用 before_transaction，
+  再开新事务执行同一个命令。重做的结果照常处理（保存、重放、冲突、500 都与第一次相同）。
+- 每个请求最多重做一次：重做里再抛 RedoCommand 时回滚，
+  503 UNAVAILABLE（retryable 为真），不保存幂等记录，两次登记的安全事件都丢弃；
+  同键重试会重新执行。
+
 READ COMMITTED（契约 §4.1 下文、§6.6）：
 
 - run_idempotent(..., read_committed=True) 的业务事务（以及 BusinessRefTaken 的重新判定事务）
@@ -233,6 +245,16 @@ class BusinessRefTaken(Exception):
         self.rejudge = rejudge
 
 
+class RedoCommand(Exception):
+    """命令要求回滚后从余额行预建那一步整个重做一次（§5.7 通用的“重新判定”）。
+
+    命令本身、keep_on_rejection 登记的写入或 rejudge 抛出；重做里再抛时 503。
+    """
+
+    def __init__(self) -> None:
+        super().__init__("the command asked to be redone after a rollback")
+
+
 def _event(request: Request, event_type: str, details: dict[str, Any]) -> SecurityEventRecord:
     access = get_access(request)
     return SecurityEventRecord(
@@ -266,6 +288,7 @@ def run_idempotent(
     balance_rows 给了时，取锁之后、开业务事务之前用单独的短事务预建它返回的余额行（§4.1）。
     read_committed 为真时业务事务（与重新判定事务）以 READ COMMITTED 开启。
     before_transaction 给了时，设好隔离级别之后、开业务事务之前在同一连接上调用它。
+    命令抛 RedoCommand 时回滚，从预建那一步整个重做一次；重做里再抛 503。
     """
     if (
         not isinstance(operation, str)
@@ -297,13 +320,24 @@ def run_idempotent(
         _acquire(request, connection, name)
         if catalog_lock:
             _acquire_catalog(request, connection, catalog_lock_name(database, scope.tenant_id))
-        if balance_rows is not None:
-            _prepare_balances(request, connection, scope.tenant_id, balance_rows)
-        if read_committed:
-            _read_committed(request, connection)
-        if before_transaction is not None:
-            _before_transaction(request, connection, before_transaction)
-        response, events = _execute(request, connection, scope, digest, command)
+        redone = False
+        while True:
+            if balance_rows is not None:
+                _prepare_balances(request, connection, scope.tenant_id, balance_rows)
+            if read_committed and not redone:
+                # 重做时会话仍是 READ COMMITTED：由 _release_locks 才设回默认。
+                _read_committed(request, connection)
+            if before_transaction is not None:
+                _before_transaction(request, connection, before_transaction)
+            try:
+                response, events = _execute(
+                    request, connection, scope, digest, command, may_redo=not redone
+                )
+            except RedoCommand:
+                # 业务事务已回滚，这次登记的事件丢弃；从预建那一步重做（§5.7 通用）。
+                redone = True
+                continue
+            break
     finally:
         _release_locks(request, connection, reset_isolation=read_committed)
     # 用同一个连接写；它已被作废时 record_security_event 从池里另取一个（§7.2）。
@@ -476,10 +510,14 @@ def _execute(
     scope: _Scope,
     digest: str,
     command: Callable[[Execution], CommandResult],
+    *,
+    may_redo: bool,
 ) -> tuple[Response, list[SecurityEventRecord]]:
     """取到锁之后：在同一连接上开事务，按作用域查记录，重放、冲突或执行命令并保存结果。
 
     返回响应与要在释放锁之后写的安全事件。
+    命令（或被拒仍保留的写入、rejudge）抛 RedoCommand 时回滚：
+    may_redo 为真时把它传出，由调用方重做；否则 503，事件都丢弃。
     """
     request_id = request.state.request_id
     execution = Execution(request, connection, scope.operation, digest)
@@ -517,6 +555,14 @@ def _execute(
             return _answer_existing(request, connection, scope, digest)
         transaction.commit()
         return response, execution.events
+    except RedoCommand:
+        # 回滚命令的全部写入（含被拒仍保留的写入），这次登记的事件不写。
+        _rollback_quietly(transaction)
+        if may_redo:
+            raise
+        # 重做里又要重做：确定未生效，两次的事件都丢弃（§5.7 通用、§7.1 第 2 条的例外）。
+        _log.warning("the command asked to be redone twice (request_id=%s)", request_id)
+        return error_response(request_id, unavailable()), []
     except Exception:
         _log.exception("idempotent command failed (request_id=%s)", request_id)
         _rollback_quietly(transaction)
