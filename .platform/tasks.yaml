@@ -2211,7 +2211,7 @@ tasks:
       (tenant_id, credential_id) 指向 credentials；显式命名，避免与已有外键同名。
       四，集成测试 tests/integration/test_order_document_schema.py 用现有夹具建租户、池、入口、凭据与一个预留，逐条验证约束能拦住不合格的行、放行合格的行。
       明确不做：任何接口与服务层（CORE-TASK-051 起）；不改 reservations、order_lines 与流水表。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-049
     acceptance_criteria:
