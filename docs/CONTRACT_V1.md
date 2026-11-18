@@ -1,6 +1,8 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.13｜2026-11-16｜状态：**Kelvin 已批准**——第 14 节第 77–83 条（§5.7 确认销售、晚到支付、待审结案与故障补交的接口、判定顺序、表示与存放，
+> 版本：0.14｜2026-11-18｜状态：**0.14 待 Kelvin 批准**——第 14 节第 84–87 条（§5.8 发货、退款回库、退货验收与订单库存查询的接口、判定顺序、表示与存放，
+> §5.3、§5.4、§5.6、§5.7、§6.7、§8.2、§8.3 的相应条目；取舍见 Q-63～Q-66）。批准前不得据此登记任务。
+> 0.13：第 14 节第 77–83 条（§5.7 确认销售、晚到支付、待审结案与故障补交的接口、判定顺序、表示与存放，
 > §5.2 的状态机与第 4、6 条、§5.5、§5.6 的触发路径、隔离级别与出错处理、§2.4、§2.7、§7.1 第 2 条、§8.2、§8.3、§9.1 的相应条目；取舍见 Q-57～Q-62）于 2026-11-16 批准。
 > 0.12：第 14 节第 70–76 条（§5.6 预留、释放、到期关闭与可售量查询的接口、判定顺序、表示与存放，
 > 预留有效期的配置，读接口不关单，§5.2 第 3、4 条、§5.1、§2.4 第 0 步、§2.7、§6.2 第 1 条、§8.2、§10 第 4 条的相应条目；取舍见 Q-53～Q-56）于 2026-11-16 批准。
@@ -22,7 +24,7 @@
 > 第 14 节第 18–23 条的 0.6 改动（§7.1 幂等的作用域、摘要、处理中判定与保存范围，§7.2 安全日志，§8.1 请求头与检查顺序，§8.3 新增 405，
 > §10 凭据、令牌、scope、角色表与池授权）
 > 与第 24–37 条（审查与设计预审后的修改；取舍见 Q-31～Q-35，含 §7.1 第 2 条追加的“换键重报返回对象当前的表示”）于 2026-11-13 批准。
-> 0.13 及以前的设计闸门通过；实现进度见 [TODO.md](TODO.md)。
+> 0.13 及以前的设计闸门通过（0.14 待批准）；实现进度见 [TODO.md](TODO.md)。
 > 按模板规则：设计有改动时，改动部分的批准作废、须重新批准。
 > 依据：[REQUIREMENTS.md](../REQUIREMENTS.md)（Core V1 需求，2026-10-08）、`acuven_hub/DECISIONS.md` 的 C-01～C-19、S-01～S-10、I-02、I-04，
 > 以及 `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md`（Inventory 草案，只读参照）。
@@ -496,14 +498,14 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | 部分/全部发货（ORD-07） | 网店记录交运 | `dispatches`（`shipment_ref`＋行/件数） | 每行 `q ≤ committed − dispatched − refund_restocked` |
 | 付款后退款（未交运部分） | 退款流程获批准，且网店确认这些件**仍在库未交运** | `refund-restocks`（`refund_ref`＋行/件数） | 同上；**仅有支付机构退款成功通知不触发**（ORD-04） |
-| 已交运后退货（ORD-05） | 实物收到并验收 | `return-receipts`（`return_ref`＋行/件数＋`disposition: sellable/unsellable`） | 每行累计退货 ≤ `dispatched_qty` |
+| 已交运后退货（ORD-05） | 实物收到并验收 | `return-receipts`（`return_ref`＋每行的可售件数与不可售件数，0.14，Q-63） | 每行累计退货 ≤ `dispatched_qty` |
 | 付款前取消 | 网店取消订单 | `reservations/{id}/release` | 只能整单；`committed` 状态返回 409 `STATE_CONFLICT` |
 
-付款后**没有**“部分取消”命令；退款与库存是两个独立事实（ORD-04）。“只退款不退货”的已交运订单不调 Core。
+付款后**没有**“部分取消”命令；退款与库存是两个独立事实（ORD-04）。“只退款不退货”的已交运订单不调 Core。接口、判定顺序、表示与存放见 §5.8（0.14）。
 
 ### 5.4 订单查询与对账
 
-- `GET /v1/orders/{order_ref}/stock`：返回该订单的预留状态、每行累计量和相关流水，供网店后台异常处理（ORD-06）。
+- `GET /v1/orders/{order_ref}/stock`：返回该订单的预留状态、每行累计量和发货、退款回库、退货验收的单据（每行带流水 ID；流水本身用 §6.8 查），供网店后台异常处理（ORD-06）。做法见 §5.8（0.14，Q-65）。
 - `GET /v1/reconciliation/order-lines?changed_after=<cursor>`：按变更顺序列出订单行累计量，供网店每日自动对账（ORD-08）。
   对账由网店发起、差异在网店后台成为待办；Core 不读网店数据库。对账要比较的项见 [SHOP_STOCK_INVENTORY.md](SHOP_STOCK_INVENTORY.md) 第 8 节。
 
@@ -534,7 +536,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
 ### 5.6 预留、释放、到期与可售量的接口与存放（0.12，Q-53～Q-56）
 
 §5.2 的状态机与规则不变，这里补接口、判定顺序、表示、存放与到期关闭的做法。本节只覆盖预留、释放、到期与可售量查询；
-确认销售、晚到支付与故障收款补交（§5.2 第 5–7 条、§5.5）见 §5.7（0.13）；付款后的分支（§5.3）与订单查询、对账（§5.4）在登记它们之前另行细化。
+确认销售、晚到支付与故障收款补交（§5.2 第 5–7 条、§5.5）见 §5.7（0.13）；付款后的分支（§5.3）与订单库存查询（§5.4）见 §5.8（0.14）；对账（§5.4）在登记它之前另行细化。
 
 **通用**
 - scope：预留、释放要 `orders.write`，预留查询要 `orders.read`，可售量要 `stock.read`（§10 第 4 条）；都不要求角色（§10 第 3 条）。
@@ -549,7 +551,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
   原因：REPEATABLE READ 下按 `(tenant_id, reservation_id)` 加锁读订单行是范围扫描，会连同最后一行之后的间隙一起锁住；`reservation_id` 按时间递增，
   新预留的订单行正好插在那段间隙里，于是“新预留锁住余额行、插订单行被间隙锁挡住”与“释放锁住订单行间隙、再等余额行”成环。
   READ COMMITTED 下加锁读只锁匹配的行、不锁间隙，普通读每条语句都看到最新的已提交数据（第 1 步的业务引用与并发重报的重新判定都依赖这一点）。
-  以后读写预留或订单行的命令（确认销售、付款后的分支、SKU 合并的执行）在登记前按这个顺序细化（SKU 合并见 §2.4 第 0、1 步）。
+  以后读写预留或订单行的命令（确认销售、付款后的分支、SKU 合并的执行）在登记前按这个顺序细化（SKU 合并见 §2.4 第 0、1 步；付款后的分支见 §5.8，0.14）。
 - 订单行的 `sku_id`：预留时取请求里的 SKU；SKU 合并执行时改挂到规范 SKU（§2.4 第 1 步、§5.1）。所以释放与到期关单在锁住预留行之后，用加锁读（`FOR SHARE`）读订单行，
   按读到的 `sku_id` 锁余额行：加锁读会等正在进行、还没提交的合并结束，读到它改挂后的 `sku_id`；普通读不等，可能读到合并之前的 `sku_id`，去减已经迁走的 `reserved`。
 - 流水：预留写 `RESERVE`、释放与到期关闭写 `RELEASE`，每个订单行一条（§4.3）。`source_type` 为 `reservation`，`source_ref` 为 `order_ref`，`line_ref` 为该行的 `line_ref`；
@@ -616,7 +618,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
 **表示**
 - `reservation_id`（前缀 `rsv_`）、`order_ref`、`pool_id`、`status`、`expires_at`、`created_at`，以及只在 `released` 时有值的 `released_at` 与 `release_reason`（其他状态为 `null`）；
 - `status` 取值 `active`、`released`、`expired`、`committed`、`late_payment_review`、`closed_refunded`（后三种见 §5.7，表示另加的字段也见 §5.7）；`expired` 的时间就是 `expires_at`，所以关单前后表示相同；
-- `lines`：按 `line_ref` 升序，每行 `line_ref`、`sku_id`、`quantity`。订单行的累计量（§5.1）由订单库存查询（§5.4）返回，在登记它的任务里定。
+- `lines`：按 `line_ref` 升序，每行 `line_ref`、`sku_id`、`quantity`。订单行的累计量（§5.1）由订单库存查询返回（§5.8，0.14）。
   SKU 合并改挂之后，`sku_id` 显示规范 SKU（`released`、`closed_refunded` 的订单行不改挂，仍显示原 SKU，§2.4）。网店按原 SKU 确认时按合并去向比对（§5.7，Q-59）。
 
 **查询**（`orders.read`）
@@ -651,7 +653,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
 
 ### 5.7 确认销售、晚到支付、待审结案与故障补交（0.13，Q-57～Q-62）
 
-§5.2 的第 5–7 条与 §5.5 的 Core 侧不变；§5.2 的状态机补上故障补交新建的两条起点（0.13）。这里补接口、判定顺序、表示与存放。付款后的分支（§5.3）与订单查询、对账（§5.4）在登记它们之前另行细化。
+§5.2 的第 5–7 条与 §5.5 的 Core 侧不变；§5.2 的状态机补上故障补交新建的两条起点（0.13）。这里补接口、判定顺序、表示与存放。付款后的分支（§5.3）与订单库存查询（§5.4）见 §5.8（0.14）；对账（§5.4）在登记它之前另行细化。
 
 **通用**
 - scope `orders.write`，不要求角色（§10 第 3 条）。池取凭据的销售入口绑定的池；凭据没有销售入口（或入口已停用）时 403 `FORBIDDEN`，记 `forbidden` 事件（被拒的类别为池），在取幂等锁之前判出、不保存。
@@ -714,7 +716,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
     `details.lines` 同 `INSUFFICIENT_STOCK`（§5.6 预留第 6 步）按请求里的顺序列出所在 SKU 合计不足的行，每项 `line_ref`、`sku_id`（合并去向）、`quantity`、`available`（该 SKU 的可售量；判定是拿它与该 SKU 各行的合计比较）。
     这是“被拒时也要留下状态变化”的命令（§7.1 第 1 条）：同一事务里的到期关单、转入待审与新建的预留和订单行，与幂等记录一起提交。
   - §5.2 第 6 条的“记一条待办”就是预留处于 `late_payment_review`，Core 不另建待办表。网店收到这个 409 时就知道该订单待审，记进自己的待办；
-    按订单查它用预留查询（`order_ref`）；按状态列出全部待审的查询在细化 §5.4 时定。
+    按订单查它用预留查询（`order_ref`）；按状态列出全部待审的查询在细化对账（§5.4）时定。
     管理员补货后用**新幂等键**、同一 `payment_ref` 重试确认（同键只会重放 409）；或网店退款后调用结案（见下）。Core 不在补货时自动补扣（Q-26）。
 - **撞唯一约束**：任何一支的写入（正常确认、晚到确认、转入待审记下 `payment_ref`、故障补交新建）撞上 `(tenant_id, channel_id, order_ref)` 或 `(tenant_id, channel_id, payment_ref)` 唯一约束（并发的预留或确认）时，
   回滚，重新判定（见“通用”），结果作为这个幂等键的确定结果保存（§7.1 第 2 条最后一段）；被回滚的那次登记的安全事件丢弃（同 §5.6 并发重报）。
@@ -731,7 +733,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
 - `committed_at`：只在 `committed` 时有值；`late`：经 `LATE_SALE_COMMIT` 确认的为 `true`，其余为 `false`；
 - `fault_mode`：由故障补交新建，或被 `reservation_id` 为 `null` 的请求确认或转入待审的为 `true`（对账要单独列出，§5.5）；一旦为 `true` 不再改回；
 - `review_closed_at`：只在 `closed_refunded` 时有值。
-- 只在 `committed` 时，订单行累计量才有意义；累计量仍由订单库存查询（§5.4）返回。
+- 只在 `committed` 时，订单行累计量才有意义；累计量仍由订单库存查询返回（§5.8，0.14）。
 
 **存放**（迁移只加列、加索引、加约束，§2.2）
 - `reservations` 加列：`payment_ref`、`paid_at`、确认摘要 `commit_request_hash`、`committed_at`、`late`（布尔，默认 `false`）、`fault_mode`（布尔，默认 `false`），
@@ -744,6 +746,109 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
   - 外键：`(tenant_id, commit_credential_id)` 与 `(tenant_id, review_closed_credential_id)` → `credentials`。
 - 晚到确认重试成功时，`commit_request_hash`、`commit_*` 改记成功的那次请求；`payment_ref`、`paid_at` 不变（重试须同一 `payment_ref`，`paid_at` 取第一次转入待审时的）。
 - `order_lines` 不加列：确认时 `committed_qty` 设为 `quantity`（§5.1、§5.6 已建的约束）。
+
+### 5.8 发货、退款回库、退货验收与订单库存查询（0.14，Q-63～Q-66）
+
+§5.1 的累计量与约束、§5.3 的分支不变；这里补三个付款后命令与订单库存查询的接口、判定顺序、表示与存放。
+对账变更流（§5.4 第二项）与按状态列出待审的查询（§5.7）在登记对账任务之前另行细化。
+
+**通用**（三个命令：发货、退款回库、退货验收）
+- scope `orders.write`，不要求角色（§10 第 3 条）。凭据没有销售入口（或入口已停用）时 403 `FORBIDDEN`，记 `forbidden` 事件（被拒的类别为池），在取幂等锁之前判出、不保存；
+  预留按 `(tenant_id, channel_id, order_ref)` 查找，只会找到本入口的预留（同 §5.7 通用）。路径的 `order_ref` 格式见 §1，不合格 422。
+- **只对 `committed` 的预留**：三个命令改的是已确认订单行的累计量（§5.1）。其他状态没有付款后扣过数的件（`late_payment_review` 还没扣数），409 `STATE_CONFLICT`。
+  全部件数都已发货、回库或退货之后，预留仍是 `committed`，不另加状态；订单走到哪一步看累计量。
+- **没有“开业务事务之前”的步骤**：不预建余额行（`committed` 预留的订单行在预留时已有余额行，§5.6 存放的外键），不先关到期（`committed` 的预留不会到期）。
+- 隔离级别同 §5.6：写事务以 READ COMMITTED 开启（按 `(tenant_id, reservation_id)` 加锁读订单行是范围扫描，理由同 §5.6）。
+- 锁序同 §5.6：预留行（`FOR UPDATE`）→ 订单行（`FOR UPDATE`，本节要改累计量）→ 余额行（`FOR UPDATE`，按 §8.1 升序）。
+  - 不读池行：预留建立时池已 `live`，池不会退回 `initializing`（§6.2 第 2 条），所以不判 `POOL_NOT_LIVE`；
+  - 不读 SKU 行与商品行：停用、合并进行中都不拦（§2.4“已付款订单照常发货、退款回库、退货”，§6.2 第 3 条同理）；`committed` 的订单行在合并执行时已改挂到规范 SKU（§2.4 第 1 步），不会落在已合并的 SKU 上；
+  - 同一订单上的这三个命令、确认销售与 SKU 合并执行都先锁预留行，彼此排队。
+- 订单行的 `sku_id`：照 §5.6 用加锁读读订单行，按读到的 `sku_id` 锁余额行、写流水（合并改挂之后就是规范 SKU，§2.4 末段）。
+  合并改挂之后同一订单可能有两行指向同一个 SKU：余额行只锁一次，两行各写各的流水。
+- **行**：请求只按 `line_ref` 指订单行，不带 `sku_id`（Core 照订单行的 `sku_id` 记账，合并改挂之后网店不必知道规范 SKU，Q-66）。
+  `lines` 1–100 个（超过 413，§8.1 第 7 步），同一请求里 `line_ref` 重复 422；可以只列订单的部分行，没列的行不动。
+- **公共字段**：可选 `reason_code`、`note`、`occurred_at`，规则同 §6.2 第 6 条，写进本命令的每条流水；不带 `occurred_at` 时取数据库时间。
+- **事务里的判定与执行**，按顺序（一个请求有多种错误时只报最先遇到的一种）：
+  1. 业务引用：用普通读按 `(tenant_id, channel_id, document_type, document_ref)` 查订单单据（见存放）。已有：规范化请求摘要（§7.1，`path` 含 `order_ref`）相同，200，返回它的 `result`
+     （单据生效后不变，所以就是当前表示，同 §6.2 第 7 条）；不同，409 `BUSINESS_REF_CONFLICT`，`details` 为 `{"ref_type": …, "ref": …}`（`ref_type` 取 `shipment`、`refund` 或 `return`），
+     记 `business_ref_conflict` 事件。同一个引用报到别的订单上，摘要不同，同样 409；
+  2. `FOR UPDATE` 按 `(tenant_id, channel_id, order_ref)` 读预留行：没有，404 `RESERVATION_NOT_FOUND`（不记事件）；不是 `committed`，409 `STATE_CONFLICT`，`details` 为 `{"status": …}`
+     （取表示里的状态，已到期还没关掉的 `active` 报 `expired`，同 §5.7 通用）；
+  3. `FOR UPDATE` 读该预留的全部订单行。请求里有订单没有的 `line_ref`：409 `RESERVATION_MISMATCH`，`details` 为 `{"reason": "lines", "line_refs": [...]}`，按升序列出这些 `line_ref`；
+  4. 余量：逐行比较本次件数与该行的余量（各命令见下）。有任何一行超过，409 `QUANTITY_EXCEEDS_OUTSTANDING`，`details.lines` 按请求顺序列出全部超过的行，
+     每项 `line_ref`、`sku_id`（订单行的）、`quantity`（退货验收为两个数之和）与 `limit`（这一行当前的余量），形状同 §6.5；
+  5. 按 §8.1 升序锁住所列订单行的 SKU 的余额行；按 `line_ref` 升序逐行写流水（见各命令）、加订单行的累计量；写订单单据一行；与幂等记录同一事务提交。§4.1 的不变量照常在锁内校验。
+
+  **报业务拒绝之前重查业务引用**（同 §5.7 第 3 步）：第 2–4 步要报拒绝之前，在同一事务里用普通读重做第 1 步（READ COMMITTED 下看得到第 1 步之后才并发提交的同一引用；不回滚）。
+  查到就按第 1 步回答，没查到才报原来的拒绝。这样同一引用换键并发重报时，后到的一个不会因为先到的已用掉余量而得到 `QUANTITY_EXCEEDS_OUTSTANDING`。
+  **撞唯一约束**：第 5 步写订单单据撞上唯一约束（并发的同一引用）时，照 §7.1 第 2 条最后一段：回滚，另开事务按第 1 步重新判定，结果作为这个幂等键的确定结果保存；被回滚的那次登记的安全事件丢弃。
+  第 2–4 步的拒绝不写任何东西，只保存幂等记录，不占用业务引用（§7.1 第 2 条）。
+- **流水**：每条的 `source_type` 为 `dispatch`、`refund_restock` 或 `return_receipt`，`source_ref` 为本命令的 `shipment_ref`、`refund_ref` 或 `return_ref`，`line_ref` 为订单行的 `line_ref`；
+  `channel_id`、凭据、幂等键、操作者与请求 ID 取本次请求。从流水找订单经订单单据（流水的引用 → 单据 → `reservation_id`）。
+
+**发货** `POST /v1/orders/{order_ref}/dispatches`（`dispatches.create`，ORD-07）
+- 正文：`{"shipment_ref": …, "lines": [{"line_ref": …, "quantity": …}, …]}`，加可选的公共字段，不接受别的字段。`quantity` 是 1–1,000,000 的 JSON 整数。
+- 余量：`committed_qty − dispatched_qty − refund_restocked_qty`。
+- 每行写一条 `DISPATCH`（`paid_pending_dispatch` 减 `quantity`），订单行 `dispatched_qty` 加 `quantity`。
+- 网店在实物交运（离开库存池）时报；一次交运一个 `shipment_ref`，可以只报部分行、部分件数，余下的之后换 `shipment_ref` 再报。
+
+**退款回库** `POST /v1/orders/{order_ref}/refund-restocks`（`refund_restocks.create`，ORD-04）
+- 正文：`{"refund_ref": …, "lines": [{"line_ref": …, "quantity": …}, …]}`，加可选的公共字段，规则同发货。余量同发货。
+- 每行写一条 `REFUND_RESTOCK`（`stock_balance` 加、`paid_pending_dispatch` 减 `quantity`），订单行 `refund_restocked_qty` 加 `quantity`。
+- 网店的退款已批准、且确认这些件仍在库未交运之后才调（§5.3）；支付机构的退款成功通知本身不触发。
+  一笔退款分两次确认回库时，第二次换一个 `refund_ref`（网店从退款记录派生，例如加序号）：同一个 `refund_ref` 只生效一次。
+
+**退货验收** `POST /v1/orders/{order_ref}/return-receipts`（`return_receipts.create`，ORD-05）
+- 正文：`{"return_ref": …, "lines": [{"line_ref": …, "sellable_quantity": …, "unsellable_quantity": …}, …]}`，加可选的公共字段，不接受别的字段。
+  两个数都必填，都是 0–1,000,000 的 JSON 整数，每行之和至少 1，否则 422。一次验收里同一行可以有可售也有不可售的件（Q-63）。
+- 余量：`dispatched_qty − returned_sellable_qty − returned_unsellable_qty`，与本行两个数之和比较。
+- 每行：`sellable_quantity` 大于 0 时写一条 `RETURN_SELLABLE`（`stock_balance` 加），`unsellable_quantity` 大于 0 时再写一条 `RETURN_UNSELLABLE`（`stock_balance`、`unavailable` 各加）；
+  订单行的两个累计量各加。不可售的件之后按 §6.5 恢复可售或报损。
+- 实物收到并验收之后才调；只退款不退货的已交运订单不调（§5.3）。
+
+**录错了怎么办**（Q-64）：V1 不提供撤销，这三类流水也不能更正（§6.7 第 1 步）。订单行累计量保持原样，差异由网店后台人工处理；账面靠库存命令对回实物：
+- 多报了发货（实物其实还在库）：账面少了这几件的待发量。之后真正交运时不再报（该行余量已用掉）；订单若改为退款，这几件不能再退款回库，由盘点（§6）按差额补回；
+- 多报了退款回库或退货（实物其实不在）：可售量虚高，可能超卖。尽快对这几件标不可售再报损（§6.5），或盘点；
+- 少报的照常补报（换一个引用，余量还在）。
+
+代价：录错的订单行累计量与实物不再一致，订单对账（§5.4）会一直显示这一行的差异，由网店记为已知差异。
+
+**成功** 201，返回订单单据的表示：
+- `document_id`、`document_type`（`dispatch`、`refund_restock` 或 `return_receipt`）、`order_ref`、`reservation_id`、`pool_id`、本类型的引用字段（`shipment_ref`、`refund_ref`、`return_ref` 三者只出现本类型的一个）、
+  `reason_code`、`note`、`occurred_at`、`created_at`；
+- `lines`：按 `line_ref` 升序，每行 `line_ref`、`sku_id`（写流水用的订单行 SKU）；发货与退款回库另带 `quantity`、`entry_id`；
+  退货验收另带 `sellable_quantity`、`unsellable_quantity`、`sellable_entry_id`、`unsellable_entry_id`（对应的数为 0 时为 `null`）；
+- 不含订单行累计量：单据生效后不变（换键重报返回它），累计量随之后的命令变，查订单库存查询。
+- 结果未知时（§8.3），用原内容重报（同键或换键都可以）取回结果，或查订单库存查询的单据列表；不另设单据查询接口。
+
+**订单库存查询** `GET /v1/orders/{order_ref}/stock?after=…&limit=…`（`orders.read`，ORD-06，Q-65）
+- 路径的 `order_ref` 格式见 §1，不合格 422。按凭据的销售入口查 `(tenant_id, channel_id, order_ref)`；没有预留、或凭据没有销售入口时 404 `RESERVATION_NOT_FOUND`
+  （不记事件：查找本身限定在本入口，同 §5.6 的 `order_ref` 查询）。
+- 返回：
+  - `reservation`：预留的表示（§5.6、§5.7；已到期还没关掉的 `active` 显示为 `expired`）；
+  - `lines`：按 `line_ref` 升序，每行 `line_ref`、`sku_id`、`quantity` 与 §5.1 的五个累计量；
+  - `documents`：该订单的订单单据，按生效先后，每项是上面的单据表示；以及 `next_cursor`。
+- 不返回流水（Q-65）：流水按池与 SKU 用 §6.8 查，单据的每行带 `entry_id`。
+- **单据分页**：一个订单的单据数没有固定上限（每张至少用掉 1 件余量，件数可到百万），所以分页；`reservation` 与 `lines` 每页都返回。
+  `limit` 规则同 §2.5：1–100，不带为 100；`after` 是上一页的 `next_cursor`。游标为 `v1.`、单据的 `document_seq` 十进制、`.` 加 `reservation_id` 的 SHA-256 小写十六进制的前 16 个字符
+  （绑定这个订单，同 §6.8 绑定筛选条件）；格式不对或与本订单不符 422。没有新单据时 `next_cursor` 原样返回请求里的 `after`，没带则为 `null`（同 §2.5）。
+- 只做普通读，不加锁。
+
+**存放**（新表；迁移只加表，§2.2）
+- `order_documents`：每条已生效的发货、退款回库、退货验收命令一行，只追加、不改不删。列：
+  - `document_id`：主键，前缀按类型分别是 `shp_`、`rfr_`、`rtn_`；
+  - `document_seq`：`BIGINT` 自增，唯一，只作订单库存查询的分页顺序（同一订单的命令在预留行锁下逐个提交，所以同一订单里它随生效先后递增）；
+  - `tenant_id`、`channel_id`、`pool_id`、`reservation_id`；
+  - `document_type`：`dispatch`、`refund_restock` 或 `return_receipt`，加检查约束；`document_ref`：本类型的引用（格式同 §1）；
+  - `request_hash`（§7.1 的摘要）、`result`（JSON，首次 201 响应的 `data`）；
+  - `credential_id`、`actor_ref`、`actor_role`、`request_id`、`created_at`（操作者两列同有同无，其余非空）。
+
+  `(tenant_id, channel_id, document_type, document_ref)` 唯一；`(tenant_id, reservation_id, document_seq)` 索引，供订单库存查询。
+  外键：`(tenant_id, reservation_id)` → `reservations`，`(tenant_id, pool_id)` → `stock_pools`，`(tenant_id, channel_id)` → `sales_channels`，`(tenant_id, credential_id)` → `credentials`。
+  `pool_id` 与所属预留的相同，由同一事务的服务层保证。
+  不并进 `stock_documents`（§6.2 第 7 条）：那张表的 `document_type` 检查约束只有三个取值、也没有 `reservation_id`，改约束不在“只加不改”的迁移之内。
+- `order_lines` 不加列：三个命令加的是 §5.1 已建的累计量，§5.6 存放已有的两条检查约束兜底上限。
+- 整机恢复后（§12.1）`document_seq` 会从恢复出的最大值往后发，可能重用丢失的单据用过的值（同 Q-41 的自增问题）；它只在一个订单内分页，网店不沿用恢复前拿到的游标即可。
 
 ---
 
@@ -1010,7 +1115,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
   1. **类型**：能更正的只有 `OPENING_BALANCE`、`RECEIPT`、`MARK_UNAVAILABLE`、`RESTORE_AVAILABLE`、`WRITE_OFF`。其他类型 409 `ENTRY_NOT_CORRECTABLE`，`details.reason` 为 `entry_type`。
      原流水是 `OPENING_BALANCE` 而池已 `live`：409 `ENTRY_NOT_CORRECTABLE`，`details.reason` 为 `pool_live`。
      不能更正的原因：
-     - 销售类流水牵动订单行累计量，错了按订单流程处理（释放、退款回库、退货）；
+     - 销售类流水牵动订单行累计量，错了按订单流程处理（释放、退款回库、退货）；发货、退款回库、退货验收自己录错了，V1 不撤销，账面靠盘点或标不可售再报损对回实物（§5.8，0.14，Q-64）；
      - 盘点差异、合并迁移、Demo 重置错了，重新盘点；
      - 更正本身不能再更正，错了也重新盘点。
   2. **已被吸收**：原流水之后，同一余额行的账面已被对到实数或另行定数——有了 `OPENING_BALANCE`、`COUNT_ADJUSTMENT`、`DEMO_RESET`、
@@ -1203,9 +1308,9 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
 | 订单 | `POST /v1/reservations`，`GET /v1/reservations/{id}`，`GET /v1/reservations?order_ref=`（§5.6） | ORD-01 |
 | | `POST /v1/reservations/{id}/release`（§5.6） | ORD-03 |
 | | `POST /v1/orders/{order_ref}/sale-commits`（`reservation_id` 可空〔故障收款，§5.5〕、`payment_ref`、`paid_at`、`lines`，§5.7） | ORD-02、03 |
-| | `POST /v1/orders/{order_ref}/dispatches`、`/refund-restocks`、`/return-receipts` | ORD-04、05、07 |
+| | `POST /v1/orders/{order_ref}/dispatches`、`/refund-restocks`、`/return-receipts`（§5.8） | ORD-04、05、07 |
 | | `POST /v1/orders/{order_ref}/late-payment-review/close`（无请求体，§5.7） | ORD-03 |
-| | `GET /v1/orders/{order_ref}/stock`，`GET /v1/reconciliation/order-lines?changed_after=` | ORD-06、08 |
+| | `GET /v1/orders/{order_ref}/stock?after=&limit=`（§5.8），`GET /v1/reconciliation/order-lines?changed_after=` | ORD-06、08 |
 | Demo | `POST /v1/demo/resets`（**仅 Demo 实例**） | §6.1 |
 | 运维 | `GET /healthz`（存活＋线上 commit SHA），`GET /readyz`（数据库与同步副本状态），`GET /v1/ops/invariants`（运维凭据） | OPS-04 |
 
@@ -1228,7 +1333,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
 | 409 | `COUNT_BELOW_COMMITMENTS` / `COUNT_STALE` | 盘点或合并定数：先处理订单再直接重试 / 实数已作废，重新点数录入（§6、§2.4） |
 | 409 | `RESERVATION_EXPIRED` / `STATE_CONFLICT` / `RESERVATION_MISMATCH` | 查最新状态再处理 |
 | 409 | `LATE_PAYMENT_INSUFFICIENT_STOCK` | 暂停履约，交管理员；`details.lines` 的形状同 `INSUFFICIENT_STOCK`；预留已转 `late_payment_review`（§5.7） |
-| 409 | `QUANTITY_EXCEEDS_OUTSTANDING` | 发货/回库/退货超量；不重试 |
+| 409 | `QUANTITY_EXCEEDS_OUTSTANDING` | 发货/回库/退货超过该行余量；`details.lines` 列出超过的行与 `limit`（§5.8）；不重试 |
 | 409 | `ORDER_REFERENCE_CONFLICT` / `BUSINESS_REF_CONFLICT` / `IDEMPOTENCY_CONFLICT` | 调用方 bug；不重试，告警 |
 | 409 | `REQUEST_IN_PROGRESS` | 按 `Retry-After` 用同键等待 |
 | 413 | `REQUEST_TOO_LARGE` | 不得把整单拆成逐行预留绕过原子性 |
@@ -1518,7 +1623,7 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 ---
 
-## 14. 变更记录（0.3、0.4 于 2026-11-10、0.5 于 2026-11-12、0.6 于 2026-11-13、0.7、0.8 于 2026-11-14、0.9、0.10 于 2026-11-15、0.11、0.12、0.13 于 2026-11-16 经 Kelvin 批准）
+## 14. 变更记录（0.3、0.4 于 2026-11-10、0.5 于 2026-11-12、0.6 于 2026-11-13、0.7、0.8 于 2026-11-14、0.9、0.10 于 2026-11-15、0.11、0.12、0.13 于 2026-11-16 经 Kelvin 批准；0.14 待批准）
 
 来源：登记 CORE-TASK-001、002 时跑的设计预审（`worker.design_precheck`），两个任务都判 `NOT_READY`，共 8 条发现。逐条处理如下：
 
@@ -1822,3 +1927,22 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 第五轮复审（提交 `3fb3aee`）结论为通过，另有非阻塞 5 条，都已改：§2.4 合并只复核来源 SKU 上的订单行；报业务拒绝前重查业务引用扩到第 2–5 步全部不写东西的拒绝，
 写明在同一事务里查、不回滚、不计入重新判定；第 3 步写准哪些订单行一定改挂、§5.6 表示补上未改挂的仍显示原 SKU；§5.6 隔离级别一条列上确认销售、待审结案与合并执行的业务事务。
+
+### 0.14（2026-11-18 起草，待 Kelvin 批准）
+
+来源：登记「按行发货、退款回库、退货验收与订单库存查询」前对 §5.1、§5.3、§5.4 的通读。§5.3 只列了三个命令与上限，§5.4 只列了订单库存查询的内容，
+都没有正文、判定顺序、表示与存放；§5.6、§5.7 也把它们留到登记前细化。第 85–87 条的取舍由 Kelvin 2026-11-18 定（Q-63～Q-65），第 84 条按 §5.6、§5.7、§6.2 的既有写法补齐（Q-66）。
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 84 | 发货、退款回库、退货验收的正文、判定顺序、锁序、流水的来源字段、业务引用存在哪、超量时的 `details` 都没定 | 未决定 | 只对 `committed` 的预留；请求行只带 `line_ref` 与件数；判定顺序 业务引用 → 锁预留行 → 锁订单行比对 `line_ref` → 余量 → 锁余额行写入；隔离级别与锁序同 §5.6（不读池行、SKU 行）；报拒绝前重查业务引用；流水 `source_ref` 为本命令的引用；新表 `order_documents` 存单据与首次结果，引用按销售入口唯一；全部发完或回库后预留仍是 `committed`（Q-66） | §5.8、§5.3、§5.6、§5.7、§8.2、§8.3 |
+| 85 | §5.3 的退货一个请求只有一个 `disposition`，同一次验收里有好有坏要拆成两个 `return_ref` | 未决定 | 每行带可售件数与不可售件数两个数，一个 `return_ref` 就是一次验收（Q-63） | §5.8、§5.3 |
+| 86 | 发货、退款回库、退货录错了怎么办：§6.7 不许更正销售类流水，而发货没有反向的订单命令 | 未决定 | V1 不提供撤销；订单行累计量保持原样、由网店记为已知差异，账面靠盘点或标不可售再报损对回实物（Q-64） | §5.8、§6.7 |
+| 87 | 订单库存查询返回多少：§5.4 写“相关流水”，一个订单的流水条数没有上限 | 未决定 | 返回预留表示、每行累计量与订单单据（每行带流水 ID），不返回流水；单据按 `document_seq` 分页，游标绑定订单（Q-65） | §5.8、§5.4、§5.6、§5.7、§8.2 |
+
+不改库存数量规则：§4.3 的 `DISPATCH`、`REFUND_RESTOCK`、`RETURN_SELLABLE`、`RETURN_UNSELLABLE` 与 §5.1 的累计量、约束不变；§5.2 的状态机不变。
+对调用方（网店）的影响：
+- 三个命令按订单路径调用，行只报 `line_ref` 与件数，每次交运、每次回库、每次退货验收各用一个新引用；
+- 退货验收每行报可售、不可售两个数；
+- 报错了没有撤销命令，网店后台记为已知差异，库存管理员用盘点或标不可售再报损对回实物；
+- 订单库存查询的单据要翻页，流水按池与 SKU 另查。
