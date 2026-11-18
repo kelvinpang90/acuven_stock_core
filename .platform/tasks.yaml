@@ -2046,7 +2046,7 @@ tasks:
       三，存放照 5.7：第一次转入待审记 payment_ref、paid_at、commit_request_hash 与 commit_ 一组列；expired 或待审转为 committed 保留原 closed_at；待审重试成功时 commit_request_hash 与 commit_ 一组列改记成功的那次、payment_ref 与 paid_at 不变；
       重试仍不够时预留的列都不改；reservation_id 为 null 的请求转入待审或确认时 fault_mode 设为真、之后不改回。
       明确不做：并发重查与合并去向变化的重做（CORE-TASK-046）；故障补交新建（CORE-TASK-047）；待审结案（CORE-TASK-048）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-044
     acceptance_criteria:
