@@ -26,7 +26,6 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-048` 实现晚到支付待审的结案
 
 ### 已阻塞
 
