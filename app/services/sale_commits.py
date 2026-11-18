@@ -22,7 +22,17 @@
    EXPIRE_THEN_LATE 读池行后在同一事务里 close_if_due，再走晚到确认；LATE 读池行后直接走；
    ANSWER_EXISTING 按第 1 步回答；
    STATE_CONFLICT 与 PAYMENT_REF_CONFLICT 409 STATE_CONFLICT（details 带表示里的状态）。
-写 payment_ref 撞唯一约束时抛 RedoCommand，执行器回滚后从余额行预建那一步重做。
+
+报业务拒绝之前重查业务引用：第 2–4 步要报不写东西的拒绝（404、RESERVATION_MISMATCH、
+STATE_CONFLICT）之前，在同一事务里用普通读重做第 1 步（READ COMMITTED 下看得到第 1 步之后
+才并发提交的确认）：命中别的订单或本订单已 committed 就按第 1 步回答，不回滚、不算重做；
+没命中才报原来的拒绝。LATE_PAYMENT_INSUFFICIENT_STOCK 不在此列。
+
+重做（RedoCommand，执行器回滚后从余额行预建那一步重做，每个请求最多一次）：
+- 写 payment_ref（正常确认、晚到确认、转入待审）撞唯一约束：重做时第 1 步读到已生效的那一条，
+  按它回答（本订单同摘要 200 与当前表示，否则 409 BUSINESS_REF_CONFLICT）；
+- 晚到确认要判可售而订单行 SKU 的合并去向不在 prepared 里（开事务前后之间有合并提交，
+  新去向没有先关到期）：在写任何东西之前重做，重做时连新去向一起预建、先关到期。
 
 晚到确认（§5.7）：按升序锁订单行各 SKU 的余额行，按 SKU 合计判可售（停用不拦）。
 - 够：每行一条 LATE_SALE_COMMIT，订单行 committed_qty 设为 quantity，预留改为 committed、late 为真；
@@ -35,7 +45,6 @@ reservation_id 为 null 的请求确认或转入待审时 fault_mode 设为真�
 
 尚未实现的分支先返回 503 UNAVAILABLE、不保存（确定未生效，可同键重试）：
 没有预留且 reservation_id 为 null 的故障补交新建。
-报业务拒绝之前重查业务引用、判可售时合并去向不在 prepared 里的重做也尚未做。
 """
 
 from collections.abc import Iterable, Sequence
@@ -191,6 +200,43 @@ def _answer_committed(execution: Execution, reservation: ReservationRecord) -> C
         representation = current_representation(connection, _tenant_id(execution), reservation)
         return CommandResult(representation, 200)
     raise _payment_ref_conflict(execution, reservation.payment_ref)
+
+
+def _answer_by_payment_ref(
+    execution: Execution, order_ref: str, payment_ref: str
+) -> CommandResult | None:
+    """第 1 步：普通读按 payment_ref 查预留。
+
+    在别的订单上 409 BUSINESS_REF_CONFLICT；
+    在本订单上且已 committed 按 _answer_committed 回答；
+    其他（待审、已结案或没查到）返回 None，继续判定。
+    """
+    principal = execution.access.principal
+    paid = find_reservation_by_payment_ref(
+        execution.connection, principal.tenant_id, principal.channel_id, payment_ref
+    )
+    if paid is None:
+        return None
+    if paid.order_ref != order_ref:
+        raise _payment_ref_conflict(execution, payment_ref)
+    if paid.status == COMMITTED:
+        return _answer_committed(execution, paid)
+    return None
+
+
+def _reject(
+    execution: Execution, order_ref: str, commit: SaleCommit, error: ApiError
+) -> CommandResult:
+    """报不写东西的业务拒绝之前重查业务引用（§5.7 第 3 步之后的一段）。
+
+    同一事务里重做第 1 步：命中别的订单或本订单已 committed 就按第 1 步回答，
+    让并发与先后到达的同一 payment_ref 得到相同的结果；没命中才报原来的拒绝。
+    不回滚，不算“重新判定”的一次。
+    """
+    answered = _answer_by_payment_ref(execution, order_ref, commit.payment_ref)
+    if answered is not None:
+        return answered
+    raise error
 
 
 def _state_conflict(status: str, **details: Any) -> ApiError:
@@ -454,27 +500,24 @@ def create_sale_commit(
     tenant_id = principal.tenant_id
 
     # 第 1 步：业务引用。
-    paid = find_reservation_by_payment_ref(
-        connection, tenant_id, principal.channel_id, commit.payment_ref
-    )
-    if paid is not None:
-        if paid.order_ref != order_ref:
-            raise _payment_ref_conflict(execution, commit.payment_ref)
-        if paid.status == COMMITTED:
-            return _answer_committed(execution, paid)
+    answered = _answer_by_payment_ref(execution, order_ref, commit.payment_ref)
+    if answered is not None:
+        return answered
 
-    # 第 2 步：锁预留行。
+    # 第 2 步：锁预留行。第 2–4 步不写东西的拒绝都经 _reject，先重查业务引用。
     reservation = lock_reservation_by_ref(connection, tenant_id, principal.channel_id, order_ref)
     if reservation is None:
         if commit.reservation_id is not None:
             # 不按这个 ID 另查，不记事件。
-            raise ApiError(404, RESERVATION_NOT_FOUND, "reservation not found")
+            not_found = ApiError(404, RESERVATION_NOT_FOUND, "reservation not found")
+            return _reject(execution, order_ref, commit, not_found)
         raise _not_implemented_yet()
     if commit.reservation_id is not None and commit.reservation_id != reservation.reservation_id:
         details = {"reason": RESERVATION_ID}
-        raise ApiError(
+        mismatch = ApiError(
             409, RESERVATION_MISMATCH, "the reservation id does not match", details=details
         )
+        return _reject(execution, order_ref, commit, mismatch)
 
     # 第 3 步：行集比对（加锁读订单行之后再查合并去向）。
     lines = lock_lines(connection, tenant_id, reservation.reservation_id)
@@ -485,9 +528,10 @@ def create_sale_commit(
     mismatched = mismatched_line_refs(requested, existing, destinations)
     if mismatched:
         details = {"reason": LINES, "line_refs": mismatched}
-        raise ApiError(
+        mismatch = ApiError(
             409, RESERVATION_MISMATCH, "the lines do not match the reservation", details=details
         )
+        return _reject(execution, order_ref, commit, mismatch)
 
     # 第 4 步：按预留状态。
     now = command_now(execution)
@@ -500,11 +544,16 @@ def create_sale_commit(
     if decision is CommitDecision.ANSWER_EXISTING:
         return _answer_committed(execution, reservation)
     if decision is CommitDecision.PAYMENT_REF_CONFLICT:
-        raise _state_conflict(status, reason=PAYMENT_REF)
+        return _reject(execution, order_ref, commit, _state_conflict(status, reason=PAYMENT_REF))
     if decision is CommitDecision.STATE_CONFLICT:
-        raise _state_conflict(status)
+        return _reject(execution, order_ref, commit, _state_conflict(status))
 
-    # LATE 与 EXPIRE_THEN_LATE：池行排在余额行之前（关单也锁余额行）。
+    # LATE 与 EXPIRE_THEN_LATE 要判可售：订单行 SKU 的合并去向不在开事务前处理过的 SKU 里
+    # （开事务前后之间有合并提交，新去向没有先关到期），在写任何东西之前回滚重做。
+    if any(destinations.get(line.sku_id) not in skus.prepared for line in lines):
+        raise RedoCommand()
+
+    # 池行排在余额行之前（关单也锁余额行）。
     lock_pool(execution, reservation.pool_id)
     closed_here = decision is CommitDecision.EXPIRE_THEN_LATE
     if closed_here:
