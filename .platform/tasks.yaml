@@ -2156,3 +2156,188 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-049
+    title: 写出发货、退款回库、退货验收的余量判定与订单查询游标的纯函数
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.14 的 5.8（与 5.1），新建 app/domain/fulfilment.py，只放纯函数与常量（不 import FastAPI、SQLAlchemy
+      或任何做 I/O 的库），单元测试放 tests/unit/test_fulfilment.py，用标准库 unittest。之后的建表、三个命令与订单库存查询任务都用它。
+      流水类型沿用 app/domain/ledger.py 的 EntryType，件数校验沿用 app/domain/stock.py 的 is_positive_quantity、is_non_negative_quantity 与 QUANTITY_MAX，不另写一份。
+      一，常量：三种单据类型 dispatch、refund_restock、return_receipt（也是流水的 source_type）与它们的元组；单据 ID 前缀 shp、rfr、rtn；
+      业务引用字段 shipment_ref、refund_ref、return_ref；冲突时 details 的 ref_type shipment、refund、return。都按单据类型给出映射。
+      二，OrderLineTotals：一行订单行的 line_ref、sku_id、quantity 与 5.1 的五个累计量。line_limit(document_type, totals)：
+      发货与退款回库为 committed_qty − dispatched_qty − refund_restocked_qty，退货验收为 dispatched_qty − returned_sellable_qty − returned_unsellable_qty；未知类型抛 ValueError。
+      三，请求行：数量行 line_ref 加 quantity；退货行 line_ref 加 sellable_quantity、unsellable_quantity。requested_quantity(document_type, line) 返回本行件数（退货为两数之和）。
+      parse_return_quantities(sellable, unsellable)：两个都是 0 到 QUANTITY_MAX 的整数（布尔不算）且和至少 1，否则抛 ValueError，供接口层的 422 用。
+      四，unknown_line_refs(request_line_refs, order_line_refs)：请求里有、订单里没有的 line_ref，升序。
+      exceeding_lines(document_type, request_lines, order_lines)：按请求顺序列出件数超过余量的行，每项 line_ref、sku_id（订单行的）、quantity（退货为两数之和）、limit；请求里有订单没有的 line_ref 时抛 ValueError（调用方先查 unknown_line_refs）。
+      五，line_entries(document_type, line)：本行要写的流水，按顺序给出 (EntryType, 件数)：发货一条 DISPATCH，退款回库一条 REFUND_RESTOCK；
+      退货验收 sellable_quantity 大于 0 时一条 RETURN_SELLABLE，unsellable_quantity 大于 0 时再一条 RETURN_UNSELLABLE（可售在前）。
+      apply_line(document_type, totals, line)：返回加上本行件数后的累计量；超过余量抛 ValueError。
+      六，订单库存查询的游标：format_order_stock_cursor(document_seq, reservation_id) 得到 v1、document_seq 十进制、reservation_id 的 SHA-256 小写十六进制前 16 个字符，以点连接；
+      parse_order_stock_cursor(value) 只校验格式并返回 (document_seq, 摘要)，格式不对抛 ValueError（前缀不是 v1、document_seq 不是无前导零的正整数或超过 app/domain/catalog.py 的 CURSOR_MAX、摘要不是 16 个小写十六进制字符；同流水游标的上限）；
+      cursor_matches(digest, reservation_id) 判摘要是否属于这个订单。格式校验与绑定检查分开，是因为契约规定格式错先 422、查不到订单 404、绑定不符最后 422。
+      明确不做：表结构、接口与服务层（CORE-TASK-050 起）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 函数与常量在 app/domain/fulfilment.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_fulfilment.py，用 unittest
+      - 单元测试验证 line_limit：发货与退款回库在部分发货、部分回库、两者都有、全部用完时的余量；退货验收在部分退货、可售与不可售都有、全部退完时的余量；未确认的行（committed_qty 为 0）发货余量为 0；未知类型抛 ValueError
+      - 单元测试验证 parse_return_quantities：0 加 1、1 加 0、上限都放行；两个都是 0、负数、超过上限、小数、布尔、字符串都抛 ValueError
+      - 单元测试验证 unknown_line_refs 与 exceeding_lines：全部在订单里为空；多出的 line_ref 升序；超过的行按请求顺序、limit 等于余量、恰好等于余量的不列；退货按两数之和比较；有未知 line_ref 时 exceeding_lines 抛 ValueError
+      - 单元测试验证 line_entries 与 apply_line：三种类型各自的流水类型与件数；退货只有可售、只有不可售、两者都有时的条数与先后；apply_line 加对应的累计量、超过余量抛 ValueError；用 app/domain/ledger.py 的 apply_entry 验证每种流水对四个账面量的增量与契约 5.8 写的一致
+      - 单元测试验证游标：format 后 parse 得回原 document_seq 与摘要，cursor_matches 对同一订单为真、对别的订单为假；前缀错、document_seq 为 0 或有前导零或非数字或超过 CURSOR_MAX、摘要长度或大小写不对、多一段或少一段都抛 ValueError；format 对 0 或超过 CURSOR_MAX 的 document_seq 抛 ValueError
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/fulfilment.py
+      - tests/unit/test_fulfilment.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-050
+    title: 建订单单据表，存发货、退款回库与退货验收的单据
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.14 的 5.8 存放，新增迁移 alembic/versions/20261118_0009_order_documents.py（revision 0009，接在 0008 之后），
+      在 app/models/orders.py 加模型 OrderDocument（表 order_documents）。迁移只加表（契约 2.2），不改已有表；downgrade 删去本表。
+      不新建模型模块，所以不用改 alembic/env.py 与 app/models/__init__.py。单据类型取值从 CORE-TASK-049 的 app/domain/fulfilment.py 引用，不另写一份。
+      列与约束照 app/models/inventory.py 的 StockDocument 的写法（类型、排序规则、result 的 JSON_TYPE 检查、created_at 默认值、复合外键的命名方式）：
+      一，document_seq：BIGINT 自增主键（契约写明设成主键，好让建表工具生成 AUTO_INCREMENT、插入后能取回）；document_id：VARCHAR(32)，唯一；
+      tenant_id、channel_id、pool_id、reservation_id；document_type（CODE32，检查约束限三个取值）；document_ref（引用列同 order_ref）；request_hash；result（JSON，检查约束为对象）；
+      credential_id、actor_ref、actor_role、request_id、created_at。actor_ref 与 actor_role 可空、同有同无（检查约束），其余非空。
+      二，(tenant_id, channel_id, document_type, document_ref) 唯一；(tenant_id, reservation_id, document_seq) 索引。
+      三，复合外键：(tenant_id, reservation_id) 指向 reservations 的 (tenant_id, reservation_id)，(tenant_id, pool_id) 指向 stock_pools，(tenant_id, channel_id) 指向 sales_channels，
+      (tenant_id, credential_id) 指向 credentials；显式命名，避免与已有外键同名。
+      四，集成测试 tests/integration/test_order_document_schema.py 用现有夹具建租户、池、入口、凭据与一个预留，逐条验证约束能拦住不合格的行、放行合格的行。
+      明确不做：任何接口与服务层（CORE-TASK-051 起）；不改 reservations、order_lines 与流水表。
+    status: ready
+    depends_on:
+      - CORE-TASK-049
+    acceptance_criteria:
+      - 迁移文件为 alembic/versions/20261118_0009_order_documents.py，down_revision 为 0008；模型在 app/models/orders.py；upgrade 后 alembic check 无差异，downgrade 再 upgrade 照常（由 CI 的 integration 执行）；已有的集成测试照常通过
+      - 集成测试验证 document_seq：不给值插入两行，各得到自增的值且后插的更大，插入后能从结果取回；document_id 重复被拒
+      - 集成测试验证 document_type 只接受 dispatch、refund_restock、return_receipt，别的值被拒；result 不是 JSON 对象（数组、字符串）被拒
+      - 集成测试验证唯一：同一入口、同一类型、同一引用的第二行被拒；不同类型同一引用、不同入口同一引用都放行
+      - 集成测试验证外键：reservation_id、pool_id、channel_id、credential_id 指向不存在或别的租户的行被拒；actor_ref 与 actor_role 只有一列被拒，都为空或都有放行
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/models/orders.py
+      - alembic/versions/20261118_0009_order_documents.py
+      - tests/integration/test_order_document_schema.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-051
+    title: 实现按行发货与退款回库两个命令及单据表示
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.14 的 5.8（通用、发货、退款回库、成功的表示）与 5.1、5.3，新建 app/api/fulfilment.py 与 app/services/fulfilment.py，在 app/main.py 挂路由；
+      规则用 CORE-TASK-049 的 app/domain/fulfilment.py，表用 CORE-TASK-050 的 OrderDocument，写流水用 app/services/stock.py 的函数，锁预留行与读表示沿用 app/services/reservations.py 的函数（只读引用，不改那个文件）。
+      一，POST /v1/orders/{order_ref}/dispatches（操作类型 dispatches.create）与 POST /v1/orders/{order_ref}/refund-restocks（操作类型 refund_restocks.create）：scope orders.write，不要求角色；
+      路径 order_ref 不合格 422（沿用 app/api/sale_commits.py 的写法）；正文 shipment_ref 或 refund_ref（引用格式）与 lines（1 到 100 行，每行 line_ref 与 1 到 1000000 的整数 quantity，超过 100 行 413，line_ref 重复 422），
+      加可选的 reason_code、note、occurred_at（规则同收货，沿用 app/api/stock_documents.py 的校验），不接受别的字段；池用 app/api/auth.py 的 require_sales_pool，没有入口 403。
+      经 run_idempotent，read_committed=True，不传 balance_rows 与开事务前钩子。
+      二，事务里照 5.8 第 1–5 步：普通读按 (tenant_id, channel_id, document_type, document_ref) 查单据，有则摘要相同 200 与 result、不同 409 BUSINESS_REF_CONFLICT（details 的 ref_type 取 app/domain/fulfilment.py 的 shipment、refund、return，不能照搬 app/services/stock.py 的 business_ref_conflict，它用的是单据类型；记 business_ref_conflict 事件）；
+      FOR UPDATE 按 order_ref 读预留行，没有 404 RESERVATION_NOT_FOUND，不是 committed 409 STATE_CONFLICT（details 带表示里的状态）；FOR UPDATE 读全部订单行，未知 line_ref 409 RESERVATION_MISMATCH（reason lines，line_refs 升序）；
+      超过余量 409 QUANTITY_EXCEEDS_OUTSTANDING（details.lines 照 exceeding_lines）；按 (pool_id, sku_id) 升序锁所涉 SKU 的余额行（同一 SKU 只锁一次），按 line_ref 升序逐行写流水（source_type 为单据类型、source_ref 为本命令的引用、line_ref、公共字段），
+      更新订单行累计量，写单据一行（document_id 用对应前缀，result 为表示），与幂等记录同一事务提交。不读池行、SKU 行与商品行。
+      三，第 2–4 步报拒绝之前，在同一事务里用普通读重查第 1 步，查到就按第 1 步回答；写单据撞唯一约束时照 app/services/stock.py 的 insert_document 抛 BusinessRefTaken，在新事务里按第 1 步重新判定。
+      四，表示照 5.8：document_id、document_type、order_ref、reservation_id、pool_id、本类型的引用字段、reason_code、note、occurred_at、created_at，lines 按 line_ref 升序，每行 line_ref、sku_id、quantity、entry_id。
+      本任务把单据表示与“按类型查单据、写单据”的函数写成三种类型通用的，供 CORE-TASK-052、053 复用。
+      明确不做：退货验收（CORE-TASK-052）；订单库存查询（CORE-TASK-053）；撤销与更正（契约 Q-64，V1 不做）。
+    status: ready
+    depends_on:
+      - CORE-TASK-049
+      - CORE-TASK-050
+    acceptance_criteria:
+      - 接口在 app/api/fulfilment.py，命令在 app/services/fulfilment.py，路由在 app/main.py 挂上，已有的集成测试照常通过；集成测试验证发货：201 与表示；余额只有 paid_pending_dispatch 减；每行一条 DISPATCH，来源字段、line_ref 与公共字段照契约；订单行 dispatched_qty 加；只报部分行、部分件数可以，之后换 shipment_ref 发完余下的，全部发完后预留仍是 committed
+      - 集成测试验证退款回库：201 与表示；stock_balance 加、paid_pending_dispatch 减；每行一条 REFUND_RESTOCK；订单行 refund_restocked_qty 加；发货与回库合计到 committed_qty 为止，再多一件 409 QUANTITY_EXCEEDS_OUTSTANDING 且 details.lines 带 limit
+      - 集成测试验证拒绝：订单不存在 404；active、released、expired、late_payment_review、closed_refunded 的预留 409 STATE_CONFLICT 且 details 带 status；未知 line_ref 409 RESERVATION_MISMATCH；凭据没有入口 403；拒绝不写流水、不写单据、不改累计量
+      - 集成测试验证业务引用与重放：同键原样重放带 Idempotency-Replayed；换键同内容 200 与首次的表示（余量已用完也是 200）；换键同引用不同内容或报到别的订单 409 BUSINESS_REF_CONFLICT，details 的 ref_type 发货为 shipment、退款回库为 refund，并写 business_ref_conflict 事件；发货与退款回库用同一个引用字符串互不冲突
+      - 集成测试验证合并改挂：模拟合并（来源 SKU 标为已合并、订单行改挂、paid_pending_dispatch 挪到规范 SKU）后发货扣的是规范 SKU；同一订单两行指向同一 SKU 时一次发货两行各写一条流水
+      - 集成测试验证正文：引用格式不对、quantity 为 0 或小数或超过上限、line_ref 重复、带未知字段、缺 lines 都 422，101 行 413，路径 order_ref 不合格 422
+      - 并发测试（照 tests/integration/test_sale_commit_concurrency.py 的做法，两个连接，用 gate_after_step_one 式的闸门让两个请求都过了第 1 步再去锁预留行）验证同一 shipment_ref 换键同内容并发：余量只够一次时（走报拒绝前重查）和余量够两次时（走撞唯一约束、回滚、另开事务重判），两个请求都得到同一张单据（一个 201、一个 200），只写一份流水与一行单据，不出 5xx，后到的不得 409 QUANTITY_EXCEEDS_OUTSTANDING；换键不同内容并发时后到的 409 BUSINESS_REF_CONFLICT
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/fulfilment.py
+      - app/services/fulfilment.py
+      - app/main.py
+      - tests/integration/test_fulfilment_api.py
+      - tests/integration/test_fulfilment_concurrency.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-052
+    title: 实现退货验收命令，每行分报可售与不可售件数
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.14 的 5.8（通用、退货验收、成功的表示），在 CORE-TASK-051 的 app/api/fulfilment.py 与 app/services/fulfilment.py 加
+      POST /v1/orders/{order_ref}/return-receipts（操作类型 return_receipts.create，scope orders.write，不要求角色）。判定顺序、锁序、重查业务引用与撞唯一约束的处理都复用 CORE-TASK-051 的通用部分。
+      一，正文 return_ref（引用格式）与 lines（1 到 100 行，每行 line_ref、sellable_quantity、unsellable_quantity，两个数都必填，用 app/domain/fulfilment.py 的 parse_return_quantities 校验，不合格 422），
+      加可选的 reason_code、note、occurred_at，不接受别的字段。
+      二，余量为 dispatched_qty − returned_sellable_qty − returned_unsellable_qty，与两数之和比较；每行按 line_entries 写 RETURN_SELLABLE（stock_balance 加）与 RETURN_UNSELLABLE（stock_balance 与 unavailable 各加），可售在前；
+      订单行两个累计量各加。
+      三，表示：lines 每行 line_ref、sku_id、sellable_quantity、unsellable_quantity、sellable_entry_id、unsellable_entry_id（对应的数为 0 时为 null），其余字段同 CORE-TASK-051。
+      四，集成测试另放 tests/integration/test_return_receipts_api.py；若 CORE-TASK-051 的测试辅助函数需要共用，只为共用把它们提到 tests/integration/conftest.py，原测试的断言不动。
+      明确不做：退货后的不可售件恢复或报损（走已有的不可售调整命令）；订单库存查询（CORE-TASK-053）。
+    status: ready
+    depends_on:
+      - CORE-TASK-051
+    acceptance_criteria:
+      - 接口与命令加在 app/api/fulfilment.py 与 app/services/fulfilment.py；CORE-TASK-051 的发货与退款回库测试照常通过
+      - 集成测试验证同一行既有可售又有不可售：201 与表示；该 SKU 的 stock_balance 加两数之和、unavailable 加不可售数、可售量只加可售数；先一条 RETURN_SELLABLE 再一条 RETURN_UNSELLABLE，来源字段照契约；订单行两个累计量各加
+      - 集成测试验证只有可售或只有不可售的行只写一条流水，表示里另一个 entry_id 为 null；可以只报部分行
+      - 集成测试验证余量：未发货的行退货 409 QUANTITY_EXCEEDS_OUTSTANDING（limit 为 0）；部分发货后退货合计到 dispatched_qty 为止，再多一件 409 且 details.lines 的 quantity 为两数之和；退款回库的件数不算进退货余量
+      - 集成测试验证拒绝与业务引用：不是 committed 409 STATE_CONFLICT；未知 line_ref 409 RESERVATION_MISMATCH；换键同内容 200 与首次表示；换键同 return_ref 不同内容 409 BUSINESS_REF_CONFLICT 且 details 的 ref_type 为 return
+      - 集成测试验证正文：两个数都为 0、缺其中一个、负数、小数、超过上限、line_ref 重复、带未知字段都 422，101 行 413
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/fulfilment.py
+      - app/services/fulfilment.py
+      - tests/integration/test_return_receipts_api.py
+      - tests/integration/test_fulfilment_api.py
+      - tests/integration/conftest.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-053
+    title: 实现订单库存查询，返回预留、每行累计量与分页的单据
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.14 的 5.8 订单库存查询（与 5.4、5.6 表示），在 app/api/fulfilment.py 与 app/services/fulfilment.py 加
+      GET /v1/orders/{order_ref}/stock（scope orders.read，不要求角色，不经幂等执行器）。
+      一，参数：after 可选，limit 可选（规则同流水查询，沿用 app/domain/stock.py 的 parse_ledger_limit）；未知的查询参数、同一参数出现两次都 422，规则同 app/api/stock_queries.py 的 _parameters（可以直接引用，不改那个文件）。
+      判定顺序：路径 order_ref、limit 与 after 的格式不对先 422（游标格式用 app/domain/fulfilment.py 的 parse_order_stock_cursor）；
+      再按凭据的销售入口查 (tenant_id, channel_id, order_ref)，没有预留或凭据没有销售入口 404 RESERVATION_NOT_FOUND，不记事件；最后游标与本订单不符（cursor_matches 为假）422。
+      二，三部分在同一个只读事务里读（REPEATABLE READ，同一个读快照），只做普通读：reservation 用 app/services/reservations.py 现有的表示函数（已到期还没关掉的 active 显示为 expired）；
+      lines 按 line_ref 升序，每行 line_ref、sku_id、quantity 与五个累计量；documents 按 document_seq 升序取 document_seq 大于游标的至多 limit 张，每项是单据的 result；
+      next_cursor 为最后一张的游标，没有新单据时原样返回请求里的 after、没带则为 null。不返回流水。
+      三，若现有读接口的连接与事务写法放在 app/services/stock_queries.py 或 app/api/stock_queries.py，照着写，不改那两个文件。
+      明确不做：对账变更流与按状态列出待审（契约 5.4，登记对账任务时另定）；流水的按订单查询（契约第 13 节第 11 条）。
+    status: ready
+    depends_on:
+      - CORE-TASK-052
+    acceptance_criteria:
+      - 接口与查询加在 app/api/fulfilment.py 与 app/services/fulfilment.py；已有的集成测试照常通过
+      - 集成测试验证一个经发货、退款回库、退货验收的订单：reservation 为 committed 的表示；lines 的五个累计量与各命令的件数一致；documents 按生效先后列出三种单据，每项与该命令 201 响应体的 data 相同
+      - 集成测试验证未确认的订单：active 预留的累计量都为 0、documents 为空、next_cursor 为 null；已到期未关的 active 显示 expired
+      - 集成测试验证分页：一个订单有 5 张单据时 limit 2 翻三页不重不漏，每页都带 reservation 与 lines，最后一页之后再翻返回空 documents 且 next_cursor 等于请求的 after
+      - 集成测试验证拒绝：订单不存在 404 RESERVATION_NOT_FOUND；凭据没有销售入口 404；别的入口的同名订单查不到；游标格式不对 422 且订单不存在时也是 422；别的订单的游标 422；limit 为 0、101、非数字都 422；未知查询参数、after 或 limit 出现两次都 422；缺 orders.read 403
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/fulfilment.py
+      - app/services/fulfilment.py
+      - tests/integration/test_order_stock_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
