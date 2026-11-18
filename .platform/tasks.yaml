@@ -2075,7 +2075,7 @@ tasks:
       二，要判可售时（晚到确认）订单行 SKU 的合并去向不在开事务前处理过的 SKU 里，抛 RedoCommand。
       三，核对 044、045 里写 payment_ref 撞唯一约束时抛 RedoCommand 的各处，重做后按已生效的那一条回答。
       明确不做：故障补交新建里的重查与重做（CORE-TASK-047）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-045
     acceptance_criteria:
