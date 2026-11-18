@@ -2137,7 +2137,7 @@ tasks:
       事务里 FOR UPDATE 按 order_ref 读预留行：没有 404 RESERVATION_NOT_FOUND；late_payment_review 改为 closed_refunded，记 review_closed_at 与 review_closed_ 一组列，不写流水，200 与表示；
       已是 closed_refunded 不写任何东西，200 与当前表示；其他状态 409 STATE_CONFLICT，details 带表示里的状态（已到期未关的 active 报 expired）。
       明确不做：确认销售与故障补交（CORE-TASK-044～047）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-045
     acceptance_criteria:
