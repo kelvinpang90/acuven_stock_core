@@ -2002,7 +2002,7 @@ tasks:
       若 CORE-TASK-039 把新预留的先关到期写在 app/api/reservations.py 或它的测试写死了表示字段集合、直接构造 ReservationRecord，本任务只为复用把那段提成函数（放进 app/services/reservations.py，服务层不反向引用接口层）、只为新字段改字段集合与构造参数，其余不动。
       合并即部署：PR 正文写明 044 合并后到 046 合并前，晚到确认与故障补交返回 503、报业务拒绝前还不重查业务引用（过渡状态，网店尚未接入）。
       明确不做：晚到确认与待审（CORE-TASK-045）；报业务拒绝前重查业务引用与合并去向变化的重做（CORE-TASK-046）；故障补交新建（CORE-TASK-047）；待审结案（CORE-TASK-048）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-039
       - CORE-TASK-041
