@@ -13,7 +13,8 @@
 1. 业务引用：普通读按 (tenant_id, channel_id, payment_ref) 查预留；在别的订单上
    409 BUSINESS_REF_CONFLICT 并记 business_ref_conflict；在本订单上且已 committed，
    摘要与记下的确认摘要相同 200 与当前表示，不同同上 409；其他继续；
-2. FOR UPDATE 按 order_ref 读预留行：没有而 reservation_id 不为 null 404 RESERVATION_NOT_FOUND；
+2. FOR UPDATE 按 order_ref 读预留行：没有而 reservation_id 不为 null 404 RESERVATION_NOT_FOUND，
+   为 null 转第 5 步；
    reservation_id 不为 null 且不同 409 RESERVATION_MISMATCH（reason 为 reservation_id）；
 3. FOR SHARE 读订单行，再普通读查请求 SKU 与订单行 SKU 的合并去向，
    行集不一致 409 RESERVATION_MISMATCH（reason 为 lines，line_refs 升序）；
@@ -21,18 +22,34 @@
    订单行 committed_qty 设为 quantity，预留改为 committed；
    EXPIRE_THEN_LATE 读池行后在同一事务里 close_if_due，再走晚到确认；LATE 读池行后直接走；
    ANSWER_EXISTING 按第 1 步回答；
-   STATE_CONFLICT 与 PAYMENT_REF_CONFLICT 409 STATE_CONFLICT（details 带表示里的状态）。
+   STATE_CONFLICT 与 PAYMENT_REF_CONFLICT 409 STATE_CONFLICT（details 带表示里的状态）；
+5. 故障补交新建（没有预留且 reservation_id 为 null）：
+   FOR SHARE 读池行，不是 live 409 POOL_NOT_LIVE；普通读查 SKU，
+   不存在或属于别的租户 404 SKU_NOT_FOUND（属于别的租户的登记 cross_tenant）；
+   各行取请求 SKU 的合并去向，按升序锁余额行，再按 sku_id 升序 FOR SHARE 读这些 SKU 行；
+   按 SKU 合计判可售（停用、合并进行中都不拦），写一个 fault_mode 的预留与订单行：
+   created_at 与 closed_at 为现在，expires_at 为现在加当前配置的有效期（形式值），
+   request_hash 取同内容预留请求的摘要；
+   够则 committed、late 为真、每行一条 LATE_SALE_COMMIT；
+   不够则 late_payment_review、订单行 committed_qty 为 0、不写流水，
+   由 keep_on_rejection 登记的写入做，409 LATE_PAYMENT_INSUFFICIENT_STOCK。
 
-报业务拒绝之前重查业务引用：第 2–4 步要报不写东西的拒绝（404、RESERVATION_MISMATCH、
-STATE_CONFLICT）之前，在同一事务里用普通读重做第 1 步（READ COMMITTED 下看得到第 1 步之后
-才并发提交的确认）：命中别的订单或本订单已 committed 就按第 1 步回答，不回滚、不算重做；
-没命中才报原来的拒绝。LATE_PAYMENT_INSUFFICIENT_STOCK 不在此列。
+报业务拒绝之前重查业务引用：第 2–5 步要报不写东西的拒绝（404、RESERVATION_MISMATCH、
+STATE_CONFLICT、POOL_NOT_LIVE）之前，在同一事务里用普通读重做第 1 步
+（READ COMMITTED 下看得到第 1 步之后才并发提交的确认）：
+命中别的订单或本订单已 committed 就按第 1 步回答，不回滚、不算重做；没命中才报原来的拒绝。
+第 5 步命中时丢弃本次登记的 cross_tenant 事件，没命中时保留（同 §5.6 并发重报）。
+LATE_PAYMENT_INSUFFICIENT_STOCK 不在此列。
 
 重做（RedoCommand，执行器回滚后从余额行预建那一步重做，每个请求最多一次）：
 - 写 payment_ref（正常确认、晚到确认、转入待审）撞唯一约束：重做时第 1 步读到已生效的那一条，
   按它回答（本订单同摘要 200 与当前表示，否则 409 BUSINESS_REF_CONFLICT）；
+- 故障补交新建撞 order_ref 或 payment_ref 的唯一约束（并发的预留或确认）：
+  重做时按已有的预留回答；
 - 晚到确认要判可售而订单行 SKU 的合并去向不在 prepared 里（开事务前后之间有合并提交，
-  新去向没有先关到期）：在写任何东西之前重做，重做时连新去向一起预建、先关到期。
+  新去向没有先关到期）：在写任何东西之前重做，重做时连新去向一起预建、先关到期；
+- 故障补交新建时请求 SKU 的合并去向不在 prepared 里，或锁余额行之后读到它已合并
+  （去向在算出之后被并发的合并改了）：同上，在写任何东西之前重做。
 
 晚到确认（§5.7）：按升序锁订单行各 SKU 的余额行，按 SKU 合计判可售（停用不拦）。
 - 够：每行一条 LATE_SALE_COMMIT，订单行 committed_qty 设为 quantity，预留改为 committed、late 为真；
@@ -42,9 +59,6 @@ STATE_CONFLICT）之前，在同一事务里用普通读重做第 1 步（READ C
   它先再调一次 close_if_due，使 RELEASE 流水、reserved 的减回与 closed_at 和待审一起提交；
   已在待审的（重试仍不够）不改预留的任何列。
 reservation_id 为 null 的请求确认或转入待审时 fault_mode 设为真，之后不改回。
-
-尚未实现的分支先返回 503 UNAVAILABLE、不保存（确定未生效，可同键重试）：
-没有预留且 reservation_id 为 null 的故障补交新建。
 """
 
 from collections.abc import Iterable, Sequence
@@ -52,13 +66,20 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Connection, select, update
+from sqlalchemy import Connection, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.api.errors import ApiError
-from app.api.requests import unavailable
+from app.domain.ids import new_id
 from app.domain.ledger import EntryType
-from app.domain.reservations import COMMITTED, LATE_PAYMENT_REVIEW, displayed_status
+from app.domain.reservations import (
+    COMMITTED,
+    LATE_PAYMENT_REVIEW,
+    ORDER_LINE_ID_PREFIX,
+    RESERVATION_ID_PREFIX,
+    compute_expires_at,
+    displayed_status,
+)
 from app.domain.sale_commits import (
     SOURCE_TYPE,
     CommitDecision,
@@ -66,6 +87,7 @@ from app.domain.sale_commits import (
     commit_reason_code,
     merge_destination,
     mismatched_line_refs,
+    reserve_request_digest,
     sku_shortfalls,
 )
 from app.models.catalog import Sku
@@ -93,6 +115,8 @@ from app.services.stock import (
     lock_balances,
     lock_pool,
     new_command_id,
+    require_live,
+    require_skus_exist,
 )
 
 # 错误码（§5.7、§8.3）。
@@ -246,11 +270,6 @@ def _state_conflict(status: str, **details: Any) -> ApiError:
         "the reservation cannot be committed in its current status",
         details={**details, "status": status},
     )
-
-
-def _not_implemented_yet() -> ApiError:
-    """故障补交新建尚未实现：503，不保存，同键重试会重新执行。"""
-    return unavailable()
 
 
 # --- 写预留行 ---
@@ -485,6 +504,199 @@ def _to_review(
     )
 
 
+# --- 故障补交新建 ---
+
+
+def _reject_before_creating(
+    execution: Execution, order_ref: str, commit: SaleCommit, error: ApiError, events_from: int
+) -> CommandResult:
+    """第 5 步报 POOL_NOT_LIVE 与 SKU_NOT_FOUND 之前重查业务引用（同 _reject）。
+
+    execution.events 从 events_from 起是本步登记的 cross_tenant：命中改按第 1 步回答时丢弃，
+    没命中时随原来的拒绝保留（同 §5.6 并发重报）。
+    """
+    registered = execution.events[events_from:]
+    del execution.events[events_from:]
+    answered = _answer_by_payment_ref(execution, order_ref, commit.payment_ref)
+    if answered is not None:
+        return answered
+    execution.events.extend(registered)
+    raise error
+
+
+def _any_merged(execution: Execution, sku_ids: Iterable[str]) -> bool:
+    """余额行锁住之后按 sku_id 升序 FOR SHARE 读 SKU 行（只为等正在进行的合并提交、
+    复核合并去向，不判停用）；有一个已合并返回 True。
+    """
+    statement = (
+        select(Sku.merged_into_sku_id)
+        .where(Sku.tenant_id == _tenant_id(execution), Sku.sku_id.in_(set(sku_ids)))
+        .order_by(Sku.sku_id)
+        .with_for_update(read=True)
+    )
+    merged_into = execution.connection.execute(statement).scalars()
+    return any(target is not None for target in merged_into)
+
+
+def _insert_created(
+    execution: Execution,
+    connection: Connection,
+    reservation: ReservationRecord,
+    lines: Sequence[ReservationLine],
+    ttl_seconds: int,
+) -> None:
+    """写故障补交新建的预留行与订单行；
+    committed 时订单行 committed_qty 等于 quantity，否则为 0。
+
+    撞 order_ref 或 payment_ref 的唯一约束（并发的预留或确认先提交）时抛 RedoCommand，
+    重做时按已有的预留回答。
+    """
+    access = execution.access
+    principal = access.principal
+    values = {
+        "reservation_id": reservation.reservation_id,
+        "tenant_id": principal.tenant_id,
+        "channel_id": reservation.channel_id,
+        "pool_id": reservation.pool_id,
+        "order_ref": reservation.order_ref,
+        "status": reservation.status,
+        "ttl_seconds": ttl_seconds,
+        "expires_at": reservation.expires_at,
+        "request_hash": reservation.request_hash,
+        "credential_id": principal.credential_id,
+        "actor_ref": None if access.actor is None else access.actor.ref,
+        "actor_role": None if access.actor is None else access.actor.role,
+        "request_id": execution.request.state.request_id,
+        "created_at": reservation.created_at,
+        "closed_at": reservation.closed_at,
+        "payment_ref": reservation.payment_ref,
+        "paid_at": reservation.paid_at,
+        "committed_at": reservation.committed_at,
+        "late": reservation.late,
+        "fault_mode": reservation.fault_mode,
+        **_commit_columns(execution),
+    }
+    try:
+        connection.execute(insert(Reservation).values(values))
+    except IntegrityError as exc:
+        if getattr(exc.orig, "args", ())[:1] == (_DUPLICATE_ENTRY,):
+            raise RedoCommand() from None
+        raise
+    committed = reservation.status == COMMITTED
+    for line in lines:
+        connection.execute(
+            insert(OrderLine).values(
+                order_line_id=new_id(ORDER_LINE_ID_PREFIX),
+                tenant_id=principal.tenant_id,
+                reservation_id=reservation.reservation_id,
+                pool_id=reservation.pool_id,
+                sku_id=line.sku_id,
+                line_ref=line.line_ref,
+                quantity=line.quantity,
+                committed_qty=line.quantity if committed else 0,
+            )
+        )
+
+
+def _create_from_fault(
+    execution: Execution, skus: CommitSkus, order_ref: str, commit: SaleCommit
+) -> CommandResult:
+    """第 5 步，故障补交新建（§5.7、§5.5“找不到”的分支）。
+
+    锁序：池行（FOR SHARE）→ 余额行（按 sku_id 升序）
+    → SKU 行（FOR SHARE，按 sku_id 升序）。
+    """
+    connection = execution.connection
+    principal = execution.access.principal
+    tenant_id = principal.tenant_id
+    pool_id = skus.pool_id
+    sku_ids = [line.sku_id for line in commit.lines]
+    events_from = len(execution.events)
+    try:
+        require_live(execution, pool_id)
+        require_skus_exist(execution, sku_ids)
+    except ApiError as error:
+        return _reject_before_creating(execution, order_ref, commit, error, events_from)
+
+    # 合并去向不在开事务前处理过的 SKU 里（新去向没有先关到期，也可能没有预建余额行）：
+    # 在写任何东西之前回滚重做。
+    canonical: dict[str, str] = {}
+    for sku_id, target in merge_destinations(connection, tenant_id, sku_ids).items():
+        if target is None or target not in skus.prepared:
+            raise RedoCommand()
+        canonical[sku_id] = target
+    targets = set(canonical.values())
+    balances = lock_balances(execution, pool_id, targets)
+    # 去向在算出之后被并发的合并改了：回滚重做，重做时按新去向。
+    if _any_merged(execution, targets):
+        raise RedoCommand()
+
+    # 订单行取合并去向（Q-59），按请求的顺序。
+    lines = [
+        ReservationLine(line.line_ref, canonical[line.sku_id], line.quantity)
+        for line in commit.lines
+    ]
+    available = {sku_id: balance.quantities.available for sku_id, balance in balances.items()}
+    shortfalls = sku_shortfalls(
+        [(line.line_ref, line.sku_id, line.quantity) for line in lines], available
+    )
+
+    now = command_now(execution)
+    ttl_seconds = execution.request.app.state.reservation_ttl_seconds
+    enough = not shortfalls
+    # 从未 active：closed_at 为创建时间，expires_at 只是形式值。
+    created = ReservationRecord(
+        reservation_id=new_id(RESERVATION_ID_PREFIX),
+        channel_id=principal.channel_id,
+        order_ref=order_ref,
+        pool_id=pool_id,
+        status=COMMITTED if enough else LATE_PAYMENT_REVIEW,
+        # 同内容的预留请求的摘要：之后用同样的行补调预留得到 200 与这个预留。
+        request_hash=reserve_request_digest(
+            order_ref, [(line.line_ref, line.sku_id, line.quantity) for line in commit.lines]
+        ),
+        expires_at=compute_expires_at(now, ttl_seconds),
+        created_at=now,
+        release_reason=None,
+        closed_at=now,
+        payment_ref=commit.payment_ref,
+        paid_at=commit.paid_at,
+        commit_request_hash=execution.request_digest,
+        committed_at=now if enough else None,
+        late=enough,
+        fault_mode=True,
+    )
+    if not enough:
+        execution.keep_on_rejection(
+            lambda kept: _insert_created(execution, kept, created, lines, ttl_seconds)
+        )
+        raise ApiError(
+            409,
+            LATE_PAYMENT_INSUFFICIENT_STOCK,
+            "not enough available stock for the late payment",
+            details={"lines": shortfalls},
+        )
+
+    _insert_created(execution, connection, created, lines, ttl_seconds)
+    reason_code = commit_reason_code(EntryType.LATE_SALE_COMMIT, True)
+    command_id = new_command_id()
+    for line in lines:
+        append_entry(
+            execution,
+            balances[line.sku_id],
+            EntryType.LATE_SALE_COMMIT,
+            (-line.quantity, 0, 0, line.quantity),
+            command_id,
+            now=now,
+            source_type=SOURCE_TYPE,
+            source_ref=order_ref,
+            line_ref=line.line_ref,
+            reason_code=reason_code,
+            occurred_at=commit.paid_at,
+        )
+    return CommandResult(reservation_representation(created, lines, now), 200)
+
+
 # --- 命令 ---
 
 
@@ -511,7 +723,7 @@ def create_sale_commit(
             # 不按这个 ID 另查，不记事件。
             not_found = ApiError(404, RESERVATION_NOT_FOUND, "reservation not found")
             return _reject(execution, order_ref, commit, not_found)
-        raise _not_implemented_yet()
+        return _create_from_fault(execution, skus, order_ref, commit)
     if commit.reservation_id is not None and commit.reservation_id != reservation.reservation_id:
         details = {"reason": RESERVATION_ID}
         mismatch = ApiError(

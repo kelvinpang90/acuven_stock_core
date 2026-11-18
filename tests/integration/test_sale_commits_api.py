@@ -2,7 +2,7 @@
 
 在真 MySQL 上跑；每个测试建自己的租户、池、销售入口与凭据，池先切到 live，
 预留经接口建立；到期关单、待审、结案与 SKU 合并的改挂由测试直接改库模拟（自己提交的连接）。
-晚到确认见 test_sale_commit_late_api.py。故障补交新建尚未实现，这里只验证它返回 503、什么也不保存。
+晚到确认见 test_sale_commit_late_api.py，故障补交新建见 test_sale_commit_fault_api.py。
 """
 
 from collections.abc import Iterator
@@ -446,31 +446,6 @@ def test_a_credential_without_a_sales_channel_is_forbidden(client, engine, calle
     assert records(engine, without_channel, key, SALE_COMMITS_CREATE) == []
     assert stored_reservation(engine, caller, created["reservation_id"])["status"] == "active"
     assert quantities_of(engine, caller, sku) == (5, 1, 0, 0)
-
-
-# --- 尚未实现的分支 ---
-
-
-def test_a_fault_mode_commit_without_a_reservation_is_unavailable_and_saves_nothing(
-    client, engine, caller
-):
-    [sku] = add_skus(engine, caller.tenant_id, 1)
-    stock(engine, caller, sku, 5)
-    body = {
-        "reservation_id": None,
-        "payment_ref": new_payment_ref(),
-        "paid_at": PAID_AT,
-        "lines": [line("l1", sku, 1)],
-    }
-    key = new_key()
-
-    error = error_of(commit(client, caller, new_ref(), body, key), 503)
-    assert error["code"] == "UNAVAILABLE"
-    assert records(engine, caller, key, SALE_COMMITS_CREATE) == []
-    assert rows_of(engine, Reservation, caller) == []
-    assert rows_of(engine, OrderLine, caller) == []
-    assert sale_commits(engine, caller) == []
-    assert quantities_of(engine, caller, sku) == (5, 0, 0, 0)
 
 
 # --- 业务引用与重放 ---
