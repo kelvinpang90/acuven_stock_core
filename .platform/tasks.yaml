@@ -1888,7 +1888,7 @@ tasks:
       六，commit_reason_code(entry_type, fault_mode)：fault_mode 为真时返回 fault_mode；否则 LATE_SALE_COMMIT 返回 late_payment、SALE_COMMIT 返回 None；其他流水类型抛 ValueError。
       七，reserve_request_digest(order_ref, lines)：返回“同内容的预留请求”的摘要，即 request_digest 对 path 为空对象、body 为 order_ref 与 lines（每项 line_ref、sku_id、quantity）的结果（契约 5.7 第 5 步）。
       明确不做：表结构、接口与服务层（CORE-TASK-042 起）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-036
     acceptance_criteria:
