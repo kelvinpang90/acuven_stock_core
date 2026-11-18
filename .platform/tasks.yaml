@@ -2177,7 +2177,7 @@ tasks:
       parse_order_stock_cursor(value) 只校验格式并返回 (document_seq, 摘要)，格式不对抛 ValueError（前缀不是 v1、document_seq 不是无前导零的正整数或超过 app/domain/catalog.py 的 CURSOR_MAX、摘要不是 16 个小写十六进制字符；同流水游标的上限）；
       cursor_matches(digest, reservation_id) 判摘要是否属于这个订单。格式校验与绑定检查分开，是因为契约规定格式错先 422、查不到订单 404、绑定不符最后 422。
       明确不做：表结构、接口与服务层（CORE-TASK-050 起）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 函数与常量在 app/domain/fulfilment.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_fulfilment.py，用 unittest
