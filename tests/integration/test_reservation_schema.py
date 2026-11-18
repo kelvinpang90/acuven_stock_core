@@ -37,6 +37,7 @@ TTL_SECONDS = 900
 EXPIRES_AT = CREATED_AT + timedelta(seconds=TTL_SECONDS)
 CLOSED_AT = datetime(2026, 11, 16, 8, 5)
 REQUEST_HASH = "0" * 64
+PAID_AT = datetime(2026, 11, 16, 8, 3)
 
 
 @dataclass
@@ -96,6 +97,18 @@ def released(shop: Shop, **overrides: object) -> dict[str, object]:
     return values | overrides
 
 
+def paid(shop: Shop, **overrides: object) -> dict[str, object]:
+    """收到付款之后的三种状态都必有的列（契约 5.7 的存放），不含状态与 closed_at。"""
+    values = {
+        "payment_ref": new_id("pay"),
+        "paid_at": PAID_AT,
+        "commit_request_hash": REQUEST_HASH,
+        "commit_credential_id": shop.credential_id,
+        "commit_request_id": new_id("req"),
+    }
+    return values | overrides
+
+
 def add_reservation(db: Connection, shop: Shop, **overrides: object) -> str:
     reservation_id = new_id("rsv")
     db.execute(reservation_insert(shop, reservation_id=reservation_id, **overrides))
@@ -108,7 +121,9 @@ def add_reservation(db: Connection, shop: Shop, **overrides: object) -> str:
 def test_status_and_release_reason_fit_the_longest_values(db: Connection):
     shop = add_shop(db)
     release = add_reservation(db, shop, **released(shop, release_reason=CHECKOUT_REPLACED))
-    review = add_reservation(db, shop, status=LATE_PAYMENT_REVIEW, closed_at=CLOSED_AT)
+    review = add_reservation(
+        db, shop, status=LATE_PAYMENT_REVIEW, closed_at=CLOSED_AT, **paid(shop)
+    )
     rows = db.execute(
         select(Reservation.reservation_id, Reservation.status, Reservation.release_reason).where(
             Reservation.reservation_id.in_([release, review])
@@ -214,9 +229,10 @@ def test_closed_at_is_empty_while_active_and_set_once_released_or_expired(db: Co
     )
     assert_rejected_by(db, reservation_insert(shop, status=EXPIRED), "ck_reservations_closed_at")
     add_reservation(db, shop, status=EXPIRED, closed_at=CLOSED_AT)
-    # 确认销售之后的状态由确认销售任务定，这里不约束。
-    add_reservation(db, shop, status=COMMITTED)
-    add_reservation(db, shop, status=COMMITTED, closed_at=CLOSED_AT)
+    # 确认销售之后的状态由确认销售任务定，这里只补齐它的约束要求的列（契约 5.7）。
+    committed = {"status": COMMITTED, "committed_at": CLOSED_AT}
+    add_reservation(db, shop, **committed, closed_at=CLOSED_AT, **paid(shop))
+    add_reservation(db, shop, **committed, closed_at=CLOSED_AT, **paid(shop))
 
 
 def test_actor_columns_are_both_set_or_both_empty(db: Connection):

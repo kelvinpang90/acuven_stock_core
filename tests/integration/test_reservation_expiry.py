@@ -28,6 +28,7 @@ from tests.integration.conftest import TEST_DATABASE_URL
 from tests.integration.test_api_auth import Caller, error_of
 from tests.integration.test_idempotency import add_skus
 from tests.integration.test_reservation_release_api import (
+    commit_columns,
     release,
     releases,
     reserved_order,
@@ -327,7 +328,7 @@ def test_a_sweep_closes_every_due_active_reservation_and_nothing_else(
         statement = update(Reservation).where(
             Reservation.reservation_id == committed["reservation_id"]
         )
-        db.execute(statement.values(status="committed"))
+        db.execute(statement.values(status="committed", **commit_columns(caller)))
     for reservation in (due_a, due_b, released, committed):
         shift(engine, reservation["reservation_id"])
     before = {sku: expiry_releases(engine, caller, sku) for sku in released_skus}
