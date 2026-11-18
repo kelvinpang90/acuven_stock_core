@@ -1,4 +1,4 @@
-"""网店订单的表：预留与订单行（契约 5.1、5.6 的存放；租户隔离见第 10 节第 1 条）。
+"""网店订单的表：预留与订单行（契约 5.1、5.6、5.7 的存放；租户隔离见第 10 节第 1 条）。
 
 只有表结构与数据库约束。状态、释放原因与数量上下限取自 app/domain/reservations.py。
 expires_at = created_at + ttl_seconds、订单行的 pool_id 与所属预留相同、
@@ -10,6 +10,7 @@ from datetime import datetime
 from sqlalchemy import (
     CHAR,
     BigInteger,
+    Boolean,
     CheckConstraint,
     ForeignKey,
     ForeignKeyConstraint,
@@ -22,7 +23,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db import Base
 from app.domain.reservations import (
     ACTIVE,
+    CLOSED_REFUNDED,
+    COMMITTED,
     EXPIRED,
+    LATE_PAYMENT_REVIEW,
     LINE_QUANTITY_MAX,
     LINE_QUANTITY_MIN,
     RELEASE_REASONS,
@@ -36,6 +40,25 @@ from app.models.inventory import CODE32, REF, ZERO
 
 # 释放时才有、且必有的列；释放的操作者两列可选，另行约束。
 RELEASE_COLUMNS = ("release_reason", "released_credential_id", "released_request_id")
+
+# 收到付款之后的三种状态（契约 5.7）：确认，或转入待审、再结案。
+PAID_STATUSES = (COMMITTED, LATE_PAYMENT_REVIEW, CLOSED_REFUNDED)
+
+# 这三种状态才有、且必有的列；确认的操作者两列可选，另行约束。
+COMMIT_COLUMNS = (
+    "payment_ref",
+    "paid_at",
+    "commit_request_hash",
+    "commit_credential_id",
+    "commit_request_id",
+)
+
+# 待审结案时才有、且必有的列；结案的操作者两列可选，另行约束。
+REVIEW_CLOSED_COLUMNS = (
+    "review_closed_at",
+    "review_closed_credential_id",
+    "review_closed_request_id",
+)
 
 # 订单行的五个累计量（契约 5.1）。
 LINE_ACCUMULATORS = (
@@ -75,8 +98,20 @@ class Reservation(Base):
             ["credentials.tenant_id", "credentials.credential_id"],
             name="fk_reservations_released_credential_id_credentials",
         ),
+        ForeignKeyConstraint(
+            ["tenant_id", "commit_credential_id"],
+            ["credentials.tenant_id", "credentials.credential_id"],
+            name="fk_reservations_commit_credential_id_credentials",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "review_closed_credential_id"],
+            ["credentials.tenant_id", "credentials.credential_id"],
+            name="fk_reservations_review_closed_credential_id_credentials",
+        ),
         # 业务引用：一个订单只有一个预留（契约 5.2 第 2 条）。
         UniqueConstraint("tenant_id", "channel_id", "order_ref"),
+        # 业务引用：一笔付款只确认一个订单（契约 5.7）；MySQL 唯一索引允许多个 NULL。
+        UniqueConstraint("tenant_id", "channel_id", "payment_ref"),
         # 复合外键 (tenant_id, reservation_id) 的引用目标。
         UniqueConstraint("tenant_id", "reservation_id"),
         # 定时任务按 expires_at 扫描 active 的预留。
@@ -91,16 +126,49 @@ class Reservation(Base):
             ),
             name="released_columns",
         ),
-        # committed 及之后的状态由确认销售任务定，这里不约束。
+        # committed 及之后的状态见下面的 paid_closed_at。
         CheckConstraint(
             f"(status <> '{ACTIVE}' OR closed_at IS NULL)"
             f" AND (status NOT IN ('{RELEASED}', '{EXPIRED}') OR closed_at IS NOT NULL)",
             name="closed_at",
         ),
+        CheckConstraint(
+            " AND ".join(
+                f"({_in('status', PAID_STATUSES)}) = ({column} IS NOT NULL)"
+                for column in COMMIT_COLUMNS
+            ),
+            name="commit_columns",
+        ),
+        CheckConstraint(
+            f"(status = '{COMMITTED}') = (committed_at IS NOT NULL)", name="committed_at"
+        ),
+        # 只有经 LATE_SALE_COMMIT 确认的才为真；转入待审时不设（契约 5.7 表示）。
+        CheckConstraint(f"status = '{COMMITTED}' OR NOT late", name="late"),
+        CheckConstraint(
+            " AND ".join(
+                f"(status = '{CLOSED_REFUNDED}') = ({column} IS NOT NULL)"
+                for column in REVIEW_CLOSED_COLUMNS
+            ),
+            name="review_closed_columns",
+        ),
+        # 离开 active 的时间：正常确认为确认时间，经到期再确认的保留到期关单时间，
+        # 故障补交新建的为创建时间（契约 5.7 存放）。
+        CheckConstraint(
+            f"NOT ({_in('status', PAID_STATUSES)}) OR closed_at IS NOT NULL",
+            name="paid_closed_at",
+        ),
         # 预留与释放都不要求角色（契约第 10 节第 3 条）：有操作者时才有角色，反之亦然。
         CheckConstraint("(actor_ref IS NULL) = (actor_role IS NULL)", name="actor"),
         CheckConstraint(
             "(released_actor_ref IS NULL) = (released_actor_role IS NULL)", name="released_actor"
+        ),
+        # 确认与结案同样不要求角色，也不按状态约束。
+        CheckConstraint(
+            "(commit_actor_ref IS NULL) = (commit_actor_role IS NULL)", name="commit_actor"
+        ),
+        CheckConstraint(
+            "(review_closed_actor_ref IS NULL) = (review_closed_actor_role IS NULL)",
+            name="review_closed_actor",
         ),
         # expires_at = created_at + ttl_seconds 由服务层保证，这里只查先后。
         CheckConstraint("expires_at > created_at", name="expires_at"),
@@ -131,6 +199,25 @@ class Reservation(Base):
     released_request_id: Mapped[str | None] = mapped_column(REF)
     # 离开 active 的时间：释放或到期关单的数据库时间。
     closed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP)
+    # 确认销售（或转入待审）记下的付款与确认（契约 5.7）。
+    payment_ref: Mapped[str | None] = mapped_column(REF)
+    paid_at: Mapped[datetime | None] = mapped_column(TIMESTAMP)
+    # 确认请求的请求摘要；晚到确认重试成功时改记成功的那次。
+    commit_request_hash: Mapped[str | None] = mapped_column(CHAR(64, collation=EXACT_COLLATION))
+    committed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP)
+    late: Mapped[bool] = mapped_column(Boolean, server_default=ZERO)
+    # 故障补交新建或经故障补交确认、转入待审的为真，一旦为真不再改回（由服务层保证）。
+    fault_mode: Mapped[bool] = mapped_column(Boolean, server_default=ZERO)
+    commit_credential_id: Mapped[str | None] = mapped_column(ID)
+    commit_actor_ref: Mapped[str | None] = mapped_column(REF)
+    commit_actor_role: Mapped[str | None] = mapped_column(CODE32)
+    commit_request_id: Mapped[str | None] = mapped_column(REF)
+    # 待审结案（契约 5.7）。
+    review_closed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP)
+    review_closed_credential_id: Mapped[str | None] = mapped_column(ID)
+    review_closed_actor_ref: Mapped[str | None] = mapped_column(REF)
+    review_closed_actor_role: Mapped[str | None] = mapped_column(CODE32)
+    review_closed_request_id: Mapped[str | None] = mapped_column(REF)
 
 
 class OrderLine(Base):

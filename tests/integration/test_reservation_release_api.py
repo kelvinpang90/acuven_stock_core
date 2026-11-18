@@ -98,6 +98,19 @@ def releases(engine: Engine, caller: Caller) -> list[dict]:
     return sorted(written, key=lambda entry: entry["line_ref"])
 
 
+def commit_columns(caller: Caller) -> dict:
+    """直接改库为 committed 时，契约 5.7 的约束要求的列；时间都取创建时间。"""
+    return {
+        "payment_ref": f"pay-{uuid4().hex}",
+        "paid_at": Reservation.created_at,
+        "commit_request_hash": Reservation.request_hash,
+        "commit_credential_id": caller.credential_id,
+        "commit_request_id": f"commit-test-{uuid4().hex}",
+        "committed_at": Reservation.created_at,
+        "closed_at": Reservation.created_at,
+    }
+
+
 # --- 释放 ---
 
 
@@ -219,7 +232,7 @@ def test_a_committed_reservation_is_a_state_conflict(client, engine, caller):
     reservation_id = created["reservation_id"]
     with engine.begin() as db:
         statement = update(Reservation).where(Reservation.reservation_id == reservation_id)
-        db.execute(statement.values(status="committed"))
+        db.execute(statement.values(status="committed", **commit_columns(caller)))
     before = entries(engine, caller)
 
     error = error_of(release(client, caller, reservation_id, {"reason": "cancelled"}), 409)
