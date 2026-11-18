@@ -73,6 +73,8 @@ class Line(RequestBody):
 class _Fulfilment(RequestBody):
     """两个命令共有的字段。lines 是 1–100 行的批量数组（超过 100 为 413）。
 
+    line_ref 的重复由 json_body 查（app/api/requests.py 的 _validate，422），这里不再重复。
+
     可选字段的默认 None 只表示没带，规则同收货：校验器只对带了的字段运行，
     所以 reason_code、occurred_at 给 null 照样 422，note 给 null 与没带相同。
     """
@@ -150,6 +152,8 @@ def _run(
     order_ref: str,
     document_ref: str,
 ) -> Response:
+    # 路由上的 pool_id 只用来在第 9 步拦没有销售入口的凭据（403）：
+    # 余额行用预留行的 pool_id，预留行按凭据的渠道查到，二者一致。
     lines = body.model.quantity_lines()
     fields = body.model.common_fields()
 
