@@ -2248,7 +2248,7 @@ tasks:
       四，表示照 5.8：document_id、document_type、order_ref、reservation_id、pool_id、本类型的引用字段、reason_code、note、occurred_at、created_at，lines 按 line_ref 升序，每行 line_ref、sku_id、quantity、entry_id。
       本任务把单据表示与“按类型查单据、写单据”的函数写成三种类型通用的，供 CORE-TASK-052、053 复用。
       明确不做：退货验收（CORE-TASK-052）；订单库存查询（CORE-TASK-053）；撤销与更正（契约 Q-64，V1 不做）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-049
       - CORE-TASK-050
