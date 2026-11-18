@@ -8,6 +8,9 @@ lines 的规则同预留（1–100 行，超过 413；line_ref 或 sku_id 重复
 池是凭据销售入口绑定的池：凭据没有销售入口或入口已停用 403（第 9 步，不保存）。
 余额行预建与开事务前的先关到期由 app/services/sale_commits.py 的 CommitSkus 做，
 这里只把它们交给执行器；判定与写库也在那里。
+
+待审结案同样要求 orders.write、不要求角色、经幂等执行器以 READ COMMITTED 开事务；
+没有请求体（非空 422，第 7 步，排在路径的 order_ref 之前），池同上，不预建余额行。
 """
 
 from typing import Annotated
@@ -18,7 +21,7 @@ from pydantic import Field, field_validator, model_validator
 
 from app.api.auth import authorize, get_access, require_sales_pool
 from app.api.errors import invalid_request
-from app.api.requests import ParsedBody, RequestBody, json_body
+from app.api.requests import ParsedBody, RequestBody, json_body, no_body
 from app.api.reservations import LINES, ORDER_REF, Line
 from app.domain.catalog import InvalidField
 from app.domain.requests import is_reference
@@ -30,6 +33,7 @@ from app.services.reservations import ReservationLine
 from app.services.sale_commits import CommitSkus, SaleCommit
 
 SALE_COMMITS_CREATE = "sale_commits.create"
+LATE_PAYMENT_REVIEWS_CLOSE = "late_payment_reviews.close"
 
 RESERVATION_ID = "reservation_id"
 PAYMENT_REF = "payment_ref"
@@ -39,6 +43,8 @@ RESERVATION_ID_MAX_LENGTH = 32
 
 router = APIRouter()
 _WRITE = [Depends(authorize(ORDERS_WRITE, write=True))]
+# 结案没有请求体：no_body 在 authorize 之后，空请求体跳过、非空 422。
+_WRITE_WITHOUT_BODY = [*_WRITE, Depends(no_body)]
 
 
 # --- 请求体（§5.7 确认销售） ---
@@ -135,4 +141,25 @@ def create_sale_commit(
         balance_rows=skus.balance_rows,
         read_committed=True,
         before_transaction=skus.close_due,
+    )
+
+
+# --- 待审结案 ---
+
+
+@router.post("/v1/orders/{order_ref}/late-payment-review/close", dependencies=_WRITE_WITHOUT_BODY)
+def close_late_payment_review(
+    request: Request,
+    order_ref: Annotated[str, Depends(_path_order_ref)],
+    pool_id: Annotated[str, Depends(require_sales_pool)],
+) -> Response:
+    def command(execution: Execution) -> CommandResult:
+        return sale_commits.close_late_payment_review(execution, order_ref)
+
+    return run_idempotent(
+        request,
+        operation=LATE_PAYMENT_REVIEWS_CLOSE,
+        body=None,
+        command=command,
+        read_committed=True,
     )

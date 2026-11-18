@@ -59,6 +59,12 @@ LATE_PAYMENT_INSUFFICIENT_STOCK 不在此列。
   它先再调一次 close_if_due，使 RELEASE 流水、reserved 的减回与 closed_at 和待审一起提交；
   已在待审的（重试仍不够）不改预留的任何列。
 reservation_id 为 null 的请求确认或转入待审时 fault_mode 设为真，之后不改回。
+
+待审结案（close_late_payment_review，§5.7）：同样在执行器以 READ COMMITTED 开的事务里运行。
+FOR UPDATE 按 order_ref 读预留行：没有 404 RESERVATION_NOT_FOUND；
+late_payment_review 改为 closed_refunded，记下结案的时间与 review_closed_* 各列，不写流水，200；
+已是 closed_refunded 不写任何东西，200 与当前表示；
+其他状态 409 STATE_CONFLICT（details 带表示里的状态，已到期未关的 active 为 expired），不关单。
 """
 
 from collections.abc import Iterable, Sequence
@@ -73,6 +79,7 @@ from app.api.errors import ApiError
 from app.domain.ids import new_id
 from app.domain.ledger import EntryType
 from app.domain.reservations import (
+    CLOSED_REFUNDED,
     COMMITTED,
     LATE_PAYMENT_REVIEW,
     ORDER_LINE_ID_PREFIX,
@@ -104,6 +111,7 @@ from app.services.reservations import (
     find_reservation_by_payment_ref,
     lock_lines,
     lock_reservation_by_ref,
+    read_lines,
     read_reservation,
     reservation_representation,
 )
@@ -777,3 +785,47 @@ def create_sale_commit(
             raise RuntimeError(f"reservation {reservation_id} is not in the tenant")
         reservation = closed
     return _late_commit(execution, reservation, lines, commit, now, closed_here=closed_here)
+
+
+# --- 待审结案 ---
+
+
+def close_late_payment_review(execution: Execution, order_ref: str) -> CommandResult:
+    """待审结案（§5.7）：网店已退款，Core 只记下结案；待审时没有扣过数，不写流水。"""
+    connection = execution.connection
+    principal = execution.access.principal
+    tenant_id = principal.tenant_id
+    reservation = lock_reservation_by_ref(connection, tenant_id, principal.channel_id, order_ref)
+    if reservation is None:
+        raise ApiError(404, RESERVATION_NOT_FOUND, "reservation not found")
+    if reservation.status == CLOSED_REFUNDED:
+        return CommandResult(current_representation(connection, tenant_id, reservation), 200)
+    now = command_now(execution)
+    if reservation.status != LATE_PAYMENT_REVIEW:
+        status = displayed_status(reservation.status, reservation.expires_at, now)
+        raise ApiError(
+            409,
+            STATE_CONFLICT,
+            "the reservation is not awaiting a late payment review",
+            details={"status": status},
+        )
+
+    access = execution.access
+    connection.execute(
+        update(Reservation)
+        .where(
+            Reservation.tenant_id == tenant_id,
+            Reservation.reservation_id == reservation.reservation_id,
+        )
+        .values(
+            status=CLOSED_REFUNDED,
+            review_closed_at=now,
+            review_closed_credential_id=principal.credential_id,
+            review_closed_actor_ref=None if access.actor is None else access.actor.ref,
+            review_closed_actor_role=None if access.actor is None else access.actor.role,
+            review_closed_request_id=execution.request.state.request_id,
+        )
+    )
+    closed = replace(reservation, status=CLOSED_REFUNDED, review_closed_at=now)
+    lines = read_lines(connection, tenant_id, reservation.reservation_id)
+    return CommandResult(reservation_representation(closed, lines, now), 200)
