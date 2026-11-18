@@ -41,6 +41,8 @@ EXPIRE 在同一事务里按 close_if_due 关单；UNCHANGED 不写；CONFLICT 4
 
 表示由 reservation_representation 从预留行、订单行与数据库时间算出，它不读库：
 active 而数据库时间已到 expires_at 的显示为 expired（读接口不写库，§5.6）。
+§5.7 加的付款、确认、late、fault_mode 与结案字段照存的列返回（列按状态的有无由表的检查约束保证）。
+确认销售（app/services/sale_commits.py）复用这里的读预留、读订单行、表示与新预留之前的关单。
 """
 
 import logging
@@ -119,7 +121,10 @@ _log = logging.getLogger("app.api.reservations")
 
 @dataclass(frozen=True)
 class ReservationRecord:
-    """reservations 的一行（表示与判定要用的列）。"""
+    """reservations 的一行（表示与判定要用的列）。
+
+    §5.7 的列排在最后、带默认值：新建的预留还没有付款与确认。
+    """
 
     reservation_id: str
     channel_id: str
@@ -131,6 +136,13 @@ class ReservationRecord:
     created_at: datetime
     release_reason: str | None
     closed_at: datetime | None
+    payment_ref: str | None = None
+    paid_at: datetime | None = None
+    commit_request_hash: str | None = None
+    committed_at: datetime | None = None
+    late: bool = False
+    fault_mode: bool = False
+    review_closed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -174,6 +186,18 @@ def find_reservation_by_ref(
     return _reservation(connection.execute(statement).mappings().first())
 
 
+def find_reservation_by_payment_ref(
+    connection: Connection, tenant_id: str, channel_id: str, payment_ref: str
+) -> ReservationRecord | None:
+    """普通读按租户与销售入口找记下了 payment_ref 的预留（§5.7 第 1 步）。"""
+    statement = select(*_RESERVATION_COLUMNS).where(
+        Reservation.tenant_id == tenant_id,
+        Reservation.channel_id == channel_id,
+        Reservation.payment_ref == payment_ref,
+    )
+    return _reservation(connection.execute(statement).mappings().first())
+
+
 def reservation_owner(connection: Connection, reservation_id: str) -> str | None:
     """预留所属的租户；不存在为 None。"""
     statement = select(Reservation.tenant_id).where(Reservation.reservation_id == reservation_id)
@@ -201,6 +225,22 @@ def lock_reservation(
     return _reservation(connection.execute(statement).mappings().first())
 
 
+def lock_reservation_by_ref(
+    connection: Connection, tenant_id: str, channel_id: str, order_ref: str
+) -> ReservationRecord | None:
+    """FOR UPDATE 按租户与销售入口读 order_ref 的预留行（§5.7 第 2 步）；没有为 None。"""
+    statement = (
+        select(*_RESERVATION_COLUMNS)
+        .where(
+            Reservation.tenant_id == tenant_id,
+            Reservation.channel_id == channel_id,
+            Reservation.order_ref == order_ref,
+        )
+        .with_for_update()
+    )
+    return _reservation(connection.execute(statement).mappings().first())
+
+
 def read_lines(
     connection: Connection, tenant_id: str, reservation_id: str
 ) -> list[ReservationLine]:
@@ -218,7 +258,11 @@ def database_now(connection: Connection) -> datetime:
     return connection.execute(text("SELECT CURRENT_TIMESTAMP(6)")).scalar_one()
 
 
-# --- 表示（§5.6） ---
+# --- 表示（§5.6、§5.7） ---
+
+
+def _optional_timestamp(value: datetime | None) -> str | None:
+    return None if value is None else format_timestamp(value)
 
 
 def reservation_representation(
@@ -227,6 +271,9 @@ def reservation_representation(
     """预留的表示：键固定且都出现，lines 按 line_ref 升序。不读库。
 
     released_at 与 release_reason 只在 released 时有值；released_at 即离开 active 的时间。
+    §5.7 的字段照存的列：payment_ref、paid_at 在 committed、late_payment_review、
+    closed_refunded 时有值，committed_at 只在 committed 时有值，
+    review_closed_at 只在 closed_refunded 时有值。
     """
     released = reservation.status == RELEASED
     return {
@@ -238,6 +285,12 @@ def reservation_representation(
         "created_at": format_timestamp(reservation.created_at),
         "released_at": format_timestamp(reservation.closed_at) if released else None,
         "release_reason": reservation.release_reason if released else None,
+        "payment_ref": reservation.payment_ref,
+        "paid_at": _optional_timestamp(reservation.paid_at),
+        "committed_at": _optional_timestamp(reservation.committed_at),
+        "late": reservation.late,
+        "fault_mode": reservation.fault_mode,
+        "review_closed_at": _optional_timestamp(reservation.review_closed_at),
         "lines": [
             {"line_ref": line.line_ref, "sku_id": line.sku_id, "quantity": line.quantity}
             for line in sorted(lines, key=lambda line: line.line_ref)
@@ -458,7 +511,7 @@ def create_reservation(
 # --- 放回预留的库存（释放与到期关单共用） ---
 
 
-def _lock_lines(
+def lock_lines(
     connection: Connection, tenant_id: str, reservation_id: str
 ) -> list[ReservationLine]:
     """FOR SHARE 读预留的订单行，按 line_ref 升序；等正在进行的 SKU 合并提交。"""
@@ -484,7 +537,7 @@ def _release_lines(
 
     合并改挂之后两行可能指向同一个 SKU：余额行只锁一次，两条流水依次写在它上面。
     """
-    lines = _lock_lines(connection, tenant_id, reservation.reservation_id)
+    lines = lock_lines(connection, tenant_id, reservation.reservation_id)
     sku_ids = [line.sku_id for line in lines]
     balances = lock_balance_rows(connection, tenant_id, reservation.pool_id, sku_ids)
     command_id = new_command_id()
@@ -573,6 +626,7 @@ def close_due_before_reserving(
 ) -> int:
     """新预留开业务事务之前（执行器的 before_transaction 钩子，连接已设好 READ COMMITTED）：
     关掉本租户、本池里所列 SKU 上 active 而已到期的预留，按 expires_at 升序最多 100 个。
+    确认销售开业务事务之前也用它（§5.7，所列 SKU 及其合并去向）。
 
     查候选的普通读出错或抛 ClosingStopped 时异常传出，执行器回 503、什么也不保存。
     """

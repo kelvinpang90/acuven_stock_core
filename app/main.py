@@ -16,6 +16,7 @@ from app.api import (
     counts,
     demo_resets,
     reservations,
+    sale_commits,
     stock_documents,
     stock_imports,
     stock_queries,
@@ -123,6 +124,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(stock_documents.router)
     app.include_router(counts.router)
     app.include_router(reservations.router)
+    app.include_router(sale_commits.router)
     # Demo 重置只在 Demo 实例上存在；生产实例不挂，该路径同不存在的路径 404（契约 6.1）。
     if settings.env == DEMO:
         app.include_router(demo_resets.router)
