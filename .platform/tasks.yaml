@@ -1926,7 +1926,7 @@ tasks:
       CORE-TASK-039 的 tests/integration/test_reservation_release_api.py 与 tests/integration/test_reservation_expiry.py 若把预留行直接改成 committed 或待审等状态，同样只为新约束补列，其余断言不动。
       五，集成测试 tests/integration/test_sale_commit_schema.py 用现有夹具建数据，逐条验证上面的约束能拦住不合格的行、放行合格的行（含 expired 转 committed 后保留原 closed_at、故障补交新建的行）。
       明确不做：任何接口与服务层（CORE-TASK-044 起）；不改 order_lines 与流水表。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-037
       - CORE-TASK-039
