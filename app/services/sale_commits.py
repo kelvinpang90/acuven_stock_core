@@ -18,13 +18,24 @@
 3. FOR SHARE 读订单行，再普通读查请求 SKU 与订单行 SKU 的合并去向，
    行集不一致 409 RESERVATION_MISMATCH（reason 为 lines，line_refs 升序）；
 4. 按 commit_decision：COMMIT 先 FOR SHARE 读池行、按升序锁余额行，每行一条 SALE_COMMIT，
-   订单行 committed_qty 设为 quantity，预留改为 committed；ANSWER_EXISTING 按第 1 步回答；
+   订单行 committed_qty 设为 quantity，预留改为 committed；
+   EXPIRE_THEN_LATE 读池行后在同一事务里 close_if_due，再走晚到确认；LATE 读池行后直接走；
+   ANSWER_EXISTING 按第 1 步回答；
    STATE_CONFLICT 与 PAYMENT_REF_CONFLICT 409 STATE_CONFLICT（details 带表示里的状态）。
 写 payment_ref 撞唯一约束时抛 RedoCommand，执行器回滚后从余额行预建那一步重做。
 
+晚到确认（§5.7）：按升序锁订单行各 SKU 的余额行，按 SKU 合计判可售（停用不拦）。
+- 够：每行一条 LATE_SALE_COMMIT，订单行 committed_qty 设为 quantity，预留改为 committed、late 为真；
+  closed_at 保留（到期关单的时间），paid_at 已记下（待审重试）时不变，确认摘要与 commit_* 记本次；
+- 不够：409 LATE_PAYMENT_INSUFFICIENT_STOCK。第一次转入待审由 keep_on_rejection 登记的写入做：
+  执行器先回滚命令的保存点（连同同一事务里的到期关单）再执行它，所以 EXPIRE_THEN_LATE 时
+  它先再调一次 close_if_due，使 RELEASE 流水、reserved 的减回与 closed_at 和待审一起提交；
+  已在待审的（重试仍不够）不改预留的任何列。
+reservation_id 为 null 的请求确认或转入待审时 fault_mode 设为真，之后不改回。
+
 尚未实现的分支先返回 503 UNAVAILABLE、不保存（确定未生效，可同键重试）：
-晚到确认（LATE、EXPIRE_THEN_LATE），以及没有预留且 reservation_id 为 null 的故障补交新建。
-报业务拒绝之前重查业务引用也尚未做。
+没有预留且 reservation_id 为 null 的故障补交新建。
+报业务拒绝之前重查业务引用、判可售时合并去向不在 prepared 里的重做也尚未做。
 """
 
 from collections.abc import Iterable, Sequence
@@ -38,7 +49,7 @@ from sqlalchemy.exc import IntegrityError
 from app.api.errors import ApiError
 from app.api.requests import unavailable
 from app.domain.ledger import EntryType
-from app.domain.reservations import COMMITTED, displayed_status
+from app.domain.reservations import COMMITTED, LATE_PAYMENT_REVIEW, displayed_status
 from app.domain.sale_commits import (
     SOURCE_TYPE,
     CommitDecision,
@@ -46,6 +57,7 @@ from app.domain.sale_commits import (
     commit_reason_code,
     merge_destination,
     mismatched_line_refs,
+    sku_shortfalls,
 )
 from app.models.catalog import Sku
 from app.models.orders import OrderLine, Reservation
@@ -56,10 +68,12 @@ from app.services.reservations import (
     ReservationLine,
     ReservationRecord,
     close_due_before_reserving,
+    close_if_due,
     current_representation,
     find_reservation_by_payment_ref,
     lock_lines,
     lock_reservation_by_ref,
+    read_reservation,
     reservation_representation,
 )
 from app.services.stock import (
@@ -74,6 +88,7 @@ from app.services.stock import (
 
 # 错误码（§5.7、§8.3）。
 RESERVATION_MISMATCH = "RESERVATION_MISMATCH"
+LATE_PAYMENT_INSUFFICIENT_STOCK = "LATE_PAYMENT_INSUFFICIENT_STOCK"
 # BUSINESS_REF_CONFLICT 的 details.ref_type。
 PAYMENT = "payment"
 # RESERVATION_MISMATCH 的 details.reason，与 PAYMENT_REF_CONFLICT 的 details.reason。
@@ -188,8 +203,48 @@ def _state_conflict(status: str, **details: Any) -> ApiError:
 
 
 def _not_implemented_yet() -> ApiError:
-    """晚到确认与故障补交新建尚未实现：503，不保存，同键重试会重新执行。"""
+    """故障补交新建尚未实现：503，不保存，同键重试会重新执行。"""
     return unavailable()
+
+
+# --- 写预留行 ---
+
+
+def _commit_columns(execution: Execution) -> dict[str, Any]:
+    """确认（或转入待审）的摘要与 commit_* 各列，取本次请求（§5.7 存放）。"""
+    access = execution.access
+    return {
+        "commit_request_hash": execution.request_digest,
+        "commit_credential_id": access.principal.credential_id,
+        "commit_actor_ref": None if access.actor is None else access.actor.ref,
+        "commit_actor_role": None if access.actor is None else access.actor.role,
+        "commit_request_id": execution.request.state.request_id,
+    }
+
+
+def _update_reservation(
+    connection: Connection, tenant_id: str, reservation_id: str, values: dict[str, Any]
+) -> None:
+    """改预留行；写 payment_ref 撞唯一约束时抛 RedoCommand（§5.7 撞唯一约束）。"""
+    statement = update(Reservation).where(
+        Reservation.tenant_id == tenant_id,
+        Reservation.reservation_id == reservation_id,
+    )
+    try:
+        connection.execute(statement.values(**values))
+    except IntegrityError as exc:
+        # 并发的确认先用掉了这个 payment_ref：回滚后整个重做。
+        if getattr(exc.orig, "args", ())[:1] == (_DUPLICATE_ENTRY,):
+            raise RedoCommand() from None
+        raise
+
+
+def _set_lines_committed(connection: Connection, tenant_id: str, reservation_id: str) -> None:
+    connection.execute(
+        update(OrderLine)
+        .where(OrderLine.tenant_id == tenant_id, OrderLine.reservation_id == reservation_id)
+        .values(committed_qty=OrderLine.quantity)
+    )
 
 
 # --- 正常确认 ---
@@ -229,16 +284,8 @@ def _commit(
             reason_code=reason_code,
             occurred_at=commit.paid_at,
         )
-    connection.execute(
-        update(OrderLine)
-        .where(
-            OrderLine.tenant_id == tenant_id,
-            OrderLine.reservation_id == reservation.reservation_id,
-        )
-        .values(committed_qty=OrderLine.quantity)
-    )
+    _set_lines_committed(connection, tenant_id, reservation.reservation_id)
 
-    access = execution.access
     committed = replace(
         reservation,
         status=COMMITTED,
@@ -251,33 +298,145 @@ def _commit(
         # 一旦为真不再改回（§5.7 表示）。
         fault_mode=reservation.fault_mode or from_fault,
     )
-    statement = update(Reservation).where(
-        Reservation.tenant_id == tenant_id,
-        Reservation.reservation_id == reservation.reservation_id,
+    _update_reservation(
+        connection,
+        tenant_id,
+        reservation.reservation_id,
+        {
+            "status": committed.status,
+            "payment_ref": committed.payment_ref,
+            "paid_at": committed.paid_at,
+            "committed_at": now,
+            "closed_at": now,
+            "late": False,
+            "fault_mode": committed.fault_mode,
+            **_commit_columns(execution),
+        },
     )
-    try:
-        connection.execute(
-            statement.values(
-                status=committed.status,
-                payment_ref=committed.payment_ref,
-                paid_at=committed.paid_at,
-                commit_request_hash=committed.commit_request_hash,
-                committed_at=now,
-                closed_at=now,
-                late=False,
-                fault_mode=committed.fault_mode,
-                commit_credential_id=access.principal.credential_id,
-                commit_actor_ref=None if access.actor is None else access.actor.ref,
-                commit_actor_role=None if access.actor is None else access.actor.role,
-                commit_request_id=execution.request.state.request_id,
-            )
-        )
-    except IntegrityError as exc:
-        # 并发的确认先用掉了这个 payment_ref：回滚后整个重做（§5.7 撞唯一约束）。
-        if getattr(exc.orig, "args", ())[:1] == (_DUPLICATE_ENTRY,):
-            raise RedoCommand() from None
-        raise
     return CommandResult(reservation_representation(committed, lines, now), 200)
+
+
+# --- 晚到确认 ---
+
+
+def _late_commit(
+    execution: Execution,
+    reservation: ReservationRecord,
+    lines: Sequence[ReservationLine],
+    commit: SaleCommit,
+    now: datetime,
+    *,
+    closed_here: bool,
+) -> CommandResult:
+    """晚到确认（§5.7、§5.2 第 6 条）：池行已读过；reservation 是 expired 或待审
+    （closed_here 为真时是本事务刚关的，执行器撤销它之后转入待审要重新关）。
+
+    锁序：余额行（按 sku_id 升序；同一事务里关单已锁的再锁一次不另等）→ 最后改预留行。
+    """
+    connection = execution.connection
+    tenant_id = _tenant_id(execution)
+    balances = lock_balances(execution, reservation.pool_id, [line.sku_id for line in lines])
+    available = {sku_id: balance.quantities.available for sku_id, balance in balances.items()}
+    # 行集已一致：按请求的顺序列订单行，sku_id 取订单行的（合并去向）。
+    order_lines = {line.line_ref: line for line in lines}
+    requested = [order_lines[line.line_ref] for line in commit.lines]
+    shortfalls = sku_shortfalls(
+        [(line.line_ref, line.sku_id, line.quantity) for line in requested], available
+    )
+    from_fault = commit.reservation_id is None
+    fault_mode = reservation.fault_mode or from_fault
+    if shortfalls:
+        if reservation.status != LATE_PAYMENT_REVIEW:
+            execution.keep_on_rejection(
+                lambda kept: _to_review(
+                    execution, kept, reservation, commit, fault_mode, closed_here
+                )
+            )
+        # 已在待审的（重试仍不够）不改预留的任何列。
+        raise ApiError(
+            409,
+            LATE_PAYMENT_INSUFFICIENT_STOCK,
+            "not enough available stock for the late payment",
+            details={"lines": shortfalls},
+        )
+
+    reason_code = commit_reason_code(EntryType.LATE_SALE_COMMIT, from_fault)
+    # 待审重试时付款时间取第一次转入待审时记下的。
+    paid_at = commit.paid_at if reservation.paid_at is None else reservation.paid_at
+    command_id = new_command_id()
+    for line in lines:
+        append_entry(
+            execution,
+            balances[line.sku_id],
+            EntryType.LATE_SALE_COMMIT,
+            (-line.quantity, 0, 0, line.quantity),
+            command_id,
+            now=now,
+            source_type=SOURCE_TYPE,
+            source_ref=reservation.order_ref,
+            line_ref=line.line_ref,
+            reason_code=reason_code,
+            occurred_at=paid_at,
+        )
+    _set_lines_committed(connection, tenant_id, reservation.reservation_id)
+
+    # closed_at 保留到期关单的时间；payment_ref 与记下的相同（待审）或第一次记下。
+    committed = replace(
+        reservation,
+        status=COMMITTED,
+        payment_ref=commit.payment_ref,
+        paid_at=paid_at,
+        commit_request_hash=execution.request_digest,
+        committed_at=now,
+        late=True,
+        fault_mode=fault_mode,
+    )
+    _update_reservation(
+        connection,
+        tenant_id,
+        reservation.reservation_id,
+        {
+            "status": committed.status,
+            "payment_ref": committed.payment_ref,
+            "paid_at": committed.paid_at,
+            "committed_at": now,
+            "late": True,
+            "fault_mode": fault_mode,
+            **_commit_columns(execution),
+        },
+    )
+    return CommandResult(reservation_representation(committed, lines, now), 200)
+
+
+def _to_review(
+    execution: Execution,
+    connection: Connection,
+    reservation: ReservationRecord,
+    commit: SaleCommit,
+    fault_mode: bool,
+    close_first: bool,
+) -> None:
+    """第一次转入待审（keep_on_rejection 的写入，在命令的保存点回滚之后执行）。
+
+    close_first 为真时命令里的到期关单已随保存点撤销：先再关一次，
+    使 RELEASE 流水、reserved 的减回与 closed_at 和待审一起提交。
+    """
+    tenant_id = _tenant_id(execution)
+    reservation_id = reservation.reservation_id
+    if close_first and not close_if_due(connection, tenant_id, reservation_id):
+        raise RuntimeError(f"reservation {reservation_id} was due but not closed")
+    _update_reservation(
+        connection,
+        tenant_id,
+        reservation_id,
+        {
+            "status": LATE_PAYMENT_REVIEW,
+            "payment_ref": commit.payment_ref,
+            "paid_at": commit.paid_at,
+            "fault_mode": fault_mode,
+            **_commit_columns(execution),
+        },
+    )
 
 
 # --- 命令 ---
@@ -344,5 +503,16 @@ def create_sale_commit(
         raise _state_conflict(status, reason=PAYMENT_REF)
     if decision is CommitDecision.STATE_CONFLICT:
         raise _state_conflict(status)
-    # LATE 与 EXPIRE_THEN_LATE：晚到确认尚未实现。
-    raise _not_implemented_yet()
+
+    # LATE 与 EXPIRE_THEN_LATE：池行排在余额行之前（关单也锁余额行）。
+    lock_pool(execution, reservation.pool_id)
+    closed_here = decision is CommitDecision.EXPIRE_THEN_LATE
+    if closed_here:
+        reservation_id = reservation.reservation_id
+        if not close_if_due(connection, tenant_id, reservation_id):
+            raise RuntimeError(f"reservation {reservation_id} was due but not closed")
+        closed = read_reservation(connection, tenant_id, reservation_id)
+        if closed is None:
+            raise RuntimeError(f"reservation {reservation_id} is not in the tenant")
+        reservation = closed
+    return _late_commit(execution, reservation, lines, commit, now, closed_here=closed_here)

@@ -2,7 +2,7 @@
 
 在真 MySQL 上跑；每个测试建自己的租户、池、销售入口与凭据，池先切到 live，
 预留经接口建立；到期关单、待审、结案与 SKU 合并的改挂由测试直接改库模拟（自己提交的连接）。
-晚到确认与故障补交新建尚未实现，这里只验证它们返回 503、什么也不保存。
+晚到确认见 test_sale_commit_late_api.py。故障补交新建尚未实现，这里只验证它返回 503、什么也不保存。
 """
 
 from collections.abc import Iterator
@@ -15,7 +15,6 @@ from sqlalchemy import Engine, update
 
 from app.models.inventory import StockBalance
 from app.models.orders import OrderLine, Reservation
-from app.services import reservations as reservation_service
 from app.services.stock import format_timestamp
 from tests.integration.test_api_auth import Caller, error_of, events
 from tests.integration.test_idempotency import add_skus, records, rid_of
@@ -31,7 +30,6 @@ from tests.integration.test_reservations_api import (
     make_client,
     new_ref,
     rows_of,
-    shift_into_the_past,
     stock,
 )
 from tests.integration.test_stock_imports_api import merge
@@ -451,28 +449,6 @@ def test_a_credential_without_a_sales_channel_is_forbidden(client, engine, calle
 
 
 # --- 尚未实现的分支 ---
-
-
-def test_committing_an_expired_reservation_is_unavailable_and_saves_nothing(client, engine, caller):
-    created, (sku,) = reserved_order(client, engine, caller, [2])
-    reservation_id = created["reservation_id"]
-    shift_into_the_past(engine, reservation_id)
-    with engine.begin() as db:
-        assert reservation_service.close_if_due(db, caller.tenant_id, reservation_id)
-    before = entries(engine, caller)
-    key = new_key()
-
-    response = commit(client, caller, created["order_ref"], commit_body(created), key)
-    error = error_of(response, 503)
-    assert error["code"] == "UNAVAILABLE"
-    assert error["retryable"] is True
-    assert records(engine, caller, key, SALE_COMMITS_CREATE) == []
-    assert sale_commits(engine, caller) == []
-    assert entries(engine, caller) == before
-    stored = stored_reservation(engine, caller, reservation_id)
-    assert stored["status"] == "expired"
-    assert stored["payment_ref"] is None
-    assert quantities_of(engine, caller, sku) == (5, 0, 0, 0)
 
 
 def test_a_fault_mode_commit_without_a_reservation_is_unavailable_and_saves_nothing(
