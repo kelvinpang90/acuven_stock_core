@@ -48,6 +48,12 @@ RESERVATION_KEYS = {
     "created_at",
     "released_at",
     "release_reason",
+    "payment_ref",
+    "paid_at",
+    "committed_at",
+    "late",
+    "fault_mode",
+    "review_closed_at",
     "lines",
 }
 
