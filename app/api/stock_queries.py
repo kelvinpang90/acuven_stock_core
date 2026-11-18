@@ -1,9 +1,10 @@
-"""池、余额与流水的查询接口。
+"""池、余额、流水与可售量的查询接口。
 
-契约 §6.2 第 1 条、§6.3 池的查询、§6.8、§7.2。三个接口都要求 stock.read、不要求角色，
-不做池授权，只限定在本租户；带了操作者头照样校验格式（authorize 里做）。
+契约 §5.6 可售量、§6.2 第 1 条、§6.3 池的查询、§6.8、§7.2、§10 第 4 条。四个接口都要求 stock.read、
+不要求角色；带了操作者头照样校验格式（authorize 里做）。池、余额与流水不做池授权，只限定在本租户；
+可售量是例外，池取凭据的销售入口，没有（有效的）入口 403 并记 forbidden。
 查询参数先校验（不合规 422），再查池与 SKU：路径或必填参数指向的池、SKU 不存在与属于别的租户
-同一个 404，后者记 cross_tenant。余额里查不到的 SKU 不出现、不报错、不记事件。
+同一个 404，后者记 cross_tenant。余额与可售量里查不到的 SKU 不出现、不报错、不记事件。
 查库在 app/services/stock_queries.py。
 """
 
@@ -15,11 +16,18 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.auth import POOL_NOT_FOUND, authorize, cross_tenant_not_found, get_access
+from app.api.auth import (
+    POOL_NOT_FOUND,
+    authorize,
+    cross_tenant_not_found,
+    get_access,
+    require_sales_pool,
+)
 from app.api.errors import ApiError, invalid_request, ok
 from app.api.requests import discard_connection, request_connection, unavailable
-from app.domain.catalog import AFTER, LIMIT, InvalidParameter
+from app.domain.catalog import ACTIVE, AFTER, LIMIT, InvalidParameter
 from app.domain.quantities import Quantities
+from app.domain.reservations import MERGED, availability_status
 from app.domain.service_auth import STOCK_READ
 from app.domain.stock import (
     FROM,
@@ -33,13 +41,14 @@ from app.domain.stock import (
 )
 from app.services import catalog, stock_queries
 from app.services.stock import SKU, SKU_NOT_FOUND, entry_representation, format_timestamp
-from app.services.stock_queries import BalanceRecord, PoolRecord
+from app.services.stock_queries import AvailabilityRecord, BalanceRecord, PoolRecord
 
 POOL = "pool"
 POOL_ID = "pool_id"
 SKU_ID = "sku_id"
 
 BALANCE_PARAMETERS = (POOL_ID, SKU_IDS)
+AVAILABILITY_PARAMETERS = (SKU_IDS,)
 LEDGER_REQUIRED = (POOL_ID, SKU_ID)
 LEDGER_OPTIONAL = (FROM, TO, AFTER, LIMIT)
 
@@ -162,6 +171,24 @@ def balance_representation(balance: BalanceRecord) -> dict:
     }
 
 
+def availability_representation(record: AvailabilityRecord) -> dict:
+    """available 与状态（§5.6 可售量）；merged_into_sku_id 只在 merged 时有值。"""
+    quantities = Quantities(
+        record.stock_balance, record.reserved, record.unavailable, record.paid_pending_dispatch
+    )
+    status = availability_status(
+        record.merged_into_sku_id,
+        sku_active=record.sku_status == ACTIVE,
+        product_active=record.product_status == ACTIVE,
+    )
+    return {
+        "sku_id": record.sku_id,
+        "available": quantities.available,
+        "status": status,
+        "merged_into_sku_id": record.merged_into_sku_id if status == MERGED else None,
+    }
+
+
 # --- 接口 ---
 
 
@@ -198,6 +225,39 @@ def list_balances(request: Request) -> JSONResponse:
         lambda connection: stock_queries.read_balances(connection, tenant_id, pool_id, sku_ids),
     )
     return ok(request, {"balances": [balance_representation(b) for b in balances]})
+
+
+@router.get("/v1/availability", dependencies=_READ)
+def get_availability(request: Request) -> JSONResponse:
+    """池取凭据的销售入口；skus 按 sku_id 升序、不分页，还没有余额行的 available 为 0。
+
+    参数校验（§8.1 第 7 步）在销售入口的判定（第 9 步）之前。只做普通读，不加锁。
+    """
+    tenant_id = _tenant_id(request)
+    values = _parameters(request, AVAILABILITY_PARAMETERS)
+    try:
+        sku_ids = parse_sku_ids(values[SKU_IDS])
+    except InvalidParameter as error:
+        raise _invalid_parameter(error) from None
+    pool_id = require_sales_pool(request)
+
+    def lookup(connection: Connection) -> tuple[PoolRecord | None, list[AvailabilityRecord]]:
+        pool = stock_queries.read_pool(connection, tenant_id, pool_id)
+        records = stock_queries.read_availability(connection, tenant_id, pool_id, sku_ids)
+        return pool, records
+
+    pool, records = _read(request, lookup)
+    if pool is None:
+        # 销售入口绑定的池由复合外键保证属于本租户，不会查不到。
+        raise RuntimeError(f"the sales channel's pool {pool_id} is missing")
+    return ok(
+        request,
+        {
+            "pool_id": pool.pool_id,
+            "pool_status": pool.status,
+            "skus": [availability_representation(record) for record in records],
+        },
+    )
 
 
 @router.get("/v1/ledger", dependencies=_READ)

@@ -1,6 +1,6 @@
-"""池、余额与流水查询的数据库读取（契约 §6.2 第 1 条、§6.3 池的查询、§6.8）。
+"""池、余额、流水与可售量查询的数据库读取（契约 §5.6 可售量、§6.2 第 1 条、§6.3 池的查询、§6.8）。
 
-read_* 都按租户过滤，不管事务：调用方在自己的连接上读完再结束事务。
+read_* 都按租户过滤，不管事务：调用方在自己的连接上读完再结束事务；都是普通读，不加锁。
 pool_owner 不按租户过滤，只在按 ID 找不到时用来区分不存在与属于别的租户
 （后者记 cross_tenant，§7.2）；SKU 的归属用 app/services/catalog.py 的 sku_owner。
 """
@@ -12,7 +12,7 @@ from typing import Any
 
 from sqlalchemy import Connection, and_, select
 
-from app.models.catalog import Sku
+from app.models.catalog import Product, Sku
 from app.models.inventory import QUANTITIES, LedgerEntry, StockBalance, StockPool
 
 
@@ -39,6 +39,20 @@ class BalanceRecord:
     paid_pending_dispatch: int
     balance_version: int
     merged_into_sku_id: str | None
+
+
+@dataclass(frozen=True)
+class AvailabilityRecord:
+    """一个 SKU 在池里的可售量所需的字段；还没有余额行时四个量都为 0。"""
+
+    sku_id: str
+    stock_balance: int
+    reserved: int
+    unavailable: int
+    paid_pending_dispatch: int
+    merged_into_sku_id: str | None
+    sku_status: str
+    product_status: str
 
 
 def pool_owner(connection: Connection, pool_id: str) -> str | None:
@@ -95,6 +109,51 @@ def read_balances(
             **{name: row[name] or 0 for name in QUANTITIES},
             balance_version=row["balance_version"] or 0,
             merged_into_sku_id=row["merged_into_sku_id"],
+        )
+        for row in connection.execute(statement).mappings()
+    ]
+
+
+def read_availability(
+    connection: Connection, tenant_id: str, pool_id: str, sku_ids: Collection[str]
+) -> list[AvailabilityRecord]:
+    """sku_ids 里属于本租户的 SKU 在这个池的可售量所需的字段，按 sku_id 升序。
+
+    不存在或属于别的租户的 SKU 不出现；已合并、停用的照常出现。池取自凭据的销售入口。
+    """
+    if not sku_ids:
+        return []
+    statement = (
+        select(
+            Sku.sku_id,
+            Sku.merged_into_sku_id,
+            Sku.status.label("sku_status"),
+            Product.status.label("product_status"),
+            *(getattr(StockBalance, name) for name in QUANTITIES),
+        )
+        .select_from(Sku)
+        .join(
+            Product,
+            and_(Product.tenant_id == Sku.tenant_id, Product.product_id == Sku.product_id),
+        )
+        .outerjoin(
+            StockBalance,
+            and_(
+                StockBalance.tenant_id == Sku.tenant_id,
+                StockBalance.pool_id == pool_id,
+                StockBalance.sku_id == Sku.sku_id,
+            ),
+        )
+        .where(Sku.tenant_id == tenant_id, Sku.sku_id.in_(list(sku_ids)))
+        .order_by(Sku.sku_id)
+    )
+    return [
+        AvailabilityRecord(
+            sku_id=row["sku_id"],
+            **{name: row[name] or 0 for name in QUANTITIES},
+            merged_into_sku_id=row["merged_into_sku_id"],
+            sku_status=row["sku_status"],
+            product_status=row["product_status"],
         )
         for row in connection.execute(statement).mappings()
     ]
