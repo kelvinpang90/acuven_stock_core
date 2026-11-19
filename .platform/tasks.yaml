@@ -2360,7 +2360,7 @@ tasks:
       函数按契约 4.4 逐项比对，产出违反项（形状照契约 4.4 的响应：前三项带 pool_id、sku_id、expected、actual，ledger_totals 的两个对象用契约写的键名；第 4 项带 reservation_id、order_ref、status、按 line_ref 升序的 line_refs）；
       汇总函数按 check 编号、再按 pool_id 与 sku_id 或 reservation_id 升序排，返回总数与至多 100 项。
       明确不做：数据库查询、接口、迁移（CORE-TASK-055 起）；SKU 合并改挂的检查（契约 4.4 写明登记 SKU 合并时再加）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 函数与常量在 app/domain/reconciliation.py 与 app/domain/invariants.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_reconciliation.py 与 tests/unit/test_invariants.py，用 unittest
