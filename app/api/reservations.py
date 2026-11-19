@@ -15,6 +15,9 @@ line_ref 或 sku_id 重复在第 7 步 422。
 都不保存）。正文只有 reason（三个取值之一），其他 422。不预建余额行（预留时已建好）。
 两个查询要求 orders.read、不要求角色：按 ID 查只限定在本租户；按 order_ref 查按凭据的销售入口。
 查库与写库在 app/services/reservations.py。
+GET /v1/reservations 也是待审列表（§5.9）：order_ref 与 status 必须且只能带一个；
+带 status 时只收 status、after、limit，按凭据的销售入口、reservation_id 升序分页，
+读库在 app/services/reconciliation.py。
 """
 
 import logging
@@ -43,12 +46,21 @@ from app.api.requests import (
     request_connection,
     unavailable,
 )
-from app.domain.catalog import InvalidField
+from app.api.stock_queries import _invalid_parameter, _parameters
+from app.domain.catalog import AFTER, LIMIT, InvalidField, InvalidParameter
+from app.domain.reconciliation import (
+    STATUS,
+    format_review_cursor,
+    match_review_cursor,
+    parse_page_limit,
+    parse_review_cursor,
+    parse_review_status,
+)
 from app.domain.requests import is_reference
 from app.domain.reservations import RELEASE_REASONS
 from app.domain.service_auth import ORDERS_READ, ORDERS_WRITE
 from app.domain.stock import parse_positive_quantity
-from app.services import reservations
+from app.services import reconciliation, reservations
 from app.services.idempotency import CommandResult, Execution, run_idempotent
 from app.services.reservations import RESERVATION, RESERVATION_NOT_FOUND, ReservationLine
 
@@ -57,6 +69,7 @@ RESERVATIONS_RELEASE = "reservations.release"
 
 ORDER_REF = "order_ref"
 LINES = "lines"
+REVIEW_LIST_OPTIONAL = (AFTER, LIMIT)
 
 _log = logging.getLogger("app.api")
 
@@ -271,6 +284,16 @@ def _order_ref_parameter(request: Request) -> str:
 
 @router.get("/v1/reservations", dependencies=_READ)
 def list_reservations(request: Request) -> JSONResponse:
+    """order_ref 与 status 必须且只能带一个（§5.9）；不带 status 时照 §5.6 的 order_ref 查询。"""
+    names = {name for name, _ in request.query_params.multi_items()}
+    if STATUS in names:
+        if ORDER_REF in names:
+            raise invalid_request("give exactly one of order_ref and status")
+        return _list_by_status(request)
+    return _list_by_order_ref(request)
+
+
+def _list_by_order_ref(request: Request) -> JSONResponse:
     """按凭据的销售入口查，reservations 为 0 或 1 个。
 
     凭据没有销售入口或入口已停用时它不可能有自己的 order_ref，返回空数组。
@@ -289,3 +312,34 @@ def list_reservations(request: Request) -> JSONResponse:
         return [reservations.current_representation(connection, principal.tenant_id, found)]
 
     return ok(request, {"reservations": _read(request, lookup)})
+
+
+def _list_by_status(request: Request) -> JSONResponse:
+    """待审列表：只收 status、after、limit，各最多一次（规则同流水查询）。
+
+    判定顺序：status、limit、游标的格式不对 422，再游标与 status 不符 422；
+    凭据没有销售入口或入口已停用时在这之后返回空数组。普通读，不加锁。
+    next_cursor 为本页最后一个的游标；没有新记录时原样返回请求里的 after，没带则为 null。
+    """
+    values = _parameters(request, (STATUS,), REVIEW_LIST_OPTIONAL)
+    after = values.get(AFTER)
+    try:
+        status = parse_review_status(values[STATUS])
+        limit = parse_page_limit(values.get(LIMIT))
+        cursor = match_review_cursor(parse_review_cursor(after), status)
+    except InvalidParameter as error:
+        raise _invalid_parameter(error) from None
+    principal = get_access(request).principal
+    if principal.channel_id is None:
+        return ok(request, {"reservations": [], "next_cursor": after})
+
+    found = _read(
+        request,
+        lambda connection: reconciliation.read_review_reservations(
+            connection, principal.tenant_id, principal.channel_id, status, cursor, limit
+        ),
+    )
+    next_cursor = after
+    if found:
+        next_cursor = format_review_cursor(found[-1]["reservation_id"], status)
+    return ok(request, {"reservations": found, "next_cursor": next_cursor})
