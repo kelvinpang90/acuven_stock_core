@@ -10,37 +10,56 @@
 按 parse_return_quantities 校验（各 0–1,000,000 的 JSON 整数，和至少 1）。
 池是凭据销售入口绑定的池：凭据没有销售入口或入口已停用 403（第 9 步，不保存）。
 判定与写库在 app/services/fulfilment.py（退货验收为 create_return_receipt）。
+
+订单库存查询 GET /v1/orders/{order_ref}/stock 要求 orders.read、不要求角色，不经幂等执行器。
+查询参数只收 after 与 limit，各最多一次（规则同流水查询）。判定顺序：路径 order_ref、limit、
+after 的格式不对 422；凭据没有销售入口或查不到预留 404 RESERVATION_NOT_FOUND（不记事件）；
+游标不属于本订单 422。读库在 app/services/fulfilment.py 的 read_order_stock。
 """
 
+import logging
 from collections.abc import Callable, Sequence
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import Field, field_validator, model_validator
+from sqlalchemy import Connection
+from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.auth import authorize, require_sales_pool
-from app.api.errors import invalid_request
-from app.api.requests import ParsedBody, RequestBody, json_body
-from app.domain.catalog import InvalidField
+from app.api.auth import authorize, get_access, require_sales_pool
+from app.api.errors import ApiError, invalid_request, ok
+from app.api.requests import (
+    ParsedBody,
+    RequestBody,
+    discard_connection,
+    json_body,
+    request_connection,
+    unavailable,
+)
+from app.api.stock_queries import _invalid_parameter, _parameters
+from app.domain.catalog import AFTER, LIMIT, InvalidField, InvalidParameter
 from app.domain.fulfilment import (
     DISPATCH,
     REFUND_RESTOCK,
     QuantityLine,
     ReturnLine,
+    parse_order_stock_cursor,
     parse_return_quantities,
 )
 from app.domain.requests import is_reference
-from app.domain.service_auth import ORDERS_WRITE
+from app.domain.service_auth import ORDERS_READ, ORDERS_WRITE
 from app.domain.stock import (
     normalize_note,
     normalize_reason_code,
+    parse_ledger_limit,
     parse_occurred_at,
     parse_positive_quantity,
 )
 from app.services import fulfilment
 from app.services.fulfilment import CommonFields
 from app.services.idempotency import CommandResult, Execution, run_idempotent
+from app.services.reservations import RESERVATION_NOT_FOUND
 
 DISPATCHES_CREATE = "dispatches.create"
 REFUND_RESTOCKS_CREATE = "refund_restocks.create"
@@ -48,13 +67,17 @@ RETURN_RECEIPTS_CREATE = "return_receipts.create"
 
 ORDER_REF = "order_ref"
 LINES = "lines"
+ORDER_STOCK_PARAMETERS = (AFTER, LIMIT)
 
 # 一条订单单据命令：(execution, order_ref, 单据引用, lines, 公共字段)。
 Create = Callable[
     [Execution, str, str, Sequence[QuantityLine | ReturnLine], CommonFields], CommandResult
 ]
 
+_log = logging.getLogger("app.api")
+
 router = APIRouter()
+_READ = [Depends(authorize(ORDERS_READ))]
 _WRITE = [Depends(authorize(ORDERS_WRITE, write=True))]
 
 
@@ -289,3 +312,59 @@ def create_return_receipt(
     return_ref = body.model.return_ref
     create = fulfilment.create_return_receipt
     return _run(request, RETURN_RECEIPTS_CREATE, body, create, order_ref, return_ref)
+
+
+# --- 订单库存查询 ---
+
+
+def _read[T](request: Request, query: Callable[[Connection], T]) -> T:
+    """用本请求的连接读，读完（也包括查询报 404、422）回滚结束事务；数据库出错 503。"""
+    connection = request_connection(request)
+    try:
+        try:
+            return query(connection)
+        finally:
+            connection.rollback()
+    except SQLAlchemyError:
+        _log.warning(
+            "database error during an order stock read (request_id=%s)",
+            request.state.request_id,
+            exc_info=True,
+        )
+        discard_connection(request)
+        raise unavailable() from None
+
+
+@router.get("/v1/orders/{order_ref}/stock", dependencies=_READ)
+def get_order_stock(
+    request: Request,
+    order_ref: Annotated[str, Depends(_path_order_ref)],
+) -> JSONResponse:
+    """预留、每行累计量与按 document_seq 分页的单据；三部分出自同一个读快照。
+
+    next_cursor 为本页最后一张单据的游标；没有新单据时原样返回请求里的 after，没带则为 null。
+    """
+    values = _parameters(request, (), ORDER_STOCK_PARAMETERS)
+    after = values.get(AFTER)
+    try:
+        limit = parse_ledger_limit(values.get(LIMIT))
+        cursor = None if after is None else parse_order_stock_cursor(after)
+    except InvalidParameter as error:
+        raise _invalid_parameter(error) from None
+    principal = get_access(request).principal
+    if principal.channel_id is None:
+        # 查找限定在本入口：没有入口就没有自己的订单（不记事件）。
+        raise ApiError(404, RESERVATION_NOT_FOUND, "reservation not found")
+    data = _read(
+        request,
+        lambda connection: fulfilment.read_order_stock(
+            connection,
+            principal.tenant_id,
+            principal.channel_id,
+            order_ref,
+            after,
+            cursor,
+            limit,
+        ),
+    )
+    return ok(request, data)
