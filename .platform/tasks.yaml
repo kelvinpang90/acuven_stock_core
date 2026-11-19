@@ -2285,7 +2285,7 @@ tasks:
       三，表示：lines 每行 line_ref、sku_id、sellable_quantity、unsellable_quantity、sellable_entry_id、unsellable_entry_id（对应的数为 0 时为 null），其余字段同 CORE-TASK-051。
       四，集成测试另放 tests/integration/test_return_receipts_api.py；若 CORE-TASK-051 的测试辅助函数需要共用，只为共用把它们提到 tests/integration/conftest.py，原测试的断言不动。
       明确不做：退货后的不可售件恢复或报损（走已有的不可售调整命令）；订单库存查询（CORE-TASK-053）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-051
     acceptance_criteria:
