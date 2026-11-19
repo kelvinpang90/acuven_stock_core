@@ -2473,7 +2473,7 @@ tasks:
       三，响应 200（查出违反也是 200）：checked_at、ok、violation_count、violations（至多 100 项），形状照契约 4.4。
       四，每次自查在进程日志写一行，带租户、用时与违反项数，不写违反项的内容。
       明确不做：定时调用与告警（契约 4.4 写明属于 OPS-04 的监控，另行登记）；任何自动修复；SKU 合并改挂的检查。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-054
     acceptance_criteria:
