@@ -3,10 +3,11 @@
 
 在真 MySQL 上跑；每个测试建自己的租户、池、销售入口与凭据，池先切到 live，
 预留、确认销售、发货与退款回库经接口建立；预留的其他状态由测试直接改库模拟。
-请求与观察的辅助函数沿用 test_fulfilment_api.py。
+与发货、退款回库共用的请求与观察辅助函数在 conftest.py。
 """
 
 from collections.abc import Iterator
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,12 +15,9 @@ from sqlalchemy import Engine
 
 from app.models.orders import OrderLine
 from app.services.stock import format_timestamp
-from tests.integration.test_api_auth import Caller, error_of, events
-from tests.integration.test_fulfilment_api import (
+from tests.integration.conftest import (
     COMMON_KEYS,
     DISPATCHES,
-    OCCURRED_AT,
-    OCCURRED_AT_UTC,
     REFUND_RESTOCKS,
     body_of,
     committed_order,
@@ -31,6 +29,7 @@ from tests.integration.test_fulfilment_api import (
     qline,
     snapshot,
 )
+from tests.integration.test_api_auth import Caller, error_of, events
 from tests.integration.test_idempotency import records, rid_of
 from tests.integration.test_reservation_release_api import reserved_order
 from tests.integration.test_reservations_api import (
@@ -52,6 +51,9 @@ from tests.integration.test_stock_service import entries, quantities_of
 RETURN_RECEIPTS_CREATE = "return_receipts.create"
 RETURN_RECEIPTS = "return-receipts"
 RETURN_TYPES = ("RETURN_SELLABLE", "RETURN_UNSELLABLE")
+# 东八区的 9 点，即 UTC 的 1 点。
+OCCURRED_AT = "2026-11-19T09:00:00+08:00"
+OCCURRED_AT_UTC = datetime(2026, 11, 19, 1, 0, 0)
 
 
 @pytest.fixture

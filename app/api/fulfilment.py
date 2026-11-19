@@ -9,9 +9,10 @@
 退货验收每行 line_ref、sellable_quantity 与 unsellable_quantity，两个数都必填，
 按 parse_return_quantities 校验（各 0–1,000,000 的 JSON 整数，和至少 1）。
 池是凭据销售入口绑定的池：凭据没有销售入口或入口已停用 403（第 9 步，不保存）。
-判定与写库在 app/services/fulfilment.py。
+判定与写库在 app/services/fulfilment.py（退货验收为 create_return_receipt）。
 """
 
+from collections.abc import Callable, Sequence
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
@@ -25,7 +26,6 @@ from app.domain.catalog import InvalidField
 from app.domain.fulfilment import (
     DISPATCH,
     REFUND_RESTOCK,
-    RETURN_RECEIPT,
     QuantityLine,
     ReturnLine,
     parse_return_quantities,
@@ -48,6 +48,11 @@ RETURN_RECEIPTS_CREATE = "return_receipts.create"
 
 ORDER_REF = "order_ref"
 LINES = "lines"
+
+# 一条订单单据命令：(execution, order_ref, 单据引用, lines, 公共字段)。
+Create = Callable[
+    [Execution, str, str, Sequence[QuantityLine | ReturnLine], CommonFields], CommandResult
+]
 
 router = APIRouter()
 _WRITE = [Depends(authorize(ORDERS_WRITE, write=True))]
@@ -199,11 +204,28 @@ def _path_order_ref(order_ref: str) -> str:
     return order_ref
 
 
+def _create_document(document_type: str) -> Create:
+    """发货与退款回库：按单据类型走 create_document。"""
+
+    def create(
+        execution: Execution,
+        order_ref: str,
+        document_ref: str,
+        lines: Sequence[QuantityLine | ReturnLine],
+        fields: CommonFields,
+    ) -> CommandResult:
+        return fulfilment.create_document(
+            execution, document_type, order_ref, document_ref, lines, fields
+        )
+
+    return create
+
+
 def _run(
     request: Request,
     operation: str,
     body: ParsedBody[_Common],
-    document_type: str,
+    create: Create,
     order_ref: str,
     document_ref: str,
 ) -> Response:
@@ -213,9 +235,7 @@ def _run(
     fields = body.model.common_fields()
 
     def command(execution: Execution) -> CommandResult:
-        return fulfilment.create_document(
-            execution, document_type, order_ref, document_ref, lines, fields
-        )
+        return create(execution, order_ref, document_ref, lines, fields)
 
     return run_idempotent(
         request,
@@ -237,7 +257,8 @@ def create_dispatch(
     pool_id: Annotated[str, Depends(require_sales_pool)],
 ) -> Response:
     shipment_ref = body.model.shipment_ref
-    return _run(request, DISPATCHES_CREATE, body, DISPATCH, order_ref, shipment_ref)
+    create = _create_document(DISPATCH)
+    return _run(request, DISPATCHES_CREATE, body, create, order_ref, shipment_ref)
 
 
 # --- 退款回库 ---
@@ -251,7 +272,8 @@ def create_refund_restock(
     pool_id: Annotated[str, Depends(require_sales_pool)],
 ) -> Response:
     refund_ref = body.model.refund_ref
-    return _run(request, REFUND_RESTOCKS_CREATE, body, REFUND_RESTOCK, order_ref, refund_ref)
+    create = _create_document(REFUND_RESTOCK)
+    return _run(request, REFUND_RESTOCKS_CREATE, body, create, order_ref, refund_ref)
 
 
 # --- 退货验收 ---
@@ -265,4 +287,5 @@ def create_return_receipt(
     pool_id: Annotated[str, Depends(require_sales_pool)],
 ) -> Response:
     return_ref = body.model.return_ref
-    return _run(request, RETURN_RECEIPTS_CREATE, body, RETURN_RECEIPT, order_ref, return_ref)
+    create = fulfilment.create_return_receipt
+    return _run(request, RETURN_RECEIPTS_CREATE, body, create, order_ref, return_ref)
