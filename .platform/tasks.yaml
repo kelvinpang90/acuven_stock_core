@@ -2393,6 +2393,8 @@ tasks:
       二，设它的事务（契约 5.9 列出的全部）：预留新建（等于 created_at）、释放、到期关单（定时任务、新预留之前、确认销售之前、释放命中已到期，各条路径都算）、确认销售（正常与晚到）、第一次转入待审、故障补交新建、待审结案，
       在 app/services/reservations.py 与 app/services/sale_commits.py 里写预留行的同一条 UPDATE 或 INSERT 里带上；发货、退款回库、退货验收在 app/services/fulfilment.py 里，写单据的同一事务里对预留行加一条 UPDATE，取本命令的时间。
       一个事务为写库取了不止一次数据库时间时，用写库用到的最晚一次；只为生成响应而取的时间不算。
+      事务改了预留或订单行、却没有写任何时间列的（例如已到期、已关单的预留第一次转入待审，只写 payment_ref、paid_at 与确认的各列），取本命令的时间（app/services/stock.py 的 command_now）；
+      paid_at 是调用方给的业务时间，任何情况下都不用它。
       三，不改任何列的路径不设：幂等重放与换键重报返回已有结果、对已 released 或 expired 的再释放、待审重试仍不够、对已 closed_refunded 的再结案。
       四，last_changed_at 不进预留的表示，现有接口的响应不变。
       明确不做：对账查询与待审列表接口（CORE-TASK-056）；不变量自查（CORE-TASK-057）；SKU 合并改挂时设它（登记 SKU 合并时做）。
@@ -2402,7 +2404,7 @@ tasks:
       - 迁移文件为 alembic/versions/20261119_0010_reservation_last_changed_at.py，down_revision 为 0009；模型在 app/models/orders.py；upgrade 后 alembic check 无差异，downgrade 再 upgrade 照常（由 CI 的 integration 执行）；已有的集成测试照常通过，现有接口的响应体不变
       - 集成测试验证回填：在 0009 的结构上造 active、released、committed、带单据的 committed、closed_refunded 几种预留，upgrade 到 0010 后各自的 last_changed_at 等于契约写的那几个时间列与单据时间中最大的一个
       - 集成测试验证新建：预留新建后 last_changed_at 等于 created_at；故障补交新建的预留同样设上
-      - 集成测试验证状态变化：释放、定时任务到期关单、释放命中已到期、确认销售、晚到确认、转入待审、待审结案之后，last_changed_at 都变大，且等于该事务写进预留的最晚的时间列
+      - 集成测试验证状态变化：释放、定时任务到期关单、释放命中已到期、确认销售、晚到确认、转入待审、待审结案之后，last_changed_at 都变大，且等于该事务写进预留的最晚的时间列；已关单的预留第一次转入待审（不写时间列）时等于本命令的时间、不早于转入之前的值，也不取 paid_at（paid_at 给一个未来的时间验证）
       - 集成测试验证付款后命令：发货、退款回库、退货验收之后 last_changed_at 变大，且等于该单据的 created_at
       - 集成测试验证不设的路径：同键重放、换键同内容重报、再释放已释放的、待审重试仍不够、再结案已结案的之后，last_changed_at 不变
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
