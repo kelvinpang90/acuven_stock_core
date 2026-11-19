@@ -2399,7 +2399,7 @@ tasks:
       三，不改任何列的路径不设：幂等重放与换键重报返回已有结果、对已 released 或 expired 的再释放、待审重试仍不够、对已 closed_refunded 的再结案。
       四，last_changed_at 不进预留的表示，现有接口的响应不变。
       明确不做：对账查询与待审列表接口（CORE-TASK-056）；不变量自查（CORE-TASK-057）；SKU 合并改挂时设它（登记 SKU 合并时做）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 迁移文件为 alembic/versions/20261119_0010_reservation_last_changed_at.py，down_revision 为 0009；模型在 app/models/orders.py；upgrade 后 alembic check 无差异，downgrade 再 upgrade 照常（由 CI 的 integration 执行）；已有的集成测试照常通过，现有接口的响应体不变
