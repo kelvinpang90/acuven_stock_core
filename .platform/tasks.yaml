@@ -2436,7 +2436,7 @@ tasks:
       带 status 时只收 status、after、limit，status 只接受 late_payment_review；只列凭据销售入口的预留，按 reservation_id 升序键集分页，返回 reservations（现有表示）与 next_cursor；
       凭据没有销售入口时在各种 422 之后返回空数组，next_cursor 照契约 2.5（原样返回 after，没带为 null）。查询函数放 app/services/reconciliation.py，不改 app/services/reservations.py。
       明确不做：不变量自查（CORE-TASK-057）；网店侧的对账与待办；改预留的表示。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-054
       - CORE-TASK-055
