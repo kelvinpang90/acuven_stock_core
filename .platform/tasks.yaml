@@ -2352,7 +2352,8 @@ tasks:
       另一个函数按契约的判定顺序判窗口：changed_from 不早于 changed_to 为一种错误，changed_to 晚于给定的数据库时间减 300 秒为另一种错误，并给出这一刻允许的最晚终点（300 秒写成模块常量）；
       对账游标的生成、解析与匹配：v1、last_changed_at 的 UTC 微秒时间戳十进制、reservation_id、窗口摘要四段以点连接，窗口摘要为规范化后的两个时间以换行符连接，取 SHA-256 小写十六进制的前 16 个字符；
       待审列表游标的生成、解析与匹配：v1、reservation_id、status 摘要三段；待审列表唯一接受的状态值 late_payment_review 写成常量。
-      格式不对一律抛 ValueError，调用方据此回 422。
+      格式不对抛 app/domain/catalog.py 的 InvalidParameter（带参数名，与现有查询参数的解析一致），调用方据此回 422；两个时间的格式用 app/domain/stock.py 公开的 parse_occurred_at 判（它抛的 InvalidField 换成带参数名的 InvalidParameter），不引用私有函数；
+      窗口顺序错误照 parse_ledger_range 按 changed_from 报 InvalidParameter，终点太晚抛一个带允许的最晚终点的专用异常（也是 ValueError 的子类）。
       二，app/domain/invariants.py：四个检查名常量（ledger_totals、reserved_vs_orders、pending_dispatch_vs_orders、order_commit_state）；
       输入用不可变的数据类：余额行（pool_id、sku_id、四个量、balance_version）、流水合计（四个量之和、流水条数、最大 balance_version_after，没有流水为全 0）、
       订单合计（active 预留订单行的 quantity 之和、全部订单行未发未回库件数之和）、一个预留及其订单行（reservation_id、order_ref、status、每行 line_ref、quantity、committed_qty）；
@@ -2363,9 +2364,9 @@ tasks:
     depends_on: []
     acceptance_criteria:
       - 函数与常量在 app/domain/reconciliation.py 与 app/domain/invariants.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_reconciliation.py 与 tests/unit/test_invariants.py，用 unittest
-      - 单元测试验证窗口时间解析：带时区的时间规范化成 UTC，恰为 2000-01-01T00:00:00Z 放行、早一微秒拒绝；缺少、无时区、格式不对都抛 ValueError
+      - 单元测试验证窗口时间解析：带时区的时间规范化成 UTC，恰为 2000-01-01T00:00:00Z 放行、早一微秒拒绝；缺少、无时区、格式不对都抛 InvalidParameter 且参数名是出错的那一个
       - 单元测试验证窗口判定：changed_from 等于或晚于 changed_to 报顺序错误；changed_to 恰为数据库时间减 300 秒放行、晚一微秒报终点太晚并给出允许的最晚终点；两种错误同时存在时先报顺序错误
-      - 单元测试验证游标：对账游标生成后解析得回原时间、reservation_id 与摘要，同一窗口匹配、换一个时间不匹配；前缀错、段数不对、时间戳非数字或有前导零、摘要长度或大小写不对都抛 ValueError；待审列表游标同样验证往返、匹配与这些格式错误
+      - 单元测试验证游标：对账游标生成后解析得回原时间、reservation_id 与摘要，同一窗口匹配、换一个时间不匹配；前缀错、段数不对、时间戳非数字或有前导零、reservation_id 段为空或不是预留 ID 的形状（rsv 前缀加下划线加 26 个 Crockford Base32 大写字符）、摘要长度或大小写不对都抛 InvalidParameter；待审列表游标同样验证往返、匹配与这些格式错误
       - 单元测试验证 ledger_totals：余额与流水合计一致不报；任一个量不等、流水条数或最大 balance_version_after 不等于 balance_version 各报一项，expected 与 actual 的键名照契约 4.4；没有流水、四个量为 0、版本 0 的行不报
       - 单元测试验证另三项：reserved_vs_orders 与 pending_dispatch_vs_orders 相等不报，不等报一项且 expected 为订单合计、actual 为余额行上的值；order_commit_state 在 committed 全部行确认时不报、有一行 committed_qty 为 0 时报出该行，非 committed 有一行 committed_qty 不为 0 时报出
       - 单元测试验证汇总：违反项按 check 编号再按 pool_id、sku_id 或 reservation_id 升序；超过 100 项时只返回前 100 项而总数照实；没有违反时总数为 0
@@ -2402,9 +2403,9 @@ tasks:
     depends_on: []
     acceptance_criteria:
       - 迁移文件为 alembic/versions/20261119_0010_reservation_last_changed_at.py，down_revision 为 0009；模型在 app/models/orders.py；upgrade 后 alembic check 无差异，downgrade 再 upgrade 照常（由 CI 的 integration 执行）；已有的集成测试照常通过，现有接口的响应体不变
-      - 集成测试验证回填：在 0009 的结构上造 active、released、committed、带单据的 committed、closed_refunded 几种预留，upgrade 到 0010 后各自的 last_changed_at 等于契约写的那几个时间列与单据时间中最大的一个
+      - 集成测试验证回填：在 0009 的结构上造 active、released、committed、带单据的 committed、closed_refunded 几种预留，upgrade 到 0010 后各自的 last_changed_at 等于契约写的那几个时间列与单据时间中最大的一个；降到 0009 照 tests/integration/test_demo_reset_schema.py 的先例在 production 测试库上做，无论成败都在 finally 里升回 head，不动共享的 demo 库
       - 集成测试验证新建：预留新建后 last_changed_at 等于 created_at；故障补交新建的预留同样设上
-      - 集成测试验证状态变化：释放、定时任务到期关单、释放命中已到期、确认销售、晚到确认、转入待审、待审结案之后，last_changed_at 都变大，且等于该事务写进预留的最晚的时间列；已关单的预留第一次转入待审（不写时间列）时等于本命令的时间、不早于转入之前的值，也不取 paid_at（paid_at 给一个未来的时间验证）
+      - 集成测试验证状态变化：释放、定时任务到期关单、释放命中已到期、确认销售、晚到确认、转入待审、待审结案之后，last_changed_at 都变大，且等于该事务写进预留的 created_at、closed_at、committed_at、review_closed_at 中最晚的一个（不看 expires_at 与 paid_at）；到期未关的 active 预留直接确认时（同一事务先关单），无论够不够、确认还是转入待审，都等于关单写的 closed_at；已关单的预留第一次转入待审（不写这几列）时等于本命令的时间、不早于转入之前的值，也不取 paid_at（paid_at 给一个未来的时间验证）
       - 集成测试验证付款后命令：发货、退款回库、退货验收之后 last_changed_at 变大，且等于该单据的 created_at
       - 集成测试验证不设的路径：同键重放、换键同内容重报、再释放已释放的、待审重试仍不够、再结案已结案的之后，last_changed_at 不变
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
@@ -2433,7 +2434,7 @@ tasks:
       last_changed_at；lines 按 line_ref 升序，每行 line_ref、sku_id、quantity 与五个累计量（形状同订单库存查询）；不返回单据与流水。返回 orders 与 next_cursor。
       二，GET /v1/reservations 带 status：在 app/api/reservations.py 现有的 order_ref 查询上扩展，order_ref 与 status 必须且只能带一个；带 order_ref 时行为与现在完全相同；
       带 status 时只收 status、after、limit，status 只接受 late_payment_review；只列凭据销售入口的预留，按 reservation_id 升序键集分页，返回 reservations（现有表示）与 next_cursor；
-      凭据没有销售入口时在各种 422 之后返回空数组。查询函数放 app/services/reconciliation.py，不改 app/services/reservations.py。
+      凭据没有销售入口时在各种 422 之后返回空数组，next_cursor 照契约 2.5（原样返回 after，没带为 null）。查询函数放 app/services/reconciliation.py，不改 app/services/reservations.py。
       明确不做：不变量自查（CORE-TASK-057）；网店侧的对账与待办；改预留的表示。
     status: ready
     depends_on:
@@ -2444,8 +2445,8 @@ tasks:
       - 集成测试验证对账查询的选取：窗口只含 last_changed_at 在 changed_from 与 changed_to 之间（含起点、不含终点）的预留；别的入口的预留不出现；每项的 reservation、last_changed_at 与 lines 的累计量与订单库存查询一致；经发货的订单显示发货件数
       - 集成测试验证对账查询的分页：一个窗口 5 个订单 limit 2 翻三页不重不漏、按 (last_changed_at, reservation_id) 升序；同一时刻的多个订单按 reservation_id 排；最后一页之后再翻返回空数组且 next_cursor 等于请求的 after
       - 集成测试验证对账查询的拒绝：缺任一时间、无时区、早于 2000 年、changed_from 不早于 changed_to、changed_to 晚于现在减 300 秒（details 带 latest_changed_to）、limit 为 0 或 101、未知参数、参数重复、游标格式不对、别的窗口的游标都 422，判定顺序照契约；缺 orders.read 403
-      - 集成测试验证凭据没有销售入口：两个接口参数合格时返回空数组，参数不合格时仍是 422
-      - 集成测试验证待审列表：只列 late_payment_review 的预留，按 reservation_id 升序分页不重不漏；结案之后不再出现；别的入口的不出现；order_ref 与 status 都带或都不带 422；status 为别的值 422；带 status 时出现别的参数 422；游标与 status 不符 422
+      - 集成测试验证凭据没有销售入口：两个接口参数合格时返回空数组，next_cursor 在带 after 时原样返回、没带时为 null；参数不合格时仍是 422
+      - 集成测试验证待审列表：只列 late_payment_review 的预留，按 reservation_id 升序分页不重不漏；结案之后不再出现；别的入口的不出现；order_ref 与 status 都带或都不带 422；status 为别的值 422；limit 为 0、101 或非数字 422；带 status 时出现别的参数 422；游标与 status 不符 422
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
       - app/api/reconciliation.py
