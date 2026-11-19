@@ -467,7 +467,7 @@ Core 需求要求所有量非负、缺货时“暂停履约交管理员”（ORD
   - `checked_at`（读快照时的数据库时间）、`ok`（没有违反项为 `true`）、`violation_count`（总数）、`violations`（最多 100 项，超过时只返回前 100 项）；
   - `violations` 按 `check` 的编号、再按 `pool_id`、`sku_id`（前三项）或 `reservation_id`（第 4 项）升序。每项：
     - 前三项：`check`、`pool_id`、`sku_id`、`expected`（由流水或订单行算出的值）、`actual`（余额行上的值）；
-      `ledger_totals` 的 `expected` 是由流水算出的对象，键为四个量的名字、`entry_count`（流水条数）与 `max_balance_version_after`（没有流水时为 0）；`actual` 是余额行上的对象，键为四个量的名字与 `balance_version`。四个量有任何一个两边不等，或 `entry_count`、`max_balance_version_after` 有任何一个不等于 `balance_version`，就算违反，另两项是整数；
+      `ledger_totals` 的 `expected` 是由流水算出的对象，键为四个量的名字、`entry_count`（流水条数）与 `max_balance_version_after`（没有流水时为 0）；`actual` 是余额行上的对象，键为四个量的名字与 `balance_version`。四个量有任何一个两边不等，或 `entry_count`、`max_balance_version_after` 有任何一个不等于 `balance_version`，就算违反；另两项检查的 `expected`、`actual` 都是整数；
     - `order_commit_state`：`check`、`reservation_id`、`order_ref`、`status`、`line_refs`（不符的行，按 `line_ref` 升序）。
 - **查出违反怎么办**：说明实现有缺陷或库被绕过接口改过，Core 不自动修。按 `pool_id`、`sku_id` 用 §6.8 的流水查询、按 `order_ref` 用订单库存查询（§5.8）定位；
   查明原因之前不要用盘点或更正去“对平”（会把缺陷的痕迹盖掉）。
@@ -2087,3 +2087,5 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 第二轮复审（提交 `0b92f89`，通过：阻塞 0 条、非阻塞 3 条）之后的修改，同样并进第 88–90 条：`ledger_totals` 的 `expected`、`actual` 写明键名与什么算违反；
 `last_changed_at` 只取写库用到的最晚一次时间，发货、退款回库、退货验收取命令时间；时间下界并入判定顺序的格式一步；页首范围补 §13；第 88 条写上并集比对；网店侧变化补“下单”。
+
+第三轮复审（提交 `1ab0921`，通过：阻塞 0 条、非阻塞 1 条）之后的修改：§4.4 响应里“另两项是整数”单起一句，与违反判定分开。
