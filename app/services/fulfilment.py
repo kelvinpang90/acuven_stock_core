@@ -1,4 +1,13 @@
-"""发货与退款回库（契约 §5.8，§5.1、§5.3），以及三种订单单据共用的读写与表示。
+"""发货、退款回库与退货验收（契约 §5.8，§5.1、§5.3），以及三种订单单据共用的读写与表示。
+
+三个命令都走 create_document（退货验收经 create_return_receipt），
+按单据类型取余量、要写的流水与累计量（app/domain/fulfilment.py 的 line_limit、
+line_entries、apply_line），按 QUANTITY_RULES 取各流水的增量：
+发货与退款回库的余量为 committed_qty − dispatched_qty − refund_restocked_qty；
+退货验收的余量为 dispatched_qty − returned_sellable_qty − returned_unsellable_qty，
+与两个数之和比较；每行可售大于 0 时先写一条 RETURN_SELLABLE（stock_balance 加），
+不可售大于 0 时再写一条 RETURN_UNSELLABLE（stock_balance、unavailable 各加），
+订单行的两个累计量各加。
 
 命令在幂等执行器以 READ COMMITTED 开的事务里、用 execution.connection 运行，
 自己不开、不提交、不回滚事务。没有开业务事务之前的步骤：不预建余额行
@@ -32,7 +41,7 @@ channel_id、凭据、幂等键、操作者与请求 ID 取本次请求；reason
 
 单据的表示（document_representation）与按类型查、写单据（find_order_document、
 insert_order_document）、回答已有单据（answer_existing_order_document）三种类型通用，
-退货验收与订单库存查询也用它们。
+订单库存查询也用它们。
 """
 
 from collections.abc import Sequence
@@ -464,3 +473,29 @@ def create_document(
         return _execute(execution, document_type, order_ref, document_ref, lines, fields)
     except BusinessRefTaken:
         raise BusinessRefTaken(rejudge) from None
+
+
+def create_return_receipt(
+    execution: Execution,
+    order_ref: str,
+    return_ref: str,
+    lines: Sequence[QuantityLine | ReturnLine],
+    fields: CommonFields,
+) -> CommandResult:
+    """退货验收（return_receipts.create）：按 create_document 的判定顺序与锁序。
+
+    与发货、退款回库不同的只在按单据类型取的规则上：
+    - 第 4 步余量（exceeding_lines → line_limit）为
+      dispatched_qty − returned_sellable_qty − returned_unsellable_qty，
+      与两个数之和比较，details.lines 的 quantity 为两数之和；退款回库的件数不算进去；
+    - 第 5 步每行的流水（line_entries）：可售大于 0 时先一条 RETURN_SELLABLE
+      （stock_balance 加），不可售大于 0 时再一条 RETURN_UNSELLABLE
+      （stock_balance、unavailable 各加），增量取 QUANTITY_RULES；
+    - 订单行（apply_line）returned_sellable_qty、returned_unsellable_qty 各加；
+    - 表示（line_representation）每行带两个数与 sellable_entry_id、unsellable_entry_id，
+      对应的数为 0、没写那条流水时为 null。
+    """
+    for line in lines:
+        if not isinstance(line, ReturnLine):
+            raise TypeError(f"a return receipt needs ReturnLine lines, got {line!r}")
+    return create_document(execution, RETURN_RECEIPT, order_ref, return_ref, lines, fields)

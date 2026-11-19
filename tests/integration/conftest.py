@@ -3,10 +3,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
 from alembic.config import Config
+from fastapi.testclient import TestClient
 from sqlalchemy import Connection, Engine, insert, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql.expression import Executable
@@ -17,7 +19,11 @@ from app.domain.environment import DEMO, PRODUCTION
 from app.models.catalog import Product, Sku, Tenant
 from app.models.instance import CoreInstance
 from app.models.inventory import LedgerEntry, Location, SalesChannel, StockBalance, StockPool
+from app.models.orders import OrderDocument, OrderLine
 from app.models.service_auth import Credential
+
+if TYPE_CHECKING:
+    from tests.integration.test_api_auth import Caller
 
 # 只指向 CI 的一次性 MySQL 服务容器；本地没设时，用到下面夹具的测试跳过。
 TEST_DATABASE_URL = os.environ.get("CORE_TEST_DATABASE_URL", "")
@@ -281,3 +287,104 @@ def add_entry(db: Connection, balance: Balance, version: int, **overrides: objec
     entry_id = new_id("led")
     db.execute(entry_insert(balance, version, entry_id=entry_id, **overrides))
     return entry_id
+
+
+# 订单单据命令（发货、退款回库、退货验收）的接口测试共用的请求与观察。
+# 要用的其他测试模块的辅助函数在函数里导入：那些模块在顶层就导入本文件，顶层互相导入会循环。
+
+DISPATCHES_CREATE = "dispatches.create"
+REFUND_RESTOCKS_CREATE = "refund_restocks.create"
+DISPATCHES = "dispatches"
+REFUND_RESTOCKS = "refund-restocks"
+# 路径、操作类型、引用字段、details.ref_type、单据类型、流水类型、document_id 前缀。
+KINDS = {
+    DISPATCHES: (DISPATCHES_CREATE, "shipment_ref", "shipment", "dispatch", "DISPATCH", "shp_"),
+    REFUND_RESTOCKS: (
+        REFUND_RESTOCKS_CREATE,
+        "refund_ref",
+        "refund",
+        "refund_restock",
+        "REFUND_RESTOCK",
+        "rfr_",
+    ),
+}
+# 三种单据的表示里，除本类型的引用字段之外都有的键。
+COMMON_KEYS = {
+    "document_id",
+    "document_type",
+    "order_ref",
+    "reservation_id",
+    "pool_id",
+    "reason_code",
+    "note",
+    "occurred_at",
+    "created_at",
+    "lines",
+}
+
+
+def new_key() -> str:
+    return f"shop:fulfil:{uuid4().hex}"
+
+
+def new_document_ref() -> str:
+    return f"doc-{uuid4().hex}"
+
+
+def qline(line_ref: str, quantity: object) -> dict:
+    return {"line_ref": line_ref, "quantity": quantity}
+
+
+def body_of(kind: str, lines: list[dict], ref: str | None = None, **extra: object) -> dict:
+    """本类型的正文：引用字段默认取一个新引用。"""
+    ref_field = KINDS[kind][1]
+    return {ref_field: ref or new_document_ref(), "lines": lines} | extra
+
+
+def post(
+    client: TestClient,
+    caller: "Caller",
+    kind: str,
+    order_ref: str,
+    body: object,
+    key: str | None = None,
+    actor: dict | None = None,
+):
+    headers = caller.auth | {
+        "Idempotency-Key": key or new_key(),
+        "X-Request-ID": f"fulfil-test-{uuid4().hex}",
+    }
+    path = f"/v1/orders/{order_ref}/{kind}"
+    return client.post(path, json=body, headers=headers | (actor or {}))
+
+
+def committed_order(client: TestClient, engine: Engine, caller: "Caller", quantities: list[int]):
+    """每行一个新 SKU、各备 5 件，预留并确认；返回预留的表示与按行的 SKU。"""
+    from tests.integration.test_reservation_release_api import reserved_order
+    from tests.integration.test_reservations_api import data_of
+    from tests.integration.test_sale_commits_api import commit, commit_body
+
+    created, skus = reserved_order(client, engine, caller, quantities)
+    data_of(commit(client, caller, created["order_ref"], commit_body(created)), 200)
+    return created, skus
+
+
+def documents(engine: Engine, caller: "Caller") -> list[dict]:
+    from tests.integration.test_reservations_api import rows_of
+
+    return sorted(
+        rows_of(engine, OrderDocument, caller), key=lambda document: document["document_seq"]
+    )
+
+
+def order_lines(engine: Engine, caller: "Caller") -> dict[str, dict]:
+    from tests.integration.test_reservations_api import rows_of
+
+    return {row["line_ref"]: row for row in rows_of(engine, OrderLine, caller)}
+
+
+def snapshot(engine: Engine, caller: "Caller") -> tuple:
+    """拒绝前后要相同的：流水、单据与订单行。"""
+    from tests.integration.test_stock_service import entries
+
+    return entries(engine, caller), documents(engine, caller), order_lines(engine, caller)
