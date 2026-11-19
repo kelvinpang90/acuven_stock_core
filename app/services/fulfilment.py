@@ -1,4 +1,11 @@
-"""发货与退款回库（契约 §5.8，§5.1、§5.3），以及三种订单单据共用的读写与表示。
+"""发货、退款回库与退货验收（契约 §5.8，§5.1、§5.3），以及三种订单单据共用的读写与表示。
+
+三个命令都走 create_document，按单据类型取余量与要写的流水：
+发货与退款回库的余量为 committed_qty − dispatched_qty − refund_restocked_qty；
+退货验收的余量为 dispatched_qty − returned_sellable_qty − returned_unsellable_qty，
+与两个数之和比较；每行可售大于 0 时先写一条 RETURN_SELLABLE（stock_balance 加），
+不可售大于 0 时再写一条 RETURN_UNSELLABLE（stock_balance、unavailable 各加），
+订单行的两个累计量各加。
 
 命令在幂等执行器以 READ COMMITTED 开的事务里、用 execution.connection 运行，
 自己不开、不提交、不回滚事务。没有开业务事务之前的步骤：不预建余额行
@@ -32,7 +39,7 @@ channel_id、凭据、幂等键、操作者与请求 ID 取本次请求；reason
 
 单据的表示（document_representation）与按类型查、写单据（find_order_document、
 insert_order_document）、回答已有单据（answer_existing_order_document）三种类型通用，
-退货验收与订单库存查询也用它们。
+订单库存查询也用它们。
 """
 
 from collections.abc import Sequence

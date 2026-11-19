@@ -1,11 +1,13 @@
-"""发货与退款回库的接口（契约 §5.3、§5.8、§7.1、§8.1、§10 第 3、4 条）。
+"""发货、退款回库与退货验收的接口（契约 §5.3、§5.8、§7.1、§8.1、§10 第 3、4 条）。
 
-两个命令都要求 orders.write、不要求角色（操作者头带了照常校验并记录），经幂等执行器，
+三个命令都要求 orders.write、不要求角色（操作者头带了照常校验并记录），经幂等执行器，
 业务事务以 READ COMMITTED 开启；不预建余额行、没有开事务前的钩子。
 路径的 order_ref 是第 1 节的引用格式，不合格在第 7 步 422。
-正文是本类型的引用（shipment_ref 或 refund_ref，第 1 节的引用格式）与 lines
-（1–100 行，超过 413；每行 line_ref 与 1–1,000,000 的 JSON 整数 quantity，line_ref 重复 422），
-加可选的 reason_code、note、occurred_at（规则同收货），不接受别的字段。
+正文是本类型的引用（shipment_ref、refund_ref 或 return_ref，第 1 节的引用格式）与 lines
+（1–100 行，超过 413；line_ref 重复 422），加可选的 reason_code、note、occurred_at（规则同收货），
+不接受别的字段。发货与退款回库每行 line_ref 与 1–1,000,000 的 JSON 整数 quantity；
+退货验收每行 line_ref、sellable_quantity 与 unsellable_quantity，两个数都必填，
+按 parse_return_quantities 校验（各 0–1,000,000 的 JSON 整数，和至少 1）。
 池是凭据销售入口绑定的池：凭据没有销售入口或入口已停用 403（第 9 步，不保存）。
 判定与写库在 app/services/fulfilment.py。
 """
@@ -14,13 +16,20 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.api.auth import authorize, require_sales_pool
 from app.api.errors import invalid_request
 from app.api.requests import ParsedBody, RequestBody, json_body
 from app.domain.catalog import InvalidField
-from app.domain.fulfilment import DISPATCH, REFUND_RESTOCK, QuantityLine
+from app.domain.fulfilment import (
+    DISPATCH,
+    REFUND_RESTOCK,
+    RETURN_RECEIPT,
+    QuantityLine,
+    ReturnLine,
+    parse_return_quantities,
+)
 from app.domain.requests import is_reference
 from app.domain.service_auth import ORDERS_WRITE
 from app.domain.stock import (
@@ -35,6 +44,7 @@ from app.services.idempotency import CommandResult, Execution, run_idempotent
 
 DISPATCHES_CREATE = "dispatches.create"
 REFUND_RESTOCKS_CREATE = "refund_restocks.create"
+RETURN_RECEIPTS_CREATE = "return_receipts.create"
 
 ORDER_REF = "order_ref"
 LINES = "lines"
@@ -70,8 +80,27 @@ class Line(RequestBody):
         return parse_positive_quantity(value)
 
 
-class _Fulfilment(RequestBody):
-    """两个命令共有的字段。lines 是 1–100 行的批量数组（超过 100 为 413）。
+class ReturnReceiptLine(RequestBody):
+    """退货验收的一行：两个数都必填，同一行可以既有可售也有不可售的件（Q-63）。"""
+
+    line_ref: str
+    sellable_quantity: int
+    unsellable_quantity: int
+
+    @field_validator("line_ref")
+    @classmethod
+    def check_line_ref(cls, value: str) -> str:
+        return _reference(value, "line_ref")
+
+    @model_validator(mode="after")
+    def check_quantities(self):
+        """各 0–1,000,000 的整数，和至少 1。"""
+        parse_return_quantities(self.sellable_quantity, self.unsellable_quantity)
+        return self
+
+
+class _Common(RequestBody):
+    """三个命令共有的字段。子类定义 lines（1–100 行的批量数组，超过 100 为 413）。
 
     line_ref 的重复由 json_body 查（app/api/requests.py 的 _validate，422），这里不再重复。
 
@@ -81,7 +110,6 @@ class _Fulfilment(RequestBody):
 
     batch_fields = (LINES,)
 
-    lines: list[Line] = Field(min_length=1)
     reason_code: str | None = None
     note: str | None = None
     occurred_at: str | None = None
@@ -102,8 +130,8 @@ class _Fulfilment(RequestBody):
         parse_occurred_at(value)
         return value
 
-    def quantity_lines(self) -> list[QuantityLine]:
-        return [QuantityLine(line.line_ref, line.quantity) for line in self.lines]
+    def request_lines(self) -> list[QuantityLine | ReturnLine]:
+        raise NotImplementedError
 
     def common_fields(self) -> CommonFields:
         return CommonFields(
@@ -111,6 +139,15 @@ class _Fulfilment(RequestBody):
             note=self.note,
             occurred_at=None if self.occurred_at is None else parse_occurred_at(self.occurred_at),
         )
+
+
+class _Fulfilment(_Common):
+    """发货与退款回库：每行 line_ref 与 quantity。"""
+
+    lines: list[Line] = Field(min_length=1)
+
+    def request_lines(self) -> list[QuantityLine | ReturnLine]:
+        return [QuantityLine(line.line_ref, line.quantity) for line in self.lines]
 
 
 class Dispatch(_Fulfilment):
@@ -131,10 +168,28 @@ class RefundRestock(_Fulfilment):
         return _reference(value, "refund_ref")
 
 
+class ReturnReceipt(_Common):
+    return_ref: str
+    lines: list[ReturnReceiptLine] = Field(min_length=1)
+
+    @field_validator("return_ref")
+    @classmethod
+    def check_return_ref(cls, value: str) -> str:
+        return _reference(value, "return_ref")
+
+    def request_lines(self) -> list[QuantityLine | ReturnLine]:
+        return [
+            ReturnLine(line.line_ref, line.sellable_quantity, line.unsellable_quantity)
+            for line in self.lines
+        ]
+
+
 dispatch_body = json_body(Dispatch)
 refund_restock_body = json_body(RefundRestock)
+return_receipt_body = json_body(ReturnReceipt)
 DispatchBody = Annotated[ParsedBody[Dispatch], Depends(dispatch_body)]
 RefundRestockBody = Annotated[ParsedBody[RefundRestock], Depends(refund_restock_body)]
+ReturnReceiptBody = Annotated[ParsedBody[ReturnReceipt], Depends(return_receipt_body)]
 
 
 def _path_order_ref(order_ref: str) -> str:
@@ -147,14 +202,14 @@ def _path_order_ref(order_ref: str) -> str:
 def _run(
     request: Request,
     operation: str,
-    body: ParsedBody[_Fulfilment],
+    body: ParsedBody[_Common],
     document_type: str,
     order_ref: str,
     document_ref: str,
 ) -> Response:
     # 路由上的 pool_id 只用来在第 9 步拦没有销售入口的凭据（403）：
     # 余额行用预留行的 pool_id，预留行按凭据的渠道查到，二者一致。
-    lines = body.model.quantity_lines()
+    lines = body.model.request_lines()
     fields = body.model.common_fields()
 
     def command(execution: Execution) -> CommandResult:
@@ -197,3 +252,17 @@ def create_refund_restock(
 ) -> Response:
     refund_ref = body.model.refund_ref
     return _run(request, REFUND_RESTOCKS_CREATE, body, REFUND_RESTOCK, order_ref, refund_ref)
+
+
+# --- 退货验收 ---
+
+
+@router.post("/v1/orders/{order_ref}/return-receipts", dependencies=_WRITE)
+def create_return_receipt(
+    request: Request,
+    body: ReturnReceiptBody,
+    order_ref: Annotated[str, Depends(_path_order_ref)],
+    pool_id: Annotated[str, Depends(require_sales_pool)],
+) -> Response:
+    return_ref = body.model.return_ref
+    return _run(request, RETURN_RECEIPTS_CREATE, body, RETURN_RECEIPT, order_ref, return_ref)
