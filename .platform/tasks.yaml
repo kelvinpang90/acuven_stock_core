@@ -2496,3 +2496,206 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-058
+    title: 写出 SKU 合并的状态判定、正文校验与差额定数的纯函数
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.16 的 2.4（状态机、差额法与定数例子）与 2.8（接口与判定顺序），把合并的规则写成纯函数，供 CORE-TASK-059～062 调用。
+      新建 app/domain/sku_merges.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；数量与定数复用 app/domain/quantities.py 的 Quantities 与 app/domain/ledger.py 的 count_deltas、apply_count_adjustment、is_stale、CountBelowCommitments（只引用；app/domain/quantities.py 不改，app/domain/ledger.py 只把模块说明里 MERGE_TRANSFER 落账规则“随合并任务加”那一句改为指向本模块，不改任何函数）。
+      一，常量：五个状态 selling_paused、counted、reconcile_pending、completed、cancelled；未结束的三种；合并单 ID 前缀 smg；流水的 source_type 为 sku_merge。
+      二，状态判定：给定合并单状态，分别判出录入实数、执行、完成、取消四个命令是执行、返回当前表示还是 409 STATE_CONFLICT（照契约 2.8 各命令写的状态分支）；
+      给定合并单状态与某个 SKU 在单上的角色（来源或规范），判它是否使该 SKU 停售（契约 2.8 停售的判定：selling_paused、counted 的两个 SKU，reconcile_pending 的规范 SKU）。
+      三，正文校验：新建正文只收 source_sku_id、canonical_sku_id（字符串，不能相同）与可选的 reason（规则同 app/domain/catalog.py 现有的 reason 规范化，可以引用）；
+      录入实数正文只收 pool_id（字符串）、shelf_count、unsellable_count（0 到 1000000 的 JSON 整数，用 app/domain/stock.py 的 parse_non_negative_quantity 判）。不合格抛与现有正文校验相同的异常，调用方据此回 422。
+      四，执行的定数：输入两个快照（Quantities）、两项实数、执行时来源与规范的当前四个量；输出迁移量（来源当前的四个量，全为 0 时照样输出）、迁移后的规范四个量、
+      两个快照相加后用 count_deltas 算出的 d_shelf 与 d_u、定数后的规范四个量与是否写定数流水（两个差额都为 0 时不写）；落账后违反不变量时抛 CountBelowCommitments（缺口照契约 6 的公式，只有规范 SKU 一项）。
+      快照是否作废用 is_stale 对两个 SKU 各判一次，给出作废的 sku_id 列表。
+      明确不做：数据库表与迁移（CORE-TASK-059）；接口（CORE-TASK-060、062）；可售量与新预留的停售状态（CORE-TASK-061）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 函数与常量在 app/domain/sku_merges.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_sku_merges.py，用 unittest
+      - 单元测试逐条验证契约 2.4 合并定数例子表的 6 行：给出表中的快照、实数与执行时的账面，得到表中迁移后的规范四个量、差额与执行结果；第 4、6 行的第一次执行抛 CountBelowCommitments 且缺口照表；第 5 行判出来源快照作废
+      - 单元测试验证迁移量：来源当前四个量全为 0 时仍输出一对全 0 的迁移量；迁移后规范四个量等于两者相加
+      - 单元测试验证状态判定：录入实数只在 selling_paused、counted 执行；执行在 counted 执行、在 reconcile_pending 与 completed 返回当前表示、在 selling_paused 与 cancelled 为 STATE_CONFLICT；完成在 reconcile_pending 执行、在 completed 返回当前表示、其余为 STATE_CONFLICT；取消在 selling_paused、counted 执行、在 cancelled 返回当前表示、在 reconcile_pending 与 completed 为 STATE_CONFLICT
+      - 单元测试验证停售判定：selling_paused、counted 时来源与规范都停售；reconcile_pending 时只有规范停售；completed、cancelled 时都不停售
+      - 单元测试验证正文校验：新建缺字段、多字段、ID 不是字符串、两个 ID 相同、reason 不合格都被拒；录入实数缺字段、多字段、pool_id 不是字符串、实数为负、超过 1000000、为字符串或布尔都被拒；合格的正文得到规范化后的值
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/sku_merges.py
+      - app/domain/ledger.py
+      - tests/unit/test_sku_merges.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-059
+    title: 新建 SKU 合并单与快照两张表的模型和迁移
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.16 的 2.8 存放，新建模型模块 app/models/merges.py（表 sku_merges 与 sku_merge_snapshots），新增迁移 alembic/versions/20261119_0011_sku_merges.py（revision 0011，接在 CORE-TASK-055 的 0010 之后），
+      在 alembic/env.py import 新模型模块、登记到 Base.metadata，并在 app/models/__init__.py 导出。状态取值与 ID 前缀用 CORE-TASK-058 的 app/domain/sku_merges.py 的常量。
+      一，sku_merges 的列、唯一约束、索引、检查约束与外键逐条照契约 2.8 存放：status 用 VARCHAR(32)；录入实数一组列同有同无，counted、reconcile_pending、completed 时非空，selling_paused 时为空，cancelled 时不限；
+      执行一组列在 reconcile_pending、completed 时非空、其他状态为空，adjustment_entry_id 可空；完成、取消两组列只在对应状态非空；各组操作者两列同有同无；source_sku_id 不等于 canonical_sku_id；复合外键照契约 10 第 1 条。
+      二，sku_merge_snapshots：主键 (merge_id, sku_id)，列与外键照契约 2.8，四个量与 balance_version 的检查约束照余额行的写法（非负）。
+      三，迁移只加表（契约 2.2）；downgrade 删两张表。“互不重叠”不建约束（契约写明由新建命令保证）。
+      明确不做：任何命令与接口（CORE-TASK-060～062）。
+    status: ready
+    depends_on:
+      - CORE-TASK-055
+      - CORE-TASK-058
+    acceptance_criteria:
+      - 模型在 app/models/merges.py，迁移为 alembic/versions/20261119_0011_sku_merges.py、down_revision 为 0010；alembic/env.py 与 app/models/__init__.py 登记了新模块；upgrade 后 alembic check 无差异，downgrade 再 upgrade 照常（由 CI 的 integration 执行）；已有的集成测试照常通过
+      - 集成测试验证检查约束：来源等于规范、status 为五个取值以外、selling_paused 却带录入实数、counted 缺录入实数、reconcile_pending 缺执行列或缺迁移流水 ID、completed 缺完成列、cancelled 以外带取消列、操作者两列只有一列，各自被数据库拒绝；五种状态各一条合法的行能写入，cancelled 带或不带录入实数都能写入
+      - 集成测试验证外键：两个 SKU、池、凭据、流水 ID 指向别的租户的对象时被拒；快照行的余额行外键指向不存在的余额行时被拒；快照的四个量为负时被拒
+      - 降到 0010 照 tests/integration/test_demo_reset_schema.py 的先例在 production 测试库上做，无论成败都在 finally 里升回 head，不动共享的 demo 库
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/models/merges.py
+      - app/models/__init__.py
+      - alembic/env.py
+      - alembic/versions/20261119_0011_sku_merges.py
+      - tests/integration/test_sku_merge_schema.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-060
+    title: 实现 SKU 合并的新建、录入实数、完成、取消与查询五个接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.16 的 2.8，新建 app/api/sku_merges.py 与 app/services/sku_merges.py，在 app/main.py 挂路由；规则用 CORE-TASK-058 的 app/domain/sku_merges.py，表用 CORE-TASK-059 的 app/models/merges.py。
+      全部接口 scope 要 catalog.write 与 stock.write 两者（authorize 传两个 scope），角色照契约 10 第 3 条；写命令经 app/services/idempotency.py 的 run_idempotent，操作类型 sku_merges.create、sku_merges.count、sku_merges.complete、sku_merges.cancel，以 READ COMMITTED 开启。
+      一，新建 POST /v1/sku-merges：run_idempotent 传 catalog_lock=True（契约 2.7、2.8：不写目录也取目录写锁，免得与修改编码按不同顺序锁 SKU 行而死锁）；事务里的判定顺序照契约 2.8 新建第 1–7 步，新错误码 SKU_MERGE_IN_PROGRESS；同一对 SKU 的未结束单返回 200 与它的当前表示。
+      二，录入实数 POST /v1/sku-merges/{merge_id}/count：池授权按正文 pool_id；开事务之前预建两个 SKU 的余额行（balance_rows）；判定顺序照契约 2.8 录入实数第 1–5 步，404 SKU_MERGE_NOT_FOUND，STATE_CONFLICT 的 details 照契约；快照照 app/services/counts.py 提交实数的写法取，已录入的整份替换。
+      三，完成与取消：判定照契约 2.8，没有请求体，不做池授权；404 在事务里判出、作为确定结果保存。四，查询 GET /v1/sku-merges/{merge_id}：表示照契约 2.8（count、execution 在对应阶段之前为 null）；属于别的租户的 404 记 cross_tenant。
+      明确不做：新预留与可售量的停售判定（CORE-TASK-061）；执行（CORE-TASK-062）；不变量自查的第 5 项（CORE-TASK-063）。
+    status: ready
+    depends_on:
+      - CORE-TASK-058
+      - CORE-TASK-059
+    acceptance_criteria:
+      - 接口在 app/api/sku_merges.py，服务在 app/services/sku_merges.py，路由在 app/main.py 挂上；已有的集成测试照常通过
+      - 集成测试验证新建：成功 201、状态 selling_paused；SKU 不存在或属于别的租户 404 SKU_NOT_FOUND（后者记 cross_tenant）；同一对 SKU 换幂等键重报返回 200 与原单（reason 不同也是）；来源或规范已合并 409 SKU_MERGED；规范停用 409 SKU_INACTIVE、来源停用不拦；任一个 SKU 在别的未结束合并单里 409 SKU_MERGE_IN_PROGRESS 且 details 带那张单；取消后同一对可以另建
+      - 集成测试验证录入实数：成功 200、状态 counted、快照等于录入时的四个量与版本；再录入整份替换；cancelled 或已执行的单 409 STATE_CONFLICT 且 details 带 status（已执行的直接改库把单置为 reconcile_pending 再测；执行那组列的两个迁移流水 ID 复用测试里已有的同租户流水，例如期初流水，不关外键检查）；换池 409 且 details.reason 为 pool_mismatch；不存在的单 404 SKU_MERGE_NOT_FOUND；池不是 live 409 POOL_NOT_LIVE（直接改库把池置回 initializing）；凭据没有销售入口 403、正文 pool_id 属于别的租户 404；stock_operator 可以录入
+      - 集成测试验证完成与取消：完成只对 reconcile_pending 生效（直接改库造这个状态；执行那组列的两个迁移流水 ID 复用测试里已有的同租户流水，例如期初流水，不关外键检查）、已完成的再完成 200、其余 409；取消对 selling_paused、counted 生效、已取消的再取消 200、reconcile_pending 与 completed 409；两者都要 stock_admin
+      - 集成测试验证查询与表示：录入前 count 与 execution 为 null，录入后 count 带快照、d_shelf 与 d_u 且等于契约 2.4 第 2 步的公式算出的值
+      - 集成测试验证鉴权：只有 catalog.write 或只有 stock.write 的凭据 403；新建、完成、取消用 stock_operator 403；查询别的租户的单 404 并记 cross_tenant
+      - 集成测试验证新建取目录写锁：另一连接持有本租户的目录写锁超过 5 秒时，新建 503 UNAVAILABLE 且什么也没写
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/sku_merges.py
+      - app/services/sku_merges.py
+      - app/main.py
+      - tests/integration/test_sku_merges_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-061
+    title: 新预留与可售量查询加 SKU 合并的停售判定
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.16 的 2.8 停售的判定与 5.6，把合并单使 SKU 停售的规则接到新预留与可售量查询上；停售与否用 CORE-TASK-058 的 app/domain/sku_merges.py 判，合并单的表用 CORE-TASK-059 的 app/models/merges.py，合并单用 CORE-TASK-060 的接口建。
+      一，新预留：在 app/services/reservations.py 第 5 步读 SKU 行与商品行之后，用普通读查使所列 SKU 停售的合并单（selling_paused、counted 的来源与规范，reconcile_pending 的规范），判定顺序为已合并、停用、停售，409 SKU_SELLING_PAUSED，details.sku_ids 按请求顺序列全。
+      二，可售量：app/domain/reservations.py 的 availability_status 加 selling_paused（排在 inactive 之后、sellable 之前）；app/services/stock_queries.py 的可售量查询读出停售与否，app/api/stock_queries.py 照新状态返回。
+      三，停售只停新预留：已有预留的释放、确认销售、故障补交与付款后的命令都不查停售（契约 2.4、5.7）。
+      明确不做：合并单的接口（CORE-TASK-060）；执行（CORE-TASK-062）。
+    status: ready
+    depends_on:
+      - CORE-TASK-055
+      - CORE-TASK-058
+      - CORE-TASK-059
+      - CORE-TASK-060
+    acceptance_criteria:
+      - 改动在 app/services/reservations.py、app/domain/reservations.py、app/services/stock_queries.py、app/api/stock_queries.py；已有的单元与集成测试照常通过
+      - 单元测试验证 availability_status：已合并先于停用、停用先于停售、停售先于可售
+      - 集成测试验证新预留：建单之后两个 SKU 的新预留 409 SKU_SELLING_PAUSED、details.sku_ids 按请求顺序列全；已合并与停用的先报；取消或完成之后恢复可预留；reconcile_pending 时规范 SKU 仍停售（直接改库造这个状态；执行那组列的两个迁移流水 ID 复用测试里已有的同租户流水，例如期初流水，不关外键检查）；拒绝不占用 order_ref，恢复后同一 order_ref 换幂等键可以预留
+      - 集成测试验证可售量：建单之后两个 SKU 的 status 为 selling_paused，取消或完成之后回到 sellable
+      - 集成测试验证只停新预留：停售期间已有预留照常释放与确认销售，故障补交照常新建
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/reservations.py
+      - app/domain/reservations.py
+      - app/services/stock_queries.py
+      - app/api/stock_queries.py
+      - tests/unit/test_reservations.py
+      - tests/integration/test_sku_merge_selling_paused.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-062
+    title: 实现 SKU 合并的执行，迁移账面、改挂订单行、按差额定数并把来源 SKU 记为已合并
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.16 的 2.4 第 0–3 步与 2.8 执行，在 app/services/sku_merges.py 与 app/api/sku_merges.py 加 POST /v1/sku-merges/{merge_id}/execute（操作类型 sku_merges.execute，stock_admin，没有请求体），定数用 CORE-TASK-058 的纯函数。
+      一，池授权按合并单录入实数时的池（按 ID 指向池内对象；还没录入的只查有没有销售入口）：在 app/api/auth.py 让 ObjectPool 的 pool_id 可为空，require_object_pool 遇到空池时只跳过“不是获准的池 403”那一步，前两步（凭据没有销售入口 403、对象不存在或属于别的租户 404 并记 cross_tenant）照旧，其余按对象做池授权的命令行为不变；run_idempotent 传 catalog_lock=True、READ COMMITTED、预建池授权时读到的池上两个 SKU 的余额行，并在 before_transaction 里照 app/services/reservations.py 的 close_due_before_reserving 先关两个 SKU 上已到期的预留（上限与出错处理相同；没有池就两步都跳过）。
+      二，事务里的判定与执行逐步照契约 2.8 执行第 1–9 步：锁内复核池（403 保存、记 forbidden 事件）；按状态分支；名单按 reservation_id 升序 FOR UPDATE 锁预留行、按 order_line_id 升序 FOR UPDATE 锁来源 SKU 上的订单行；锁两个余额行；
+      普通读复核来源 SKU 上四种状态的订单行，多出名单时抛 RedoCommand 重做；锁两个 SKU 行复核已合并与规范停用；COUNT_STALE；写 MERGE_TRANSFER_OUT 与 MERGE_TRANSFER_IN（全为 0 也写）、改挂订单行并设所属预留的 last_changed_at、按差额写 COUNT_ADJUSTMENT（不全为 0 时）、
+      照 app/services/stock.py 的 write_entry 与 mark_verified 更新两个余额行的判定列；违反不变量 409 COUNT_BELOW_COMMITMENTS；来源 SKU 改为 inactive、merged_into_sku_id 设为规范 SKU、版本加 1，用 app/services/catalog.py 的 record_change 写一条 sku_merged 变更记录；合并单改为 reconcile_pending 并记下执行列。
+      三，重做次数：在 app/services/idempotency.py 的 run_idempotent 加一个参数指定最多做几遍（默认保持现在的 2 遍，现有调用方的行为不变），执行传 3；最后一遍仍抛 RedoCommand 时 503 UNAVAILABLE、什么也不保存。
+      四，在 app/domain/catalog.py 的 EVENT_TYPES 加 sku_merged。五，每次执行在进程日志写一行合并单 ID、改挂的订单行数与事务用时。
+      明确不做：不变量自查的第 5 项（CORE-TASK-063）；网店侧的映射切换。
+    status: ready
+    depends_on:
+      - CORE-TASK-055
+      - CORE-TASK-058
+      - CORE-TASK-059
+      - CORE-TASK-060
+      - CORE-TASK-061
+    acceptance_criteria:
+      - 执行在 app/services/sku_merges.py 与 app/api/sku_merges.py；run_idempotent 的新参数默认不改变现有命令的行为（已有的单元与集成测试照常通过）
+      - 集成测试逐条验证契约 2.4 合并定数例子表的 6 行：照表造来源与规范的账面、录入实数、执行前的变动，执行后规范 SKU 的四个量、写没写定数流水、409 的缺口与 COUNT_STALE 的 details 都与表一致；第 6 行先被拒、处理订单后用新幂等键直接再执行得表中结果
+      - 集成测试验证迁移与改挂：来源上 active、expired、late_payment_review、committed 预留的订单行改挂到规范 SKU，released 与 closed_refunded 的不改挂；改挂的预留 last_changed_at 变大；之后对改挂订单的释放、确认、发货、退款回库、退货验收作用到规范 SKU；来源四个量全为 0 时也写一对迁移流水，执行之前来源与规范上的收货再更正都被拒（details.reason 为 superseded；差额为 0、没写定数流水时规范上同样被拒）；三条流水的 source_type 为 sku_merge、source_ref 为 merge_id、channel_id 为凭据的销售入口，reason_code、note、line_ref 为空；名单读出之后、锁住之前被释放的预留不改挂（用 monkeypatch 在名单读出之后在另一个连接释放它）
+      - 集成测试验证来源 SKU：执行后 inactive、merged_into_sku_id 为规范 SKU、版本加 1，目录变更流出现一条 sku_merged，changes 含 merged_into_sku_id（来源原为 active 时还含 status）、reason 取合并单；新预留带来源 SKU 409 SKU_MERGED
+      - 集成测试验证状态与重复：已执行的单再执行（同键与换键）返回 200 当前表示、不再写流水；selling_paused 与 cancelled 409 STATE_CONFLICT；规范 SKU 在建单后被停用时 409 SKU_INACTIVE 且合并单仍为 counted、什么也没写
+      - 集成测试验证复核重做：用 monkeypatch 在名单读出之后插入一条来源 SKU 上的故障补交订单行（照 tests/integration/test_sale_commit_concurrency.py 的写法），执行重做一遍后把它一并改挂；每遍都多出时 503 UNAVAILABLE、合并单仍为 counted、没有写入
+      - 集成测试验证鉴权与池：stock_operator 403；凭据没有销售入口 403；合并单不存在或属于别的租户 404 SKU_MERGE_NOT_FOUND（后者记 cross_tenant；别的租户的用例用一张还没录入实数的单），都不保存；还没录入的单只查销售入口、事务里 409；锁内 403 的造法：对还没录入的单发请求，用 monkeypatch 在池授权之后、开事务之前把合并单录入到同租户的另一个池（例如替换 app.services.sku_merges 引用的 run_idempotent：先录入，再调原函数），预期 403 作为确定结果保存（直接查幂等记录存在且为 403，照现有测试 rows(engine, IdempotencyRecord, ...) 的写法；同键重放会在锁外再 403、多写一条 forbidden 事件，按此断言事件条数）、记 forbidden 事件且带合并单的 pool_id；对照：事先就录入在别的池时锁外 403、不保存
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过，单次执行的事务用时远短于 5 分钟
+    allowed_change_paths:
+      - app/services/sku_merges.py
+      - app/api/sku_merges.py
+      - app/services/idempotency.py
+      - app/api/auth.py
+      - app/domain/catalog.py
+      - tests/unit/test_catalog.py
+      - tests/integration/test_idempotency.py
+      - tests/integration/test_sku_merge_execute_api.py
+      - tests/integration/test_sku_merge_execute_concurrency.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-063
+    title: 不变量自查加第五项，查未结订单行是否仍指向已合并的 SKU
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.16 的 4.4 第 5 项，在 CORE-TASK-054 的 app/domain/invariants.py 加检查名 merged_sku_lines 与比对函数，在 CORE-TASK-057 的 app/services/invariants.py 的同一只读事务里查出数据。
+      一，查哪些：所属预留为 active、expired、late_payment_review、committed 的订单行，其 sku_id 指向 merged_into_sku_id 非空的 SKU；按预留归组。
+      二，违反项形状同 order_commit_state：check、reservation_id、order_ref、status、按 line_ref 升序的 line_refs；汇总排序为第 5 项、按 reservation_id 升序，与其他项一起计总数、至多返回 100 项。
+      三，它只靠 skus 表的 merged_into_sku_id 判定，不依赖合并单的表；现有接口与其余四项的结果不变。
+      明确不做：自动修复；定时调用与告警（OPS-04，另行登记）。
+    status: ready
+    depends_on:
+      - CORE-TASK-057
+    acceptance_criteria:
+      - 改动在 app/domain/invariants.py 与 app/services/invariants.py；单元测试在 tests/unit/test_invariants.py，集成测试在 tests/integration/test_invariants_api.py；已有的测试照常通过
+      - 单元测试验证比对：四种状态的预留有订单行指向已合并的 SKU 时报出该预留与那些行；released、closed_refunded 的不报；没有这类行时不报；汇总时第 5 项排在第 4 项之后、按 reservation_id 升序
+      - 集成测试验证接口：直接改库把一个 active 预留的订单行所指的 SKU 设为已合并（同时设为 inactive），自查报出 merged_sku_lines；把 released 预留的订单行所指的 SKU 设为已合并时不报；正常的账 ok 仍为 true
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/domain/invariants.py
+      - app/services/invariants.py
+      - tests/unit/test_invariants.py
+      - tests/integration/test_invariants_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
