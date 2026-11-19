@@ -60,6 +60,11 @@ LATE_PAYMENT_INSUFFICIENT_STOCK 不在此列。
   已在待审的（重试仍不够）不改预留的任何列。
 reservation_id 为 null 的请求确认或转入待审时 fault_mode 设为真，之后不改回。
 
+最后变更时间（§5.9）：改预留行的同一条 UPDATE 或 INSERT 里设 last_changed_at，
+取本事务写库用到的最晚一次数据库时间——通常是命令时间；同一事务里先关到期的，
+关单取的时间更晚，取它。转入待审不写时间列，也取命令时间；paid_at 是调用方给的，不用。
+同键重放、待审重试仍不够、再结案已结案的都不改列，不设。
+
 待审结案（close_late_payment_review，§5.7）：同样在执行器以 READ COMMITTED 开的事务里运行。
 FOR UPDATE 按 order_ref 读预留行：没有 404 RESERVATION_NOT_FOUND；
 late_payment_review 改为 closed_refunded，记下结案的时间与 review_closed_* 各列，不写流水，200；
@@ -383,6 +388,7 @@ def _commit(
             "closed_at": now,
             "late": False,
             "fault_mode": committed.fault_mode,
+            "last_changed_at": now,
             **_commit_columns(execution),
         },
     )
@@ -422,7 +428,7 @@ def _late_commit(
         if reservation.status != LATE_PAYMENT_REVIEW:
             execution.keep_on_rejection(
                 lambda kept: _to_review(
-                    execution, kept, reservation, commit, fault_mode, closed_here
+                    execution, kept, reservation, commit, fault_mode, closed_here, now
                 )
             )
         # 已在待审的（重试仍不够）不改预留的任何列。
@@ -454,6 +460,10 @@ def _late_commit(
     _set_lines_committed(connection, tenant_id, reservation.reservation_id)
 
     # closed_at 保留到期关单的时间；payment_ref 与记下的相同（待审）或第一次记下。
+    # 本事务刚关的，关单取的时间晚于 now，是写库用到的最晚一次（§5.9）。
+    changed_at = now
+    if closed_here and reservation.closed_at is not None:
+        changed_at = max(now, reservation.closed_at)
     committed = replace(
         reservation,
         status=COMMITTED,
@@ -475,6 +485,7 @@ def _late_commit(
             "committed_at": now,
             "late": True,
             "fault_mode": fault_mode,
+            "last_changed_at": changed_at,
             **_commit_columns(execution),
         },
     )
@@ -488,28 +499,29 @@ def _to_review(
     commit: SaleCommit,
     fault_mode: bool,
     close_first: bool,
+    now: datetime,
 ) -> None:
     """第一次转入待审（keep_on_rejection 的写入，在命令的保存点回滚之后执行）。
 
     close_first 为真时命令里的到期关单已随保存点撤销：先再关一次，
     使 RELEASE 流水、reserved 的减回与 closed_at 和待审一起提交。
+    last_changed_at（§5.9）：再关的这一次已设为它取的时间（晚于 now），保留；
+    否则不写任何时间列，取命令时间 now（不取调用方给的 paid_at）。
     """
     tenant_id = _tenant_id(execution)
     reservation_id = reservation.reservation_id
     if close_first and not close_if_due(connection, tenant_id, reservation_id):
         raise RuntimeError(f"reservation {reservation_id} was due but not closed")
-    _update_reservation(
-        connection,
-        tenant_id,
-        reservation_id,
-        {
-            "status": LATE_PAYMENT_REVIEW,
-            "payment_ref": commit.payment_ref,
-            "paid_at": commit.paid_at,
-            "fault_mode": fault_mode,
-            **_commit_columns(execution),
-        },
-    )
+    values: dict[str, Any] = {
+        "status": LATE_PAYMENT_REVIEW,
+        "payment_ref": commit.payment_ref,
+        "paid_at": commit.paid_at,
+        "fault_mode": fault_mode,
+        **_commit_columns(execution),
+    }
+    if not close_first:
+        values["last_changed_at"] = now
+    _update_reservation(connection, tenant_id, reservation_id, values)
 
 
 # --- 故障补交新建 ---
@@ -582,6 +594,8 @@ def _insert_created(
         "committed_at": reservation.committed_at,
         "late": reservation.late,
         "fault_mode": reservation.fault_mode,
+        # 各个时间列都是同一个命令时间（§5.9）。
+        "last_changed_at": reservation.created_at,
         **_commit_columns(execution),
     }
     try:
@@ -824,6 +838,7 @@ def close_late_payment_review(execution: Execution, order_ref: str) -> CommandRe
             review_closed_actor_ref=None if access.actor is None else access.actor.ref,
             review_closed_actor_role=None if access.actor is None else access.actor.role,
             review_closed_request_id=execution.request.state.request_id,
+            last_changed_at=now,
         )
     )
     closed = replace(reservation, status=CLOSED_REFUNDED, review_closed_at=now)

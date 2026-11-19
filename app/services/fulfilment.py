@@ -24,7 +24,8 @@ line_entries、apply_line），按 QUANTITY_RULES 取各流水的增量：
    409 RESERVATION_MISMATCH（reason 为 lines，line_refs 升序）；
 4. 余量：任何一行超过 409 QUANTITY_EXCEEDS_OUTSTANDING，details.lines 按请求顺序列全；
 5. 按 (pool_id, sku_id) 升序锁所列订单行的 SKU 的余额行（同一 SKU 只锁一次），
-   按 line_ref 升序逐行写流水、加订单行的累计量，写订单单据一行，201。
+   按 line_ref 升序逐行写流水、加订单行的累计量，写订单单据一行，
+   预留行的 last_changed_at 设为命令时间（§5.9，与单据的 created_at 相同），201。
 
 锁序：预留行（FOR UPDATE）→ 订单行（FOR UPDATE）→ 余额行（FOR UPDATE）。
 不读池行、SKU 行与商品行：停用、合并进行中都不拦；订单行的 sku_id 照加锁读读到的
@@ -77,7 +78,7 @@ from app.domain.fulfilment import (
 from app.domain.ids import new_id
 from app.domain.ledger import QUANTITY_RULES, EntryType
 from app.domain.reservations import COMMITTED, displayed_status
-from app.models.orders import LINE_ACCUMULATORS, OrderDocument, OrderLine
+from app.models.orders import LINE_ACCUMULATORS, OrderDocument, OrderLine, Reservation
 from app.services.idempotency import BusinessRefTaken, CommandResult, Execution
 from app.services.reservations import (
     RESERVATION_NOT_FOUND,
@@ -458,6 +459,15 @@ def _execute(
         reservation.pool_id,
         now,
         result,
+    )
+    # 预留行已在第 2 步锁住；最后变更时间取本命令的时间，即单据的 created_at（§5.9）。
+    connection.execute(
+        update(Reservation)
+        .where(
+            Reservation.tenant_id == tenant_id,
+            Reservation.reservation_id == reservation.reservation_id,
+        )
+        .values(last_changed_at=now)
     )
     return CommandResult(result, 201)
 
