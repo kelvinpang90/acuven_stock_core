@@ -2341,3 +2341,155 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-054
+    title: 写出对账窗口、两种分页游标与不变量比对的纯函数
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.15 的 5.9（对账查询与待审列表）与 4.4（不变量自查），把参数、游标与比对规则写成纯函数，供 CORE-TASK-056、057 调用。
+      新建 app/domain/reconciliation.py 与 app/domain/invariants.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；时间解析照 app/domain/stock.py 解析流水查询 from、to 的写法，
+      limit 沿用 app/domain/stock.py 的 parse_ledger_limit，摘要取法同 ledger_filter_digest（可以引用这些公开函数，不改那个文件）。
+      一，app/domain/reconciliation.py：
+      解析对账窗口的两个时间（必填、带时区的 RFC 3339、规范化成 UTC 微秒、早于 2000-01-01T00:00:00Z 拒绝，这些都算格式错误）；
+      另一个函数按契约的判定顺序判窗口：changed_from 不早于 changed_to 为一种错误，changed_to 晚于给定的数据库时间减 300 秒为另一种错误，并给出这一刻允许的最晚终点（300 秒写成模块常量）；
+      对账游标的生成、解析与匹配：v1、last_changed_at 的 UTC 微秒时间戳十进制、reservation_id、窗口摘要四段以点连接，窗口摘要为规范化后的两个时间以换行符连接，取 SHA-256 小写十六进制的前 16 个字符；
+      待审列表游标的生成、解析与匹配：v1、reservation_id、status 摘要三段；待审列表唯一接受的状态值 late_payment_review 写成常量。
+      格式不对一律抛 ValueError，调用方据此回 422。
+      二，app/domain/invariants.py：四个检查名常量（ledger_totals、reserved_vs_orders、pending_dispatch_vs_orders、order_commit_state）；
+      输入用不可变的数据类：余额行（pool_id、sku_id、四个量、balance_version）、流水合计（四个量之和、流水条数、最大 balance_version_after，没有流水为全 0）、
+      订单合计（active 预留订单行的 quantity 之和、全部订单行未发未回库件数之和）、一个预留及其订单行（reservation_id、order_ref、status、每行 line_ref、quantity、committed_qty）；
+      函数按契约 4.4 逐项比对，产出违反项（形状照契约 4.4 的响应：前三项带 pool_id、sku_id、expected、actual，ledger_totals 的两个对象用契约写的键名；第 4 项带 reservation_id、order_ref、status、按 line_ref 升序的 line_refs）；
+      汇总函数按 check 编号、再按 pool_id 与 sku_id 或 reservation_id 升序排，返回总数与至多 100 项。
+      明确不做：数据库查询、接口、迁移（CORE-TASK-055 起）；SKU 合并改挂的检查（契约 4.4 写明登记 SKU 合并时再加）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 函数与常量在 app/domain/reconciliation.py 与 app/domain/invariants.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_reconciliation.py 与 tests/unit/test_invariants.py，用 unittest
+      - 单元测试验证窗口时间解析：带时区的时间规范化成 UTC，恰为 2000-01-01T00:00:00Z 放行、早一微秒拒绝；缺少、无时区、格式不对都抛 ValueError
+      - 单元测试验证窗口判定：changed_from 等于或晚于 changed_to 报顺序错误；changed_to 恰为数据库时间减 300 秒放行、晚一微秒报终点太晚并给出允许的最晚终点；两种错误同时存在时先报顺序错误
+      - 单元测试验证游标：对账游标生成后解析得回原时间、reservation_id 与摘要，同一窗口匹配、换一个时间不匹配；前缀错、段数不对、时间戳非数字或有前导零、摘要长度或大小写不对都抛 ValueError；待审列表游标同样验证往返、匹配与这些格式错误
+      - 单元测试验证 ledger_totals：余额与流水合计一致不报；任一个量不等、流水条数或最大 balance_version_after 不等于 balance_version 各报一项，expected 与 actual 的键名照契约 4.4；没有流水、四个量为 0、版本 0 的行不报
+      - 单元测试验证另三项：reserved_vs_orders 与 pending_dispatch_vs_orders 相等不报，不等报一项且 expected 为订单合计、actual 为余额行上的值；order_commit_state 在 committed 全部行确认时不报、有一行 committed_qty 为 0 时报出该行，非 committed 有一行 committed_qty 不为 0 时报出
+      - 单元测试验证汇总：违反项按 check 编号再按 pool_id、sku_id 或 reservation_id 升序；超过 100 项时只返回前 100 项而总数照实；没有违反时总数为 0
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/reconciliation.py
+      - app/domain/invariants.py
+      - tests/unit/test_reconciliation.py
+      - tests/unit/test_invariants.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-055
+    title: 预留表加最后变更时间，改预留或订单行的命令都同步设它
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.15 的 5.9 最后变更时间与存放，新增迁移 alembic/versions/20261119_0010_reservation_last_changed_at.py（revision 0010，接在 0009 之后），
+      在 app/models/orders.py 的 Reservation 加列 last_changed_at（DATETIME(6)，非空）与两个索引，并让现有改预留行或订单行的命令在同一事务里设它。
+      数据库与命令放在同一个任务里（拆分规则的例外），原因：只加列而命令不设，部署之后到下一个任务合并之前写入的预留会带着错的最后变更时间，对账会漏掉它们；拆开就要在第二个任务里再回填一次。
+      一，迁移只加列、加索引（契约 2.2）：加列时以 CURRENT_TIMESTAMP(6) 为默认值，同一迁移里回填已有的行，取 created_at、closed_at、committed_at、review_closed_at
+      与该预留 order_documents.created_at 中最大的一个（空值不计）；索引 (tenant_id, channel_id, last_changed_at, reservation_id) 与 (tenant_id, channel_id, status, reservation_id)；downgrade 删去两个索引与这一列。
+      不新建模型模块，所以不用改 alembic/env.py 与 app/models/__init__.py。
+      二，设它的事务（契约 5.9 列出的全部）：预留新建（等于 created_at）、释放、到期关单（定时任务、新预留之前、确认销售之前、释放命中已到期，各条路径都算）、确认销售（正常与晚到）、第一次转入待审、故障补交新建、待审结案，
+      在 app/services/reservations.py 与 app/services/sale_commits.py 里写预留行的同一条 UPDATE 或 INSERT 里带上；发货、退款回库、退货验收在 app/services/fulfilment.py 里，写单据的同一事务里对预留行加一条 UPDATE，取本命令的时间。
+      一个事务为写库取了不止一次数据库时间时，用写库用到的最晚一次；只为生成响应而取的时间不算。
+      三，不改任何列的路径不设：幂等重放与换键重报返回已有结果、对已 released 或 expired 的再释放、待审重试仍不够、对已 closed_refunded 的再结案。
+      四，last_changed_at 不进预留的表示，现有接口的响应不变。
+      明确不做：对账查询与待审列表接口（CORE-TASK-056）；不变量自查（CORE-TASK-057）；SKU 合并改挂时设它（登记 SKU 合并时做）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 迁移文件为 alembic/versions/20261119_0010_reservation_last_changed_at.py，down_revision 为 0009；模型在 app/models/orders.py；upgrade 后 alembic check 无差异，downgrade 再 upgrade 照常（由 CI 的 integration 执行）；已有的集成测试照常通过，现有接口的响应体不变
+      - 集成测试验证回填：在 0009 的结构上造 active、released、committed、带单据的 committed、closed_refunded 几种预留，upgrade 到 0010 后各自的 last_changed_at 等于契约写的那几个时间列与单据时间中最大的一个
+      - 集成测试验证新建：预留新建后 last_changed_at 等于 created_at；故障补交新建的预留同样设上
+      - 集成测试验证状态变化：释放、定时任务到期关单、释放命中已到期、确认销售、晚到确认、转入待审、待审结案之后，last_changed_at 都变大，且等于该事务写进预留的最晚的时间列
+      - 集成测试验证付款后命令：发货、退款回库、退货验收之后 last_changed_at 变大，且等于该单据的 created_at
+      - 集成测试验证不设的路径：同键重放、换键同内容重报、再释放已释放的、待审重试仍不够、再结案已结案的之后，last_changed_at 不变
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - alembic/versions/20261119_0010_reservation_last_changed_at.py
+      - app/models/orders.py
+      - app/services/reservations.py
+      - app/services/sale_commits.py
+      - app/services/fulfilment.py
+      - tests/integration/test_reservation_last_changed_at.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-056
+    title: 实现订单对账查询与待审列表两个读接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.15 的 5.9，新建 app/api/reconciliation.py 与 app/services/reconciliation.py，在 app/main.py 挂路由；
+      参数与游标用 CORE-TASK-054 的 app/domain/reconciliation.py，查询用 CORE-TASK-055 的 last_changed_at 与两个索引。两个接口 scope orders.read，不要求角色，不经幂等执行器，只做普通读。
+      一，GET /v1/reconciliation/orders：只收 changed_from、changed_to、after、limit，未知参数或同一参数出现两次 422（规则同 app/api/stock_queries.py 的 _parameters，可以直接引用，不改那个文件）；
+      判定顺序照契约：格式（含早于 2000 年）422，再顺序 422，再终点太晚 422（details 为 latest_changed_to），最后游标与窗口不符 422；凭据没有销售入口或入口已停用时，在各种 422 之后返回空数组，next_cursor 照契约 2.5。
+      按 (tenant_id, channel_id) 与 changed_from 不晚于 last_changed_at、last_changed_at 早于 changed_to 选预留，按 (last_changed_at, reservation_id) 升序键集分页；
+      每页在一个只读事务里读（REPEATABLE READ，同一个读快照）。每项：reservation 用 app/services/reservations.py 现有的表示函数（已到期还没关掉的 active 显示为 expired）；
+      last_changed_at；lines 按 line_ref 升序，每行 line_ref、sku_id、quantity 与五个累计量（形状同订单库存查询）；不返回单据与流水。返回 orders 与 next_cursor。
+      二，GET /v1/reservations 带 status：在 app/api/reservations.py 现有的 order_ref 查询上扩展，order_ref 与 status 必须且只能带一个；带 order_ref 时行为与现在完全相同；
+      带 status 时只收 status、after、limit，status 只接受 late_payment_review；只列凭据销售入口的预留，按 reservation_id 升序键集分页，返回 reservations（现有表示）与 next_cursor；
+      凭据没有销售入口时在各种 422 之后返回空数组。查询函数放 app/services/reconciliation.py，不改 app/services/reservations.py。
+      明确不做：不变量自查（CORE-TASK-057）；网店侧的对账与待办；改预留的表示。
+    status: ready
+    depends_on:
+      - CORE-TASK-054
+      - CORE-TASK-055
+    acceptance_criteria:
+      - 对账查询在 app/api/reconciliation.py 与 app/services/reconciliation.py，路由在 app/main.py 挂上；待审列表在 app/api/reservations.py 扩展；已有的集成测试照常通过，order_ref 查询的行为不变
+      - 集成测试验证对账查询的选取：窗口只含 last_changed_at 在 changed_from 与 changed_to 之间（含起点、不含终点）的预留；别的入口的预留不出现；每项的 reservation、last_changed_at 与 lines 的累计量与订单库存查询一致；经发货的订单显示发货件数
+      - 集成测试验证对账查询的分页：一个窗口 5 个订单 limit 2 翻三页不重不漏、按 (last_changed_at, reservation_id) 升序；同一时刻的多个订单按 reservation_id 排；最后一页之后再翻返回空数组且 next_cursor 等于请求的 after
+      - 集成测试验证对账查询的拒绝：缺任一时间、无时区、早于 2000 年、changed_from 不早于 changed_to、changed_to 晚于现在减 300 秒（details 带 latest_changed_to）、limit 为 0 或 101、未知参数、参数重复、游标格式不对、别的窗口的游标都 422，判定顺序照契约；缺 orders.read 403
+      - 集成测试验证凭据没有销售入口：两个接口参数合格时返回空数组，参数不合格时仍是 422
+      - 集成测试验证待审列表：只列 late_payment_review 的预留，按 reservation_id 升序分页不重不漏；结案之后不再出现；别的入口的不出现；order_ref 与 status 都带或都不带 422；status 为别的值 422；带 status 时出现别的参数 422；游标与 status 不符 422
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/reconciliation.py
+      - app/services/reconciliation.py
+      - app/api/reservations.py
+      - app/main.py
+      - tests/integration/test_reconciliation_api.py
+      - tests/integration/test_late_payment_review_list_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-057
+    title: 实现不变量自查接口，查账面、流水与订单是否对得上
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.15 的 4.4，新建 app/api/ops.py 与 app/services/invariants.py，在 app/main.py 挂路由 GET /v1/ops/invariants；
+      比对与汇总用 CORE-TASK-054 的 app/domain/invariants.py。scope ops.read（运维凭据，不带销售入口），不要求角色，不经幂等执行器，不做池授权，查凭据所属租户的全部池。
+      一，不收任何查询参数，带了 422。
+      二，全部查询在一个只读事务里做（REPEATABLE READ，开启时即取读快照），不加锁：按余额行聚合该租户的流水（四个量之和、条数、最大 balance_version_after），
+      按 (pool_id, sku_id) 聚合 active 预留的订单行 quantity 之和与全部订单行的 committed_qty 减 dispatched_qty 减 refund_restocked_qty 之和，读出全部预留的状态与订单行的 committed_qty；
+      流水与订单行都有外键指向余额行，所以从余额行出发不会漏。checked_at 取这个事务里的数据库时间。
+      三，响应 200（查出违反也是 200）：checked_at、ok、violation_count、violations（至多 100 项），形状照契约 4.4。
+      四，每次自查在进程日志写一行，带租户、用时与违反项数，不写违反项的内容。
+      明确不做：定时调用与告警（契约 4.4 写明属于 OPS-04 的监控，另行登记）；任何自动修复；SKU 合并改挂的检查。
+    status: ready
+    depends_on:
+      - CORE-TASK-054
+    acceptance_criteria:
+      - 接口在 app/api/ops.py，查询在 app/services/invariants.py，路由在 app/main.py 挂上；已有的集成测试照常通过
+      - 集成测试验证正常的账：经期初、收货、预留、确认销售、发货、退款回库、退货验收、释放与到期关单之后，自查 ok 为 true、violation_count 为 0；另一个租户的数据不影响结果
+      - 集成测试验证 ledger_totals：直接改库让某余额行的一个量或 balance_version 与流水不符，报出该行，expected 与 actual 的键名与值照契约 4.4
+      - 集成测试验证 reserved_vs_orders 与 pending_dispatch_vs_orders：直接改库让 reserved 或 paid_pending_dispatch 与订单行不符，各报出该行；已到期还没关掉的 active 预留不误报
+      - 集成测试验证 order_commit_state：直接改库让 committed 预留的一行 committed_qty 为 0，报出该预留与那一行
+      - 集成测试验证汇总：违反超过 100 项时只返回 100 项、violation_count 照实、按契约排序
+      - 集成测试验证鉴权与参数：没有 ops.read 的凭据 403；带任何查询参数 422；自查前后各表内容不变
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/ops.py
+      - app/services/invariants.py
+      - app/main.py
+      - tests/integration/test_invariants_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
