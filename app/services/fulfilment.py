@@ -42,6 +42,11 @@ channel_id、凭据、幂等键、操作者与请求 ID 取本次请求；reason
 单据的表示（document_representation）与按类型查、写单据（find_order_document、
 insert_order_document）、回答已有单据（answer_existing_order_document）三种类型通用，
 订单库存查询也用它们。
+
+订单库存查询（read_order_stock，§5.8）不经幂等执行器，在调用方的连接上开一个
+REPEATABLE READ、READ ONLY 的事务，预留、订单行与单据都在同一个读快照里用普通读读出，
+自己不提交、不回滚（调用方读完结束事务）。查不到预留 404 RESERVATION_NOT_FOUND（不记事件），
+游标与本订单不符 422；参数格式由接口层先判。
 """
 
 from collections.abc import Sequence
@@ -49,10 +54,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Connection, insert, select, update
+from sqlalchemy import Connection, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 
-from app.api.errors import ApiError
+from app.api.errors import ApiError, invalid_request
+from app.domain.catalog import AFTER
 from app.domain.fulfilment import (
     DOCUMENT_ID_PREFIXES,
     REF_FIELDS,
@@ -62,7 +68,9 @@ from app.domain.fulfilment import (
     QuantityLine,
     ReturnLine,
     apply_line,
+    cursor_matches,
     exceeding_lines,
+    format_order_stock_cursor,
     line_entries,
     unknown_line_refs,
 )
@@ -71,7 +79,15 @@ from app.domain.ledger import QUANTITY_RULES, EntryType
 from app.domain.reservations import COMMITTED, displayed_status
 from app.models.orders import LINE_ACCUMULATORS, OrderDocument, OrderLine
 from app.services.idempotency import BusinessRefTaken, CommandResult, Execution
-from app.services.reservations import RESERVATION_NOT_FOUND, STATE_CONFLICT, lock_reservation_by_ref
+from app.services.reservations import (
+    RESERVATION_NOT_FOUND,
+    STATE_CONFLICT,
+    ReservationLine,
+    database_now,
+    find_reservation_by_ref,
+    lock_reservation_by_ref,
+    reservation_representation,
+)
 from app.services.sale_commits import LINES, RESERVATION_MISMATCH
 from app.services.stock import (
     BUSINESS_REF_CONFLICT,
@@ -87,6 +103,8 @@ from app.services.stock import (
 QUANTITY_EXCEEDS_OUTSTANDING = "QUANTITY_EXCEEDS_OUTSTANDING"
 
 _DUPLICATE_ENTRY = 1062  # MySQL ER_DUP_ENTRY
+# 只对下一个事务生效：订单库存查询的三部分在同一个读快照里（§5.8）。
+_READ_SNAPSHOT = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 
 
 @dataclass(frozen=True)
@@ -499,3 +517,88 @@ def create_return_receipt(
         if not isinstance(line, ReturnLine):
             raise TypeError(f"a return receipt needs ReturnLine lines, got {line!r}")
     return create_document(execution, RETURN_RECEIPT, order_ref, return_ref, lines, fields)
+
+
+# --- 订单库存查询（§5.8） ---
+
+
+def read_order_lines(
+    connection: Connection, tenant_id: str, reservation_id: str
+) -> list[OrderLineTotals]:
+    """普通读读预留的全部订单行与累计量，按 line_ref 升序。"""
+    statement = (
+        select(*_TOTALS_COLUMNS)
+        .where(OrderLine.tenant_id == tenant_id, OrderLine.reservation_id == reservation_id)
+        .order_by(OrderLine.line_ref)
+    )
+    return [OrderLineTotals(**row) for row in connection.execute(statement).mappings()]
+
+
+def read_order_documents(
+    connection: Connection,
+    tenant_id: str,
+    reservation_id: str,
+    after_seq: int | None,
+    limit: int,
+) -> list[tuple[int, dict[str, Any]]]:
+    """普通读读预留的单据，按 document_seq 升序取大于 after_seq 的至多 limit 张；
+    返回 (document_seq, result)。
+    """
+    statement = select(OrderDocument.document_seq, OrderDocument.result).where(
+        OrderDocument.tenant_id == tenant_id, OrderDocument.reservation_id == reservation_id
+    )
+    if after_seq is not None:
+        statement = statement.where(OrderDocument.document_seq > after_seq)
+    statement = statement.order_by(OrderDocument.document_seq).limit(limit)
+    return [(row.document_seq, row.result) for row in connection.execute(statement)]
+
+
+def _totals_representation(totals: OrderLineTotals) -> dict[str, Any]:
+    """一行订单行：line_ref、sku_id、quantity 与 §5.1 的五个累计量。"""
+    return {
+        "line_ref": totals.line_ref,
+        "sku_id": totals.sku_id,
+        "quantity": totals.quantity,
+        **{name: getattr(totals, name) for name in LINE_ACCUMULATORS},
+    }
+
+
+def read_order_stock(
+    connection: Connection,
+    tenant_id: str,
+    channel_id: str,
+    order_ref: str,
+    after: str | None,
+    cursor: tuple[int, str] | None,
+    limit: int,
+) -> dict[str, Any]:
+    """订单库存查询的 data：reservation、lines、documents 与 next_cursor。
+
+    after 是请求里的原值，cursor 是已校验过格式的 (document_seq, 摘要)，没带都为 None。
+    调用时连接上没有打开的事务；返回或抛出时事务仍开着，由调用方结束。
+    预留按 (tenant_id, channel_id, order_ref) 查，没有 404 RESERVATION_NOT_FOUND；
+    游标不属于这个订单 422。没有新单据时 next_cursor 原样为 after。
+    """
+    connection.execute(text(_READ_SNAPSHOT))
+    reservation = find_reservation_by_ref(connection, tenant_id, channel_id, order_ref)
+    if reservation is None:
+        raise ApiError(404, RESERVATION_NOT_FOUND, "reservation not found")
+    reservation_id = reservation.reservation_id
+    if cursor is not None and not cursor_matches(cursor[1], reservation_id):
+        raise invalid_request(f"invalid {AFTER} parameter", {"parameter": AFTER})
+
+    totals = read_order_lines(connection, tenant_id, reservation_id)
+    after_seq = None if cursor is None else cursor[0]
+    documents = read_order_documents(connection, tenant_id, reservation_id, after_seq, limit)
+    lines = [ReservationLine(t.line_ref, t.sku_id, t.quantity) for t in totals]
+    now = database_now(connection)
+
+    next_cursor = after
+    if documents:
+        next_cursor = format_order_stock_cursor(documents[-1][0], reservation_id)
+    return {
+        "reservation": reservation_representation(reservation, lines, now),
+        "lines": [_totals_representation(t) for t in totals],
+        "documents": [result for _, result in documents],
+        "next_cursor": next_cursor,
+    }
