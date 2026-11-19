@@ -1,6 +1,8 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.15｜2026-11-19｜状态：**Kelvin 已批准**——第 14 节第 88–90 条（§5.9 订单对账查询与待审列表、预留的最后变更时间，§4.4 不变量自查，
+> 版本：0.16｜2026-11-19｜状态：**Kelvin 已批准**——第 14 节第 91–93 条（§2.8 SKU 合并的接口、判定顺序、表示与存放，§2.4 状态机简化、执行的锁序与复核，
+> §2.5、§2.7、§4.4 第 5 项、§5.6、§5.7、§5.9、§6.2 第 2、3 条、§7.1 第 1、2 条、§7.2、§8.2、§8.3、§10 第 3、4 条的相应条目；取舍见 Q-70、Q-71）于 2026-11-19 批准。
+> 0.15：第 14 节第 88–90 条（§5.9 订单对账查询与待审列表、预留的最后变更时间，§4.4 不变量自查，
 > §5.4、§5.6、§5.7、§5.8、§8.2、§9.1、§10 第 4 条、§13 第 12 条的相应条目；取舍见 Q-67～Q-69）于 2026-11-19 批准。
 > 0.14：第 14 节第 84–87 条（§5.8 发货、退款回库、退货验收与订单库存查询的接口、判定顺序、表示与存放，
 > §5.3、§5.4、§5.6、§5.7、§6.7、§8.2、§8.3、§9.1、§13 的相应条目；取舍见 Q-63～Q-66）于 2026-11-18 批准。
@@ -26,7 +28,7 @@
 > 第 14 节第 18–23 条的 0.6 改动（§7.1 幂等的作用域、摘要、处理中判定与保存范围，§7.2 安全日志，§8.1 请求头与检查顺序，§8.3 新增 405，
 > §10 凭据、令牌、scope、角色表与池授权）
 > 与第 24–37 条（审查与设计预审后的修改；取舍见 Q-31～Q-35，含 §7.1 第 2 条追加的“换键重报返回对象当前的表示”）于 2026-11-13 批准。
-> 0.15 及以前的设计闸门通过；实现进度见 [TODO.md](TODO.md)。
+> 0.16 及以前的设计闸门通过；实现进度见 [TODO.md](TODO.md)。
 > 按模板规则：设计有改动时，改动部分的批准作废、须重新批准。
 > 依据：[REQUIREMENTS.md](../REQUIREMENTS.md)（Core V1 需求，2026-10-08）、`acuven_hub/DECISIONS.md` 的 C-01～C-19、S-01～S-10、I-02、I-04，
 > 以及 `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md`（Inventory 草案，只读参照）。
@@ -183,42 +185,37 @@
 
 ```mermaid
 stateDiagram-v2
-  [*] --> draft: 管理员选定 来源SKU→规范SKU
-  draft --> selling_paused: 暂停两个 SKU 的新预留
+  [*] --> selling_paused: 管理员选定 来源SKU→规范SKU，建单即暂停两个 SKU 的新预留
   selling_paused --> counted: 运营人员录入两个 SKU 合计的盘点实数（Core 记快照）
-  counted --> counted: 执行被拒（COUNT_BELOW_COMMITMENTS / COUNT_STALE，不改任何数量）；重新点数后重新录入（覆盖快照）
-  counted --> migrating: 确认执行
-  migrating --> reconcile_pending: Core 迁移完成
+  counted --> counted: 执行被拒或出错（COUNT_BELOW_COMMITMENTS / COUNT_STALE / 其他错误，事务回滚，不改任何数量）；重新点数后重新录入（覆盖快照）
+  counted --> reconcile_pending: 执行（一个事务里迁移、定数）
   reconcile_pending --> completed: 网店确认映射已切换且对账一致，恢复销售
-  migrating --> failed_paused: 迁移出错（事务已回滚；不含 COUNT_BELOW_COMMITMENTS / COUNT_STALE）
-  failed_paused --> migrating: 重试（幂等）
-  failed_paused --> counted: 重试遇到 COUNT_BELOW_COMMITMENTS / COUNT_STALE（不改任何数量）
-  draft --> cancelled
-  selling_paused --> cancelled: 未迁移前可取消并恢复销售
+  selling_paused --> cancelled: 未执行前可取消并恢复销售
   counted --> cancelled: 同上
-  failed_paused --> cancelled: 同上
 ```
 
-停售只停**新预留**：`selling_paused` 与 `counted` 期间，已有预留照常确认、释放、到期，已付款订单照常发货、退款回库、退货，
+（0.16，Q-70：去掉 0.5 的 `draft`、单独的“暂停”命令、`migrating` 与 `failed_paused`。执行是一个事务，出错整笔回滚，合并单本来就留在 `counted`，
+直接再执行即可，所以“迁移中”“迁移失败”两个状态在库里看不到；建单与暂停合成一步。CAT-05 的“失败时保持停售和可恢复状态”由 `counted` 承担。
+接口、判定顺序、表示与存放见 §2.8。）
+
+停售只停**新预留**：从建单到合并单 `completed` 或 `cancelled` 之间（0.16：执行之后来源 SKU 已合并，按已合并拒绝新预留；规范 SKU 到合并单 `completed` 才恢复），已有预留照常确认、释放、到期，已付款订单照常发货、退款回库、退货，
 故障补交（§5.7，0.13）还会在这两个 SKU 上新建已确认或待审的预留与订单行，
 收货、不可售、报损也照常可做。所以盘点用 §6 的**差额法**，不用盘点数覆盖执行时的账面（0.5，Q-30）：
 
-- **合并单互不重叠**：一个 SKU 同时最多属于一张未结束（`completed`、`cancelled` 以外）的合并单；规范 SKU 必须是 `active`；来源 SKU 不能已经合并过（`merged_into_sku_id` 为空），也不能等于规范 SKU。建单时校验，执行时在锁内复核。
-- **按池分别处理**：录入实数、快照、迁移与定数都按池分别做（V1 只有一个池）。
+- **合并单互不重叠**：一个 SKU 同时最多属于一张未结束（`completed`、`cancelled` 以外）的合并单；规范 SKU 必须是 `active`；来源 SKU 不能已经合并过（`merged_into_sku_id` 为空），也不能等于规范 SKU。建单时校验；执行时复核的范围见 §2.8（0.16）。两个 SKU 可以属于不同商品（同一实物被建成了两个商品时也靠合并修正）；合并不改任何商品的状态（0.16）。
+- **按池分别处理**：录入实数、快照、迁移与定数都按池分别做（V1 只有一个池；0.16：V1 一张合并单只在一个池上录入与执行，§2.8）。
 
 - **录入实数（`count`）**：两个 SKU 是同一种实物，运营人员（`stock_operator` 或 `stock_admin`，§10 第 3 条）录**合计**的两项实数——在架件数（含已付款待发的件）与不可售件数，
   都是不小于 0 的整数，否则 422。Core 在同一事务里按 `(pool_id, sku_id)` 升序锁两个余额行（某个 SKU 在该池还没有余额行时，照 §4.1 先建好，四个量为 0、版本 0），记下它们当时的四个账面量与 `balance_version` 作为**快照**。
   点数前的实物进出须先入账，规则同 §6。只有重新点过实物时才重新录入，后一次覆盖前一次的实数与快照。
 - **执行（`execute`）**：第 0 步的关单在开事务之前；之后的检查与第 1–3 步在 Core 的**一个事务**里，两个余额行按 `(pool_id, sku_id)` 升序加锁
-  （0.12：要改挂订单行，所以锁余额行之前先按 `reservation_id` 升序锁住涉及的预留行，再按 §5.6 的锁序锁订单行与余额行，细节在登记合并任务前定。0.13：用普通读找出的预留名单，在等余额行期间可能漏掉并发提交的故障补交新建的订单行（§5.7 第 5 步），
-  所以合并的业务事务以 READ COMMITTED 开启，锁住余额行之后用普通读复核来源 SKU 上属于第 1 步四种状态的预留的订单行（规范 SKU 上的订单行不用改挂，不在名单里，也不复核）（REPEATABLE READ 下会漏看刚提交的行），多出名单的就回滚重来（次数上限由合并任务定）；
-  名单里的预留在锁住时已变成 `released`、`closed_refunded` 的，按锁住时的状态不改挂。名单含来源 SKU 上全部历史 `committed` 预留，会随时间增长，由合并任务估量；
-  不能在锁住余额行之后再去锁新的预留行，那与“预留行 → 余额行”的锁序相反；也不能在锁余额行之前锁 SKU 行，否则与故障补交新建“余额行 → SKU 行”成环）：
+  （0.12、0.13：要改挂订单行，所以锁余额行之前先锁住涉及的预留行与订单行；用普通读找出的名单可能漏掉并发的故障补交新建的订单行，锁住余额行之后复核、多出就回滚重来。
+  锁序、名单、复核与重来的上限见 §2.8 执行的判定顺序，0.16）：
   0. **前置检查**：开业务事务之前（§2.7 的先后里余额行预建之后），按 §5.6 的到期关闭把两个 SKU 上已到期的 `active` 预留逐个关掉，每个一个事务（0.12：不在锁住余额行之后关单，否则与释放、到期关单“预留行 → 余额行”的锁序成环）；
      开事务之后才到期的预留随订单行一起迁到规范 SKU，之后照常关单。再查快照之后两个 SKU 上有没有 §6 定义的**只改账的流水**（看锁住的余额行上的 `last_book_only_version` 是否大于快照版本，§4.1，0.9）；
      有则录入的实数已作废，整笔拒绝，409 `COUNT_STALE`，合并单留在 `counted`，须重新点数、重新录入。
   1. **整行迁移**：来源 SKU **执行时**的四个账面量全部转到规范 SKU——来源写 `MERGE_TRANSFER_OUT`（四个量各减去当前值，归零），
-     规范写 `MERGE_TRANSFER_IN`（各加同样的量），成对出现；同时把来源 SKU 上 `active`、`expired`、`late_payment_review`、`committed` 四种状态的预留的全部订单行（连同累计量）改挂到规范 SKU（0.13；
+     规范写 `MERGE_TRANSFER_IN`（各加同样的量），成对出现，来源的四个量全为 0 时也写（0.16：两条流水设两个余额行的判定列，来源 SKU 上执行之前的流水因此不能再更正，§6.7 第 2 步）；同时把来源 SKU 上 `active`、`expired`、`late_payment_review`、`committed` 四种状态的预留的全部订单行（连同累计量）改挂到规范 SKU（0.13；
      已到期、已在待审的订单仍可能晚到确认，§5.7 按订单行的 `sku_id` 锁余额行），找出、锁住的预留名单也按这四种状态取；`released`、`closed_refunded` 的不改挂。
      两个各自满足不变量的账面相加仍满足不变量，这一步不会失败。两条迁移流水都是只改账的流水，照 §4.1 更新两个余额行的 `last_book_only_version` 与 `last_reconciled_version`（0.9、0.10）。
   2. **按差额定数**：`d_u` = 不可售实数 − 两个快照的 `unavailable` 之和；
@@ -229,7 +226,7 @@ stateDiagram-v2
   3. **不变量**：第 2 步落账后若违反 §4.1，整笔执行回滚（第 1 步也不生效），返回 409 `COUNT_BELOW_COMMITMENTS`，
      缺口数照 §6 的公式算；合并单留在 `counted`。管理员照 §6 先处理相关预留与缺货的已付款订单，然后**直接再执行**：
      沿用原实数与快照，其间的释放、退款回库、发货等变动由差额法照常保留；不要把原来的数再录一遍（会重取快照、把其间的发货等算错）。
-     这类业务拒绝不进 `failed_paused`（那是迁移本身出错的分支）。
+     执行因别的原因出错（数据库错误等）时同样整笔回滚、合并单留在 `counted`，查明后直接再执行（0.16，Q-70）。
 - 结果：规范 SKU 的账面 = 盘点核实的数量 ＋ 盘点之后发生的变动，不是两份余额直接相加（CAT-05）；盘点时漏点、重复计的件数由差额修正。
 - 来源 SKU 归零后设 `inactive` 且 `merged_into_sku_id = 规范 SKU`；
 - 数据库约束：`merged_into_sku_id` 不能等于自身；非空时该 SKU 必须是 `inactive`。已合并的 SKU 不能重新启用（`reactivate` 返回 409 `SKU_MERGED`）。
@@ -273,7 +270,7 @@ V1 用拉取，不做推送（Q-08）。
   抬高之后不能再重放 binlog。
   “用旧游标重拉得到同样的记录”只在没有丢数据时成立：游标落在丢失窗口里的，重拉得到的是恢复后的新记录。丢失窗口里的目录变化照 §12.1 第 4 条补齐。
 - 事件类型：`product_created`、`product_updated`、`product_deactivated`、`product_reactivated`、`sku_created`、`sku_updated`、
-  `sku_deactivated`、`sku_reactivated`；登记 SKU 合并时再加 `sku_merged`。调用方须忽略不认识的事件类型（§8.4 只做加法）。
+  `sku_deactivated`、`sku_reactivated`、`sku_merged`（0.16：SKU 合并执行时给来源 SKU 写，§2.8）。调用方须忽略不认识的事件类型（§8.4 只做加法）。
 
 ### 2.6 目录命令（0.7，Q-36～Q-38）
 
@@ -334,12 +331,12 @@ V1 用拉取，不做推送（Q-08）。
 - 列：`id`（自增 `BIGINT` 主键，变更流的顺序与游标都由它来）、`tenant_id`、`event_type`（`VARCHAR(32)`，不加检查约束，以后加事件类型不改表，
   由应用校验）、`object_type`（`product` / `sku`，检查约束）、`object_id`、`product_id`（SKU 事件为所属商品，商品事件等于 `object_id`；
   复合外键指向商品）、`version`（改动后的版本）、`changes`（JSON，`{字段名: {"before": …, "after": …}}`，字段名与表示里的相同，
-  `reference_price` 整个对象算一个字段，停用与重新启用记 `status`）、`credential_id`、`actor_ref`、`actor_role`（目录写命令都要求
-  `catalog_admin`，所以两者必有）、`reason`、`import_id`（导入确认建的才有，复合外键指向 `catalog_imports`）、`request_id`、
+  `reference_price` 整个对象算一个字段，停用与重新启用记 `status`）、`credential_id`、`actor_ref`、`actor_role`（写变更记录的命令都要求角色——目录命令
+  `catalog_admin`、SKU 合并执行 `stock_admin`，所以两者必有）、`reason`、`import_id`（导入确认建的才有，复合外键指向 `catalog_imports`）、`request_id`、
   `idempotency_key`、`created_at`。索引 `(tenant_id, id)`、`(tenant_id, object_id, id)`。
 - 与目录写入、编码历史、幂等记录在同一事务提交（§12.1 第 1 条）。
 - **目录写锁**：自增值在插入时分配，不按提交顺序；不加锁时，读变更流的一方可能先看到已提交的大号，晚提交的小号就被跳过了。
-  所以每个写目录的命令（§2.6 的新建、加规格、修改、停用、重新启用，§2.3 的导入确认，以后的 SKU 合并）在取到幂等命名锁（§7.1 执行顺序第 1 步）
+  所以每个写目录的命令（§2.6 的新建、加规格、修改、停用、重新启用，§2.3 的导入确认，§2.8 的 SKU 合并执行；§2.8 的 SKU 合并新建不写目录也取，见下）在取到幂等命名锁（§7.1 执行顺序第 1 步）
   之后、开事务之前，在同一连接上再取一个 MySQL 命名锁 `GET_LOCK(目录锁名, 5)`：
   - 锁名是数据库名、字面量 `catalog`、`tenant_id` 三项以换行符（0x0A）连接后 UTF-8 编码的 SHA-256 小写十六进制，64 个字符；定下后不改。
   - 5 秒内取不到（返回 0）或出错（返回 NULL）：503 `UNAVAILABLE`（确定未生效，可同键重试），什么也不写、不保存。
@@ -349,9 +346,122 @@ V1 用拉取，不做推送（Q-08）。
   没有别的目录写入。V1 目录写入很少，串行的代价可以接受。
   不锁租户行：幂等记录、流水、余额等表都有外键指向 `tenants`，插入时对租户行加共享锁，锁租户行会让目录命令与本租户的全部写命令互相阻塞，
   锁序与销售命令相反时还会死锁。命名锁不是 InnoDB 行锁，不受外键影响；取它时还没开事务、不持有任何行锁，所以不会与行锁形成环。
-  既写目录又锁余额行的命令（SKU 合并）照此先取目录写锁，开事务后再按 §8.1 的顺序锁余额行。批量导入的预览不写目录，不取这个锁。
-  开事务前的先后固定为：幂等锁（§7.1）→ 目录写锁（只有写目录的命令）→ 余额行预建的短事务（§4.1，只有要锁余额行的命令）→ 关掉相关到期预留的短事务（只有新预留、确认销售与 SKU 合并执行，§5.6、§5.7、§2.4，0.12、0.13）→ 开业务事务。
+  既写目录又锁余额行的命令（SKU 合并执行）照此先取目录写锁，开事务后再按 §8.1 的顺序锁余额行。批量导入的预览不写目录，不取这个锁。
+  SKU 合并新建不写目录，也取这个锁（0.16，§2.8）：它锁 SKU 行，取锁后与修改编码等目录命令串行，避免两边按不同顺序锁 SKU 行而死锁。
+  开事务前的先后固定为：幂等锁（§7.1）→ 目录写锁（只有写目录的命令与 SKU 合并新建）→ 余额行预建的短事务（§4.1，只有要锁余额行的命令）→ 关掉相关到期预留的短事务（只有新预留、确认销售与 SKU 合并执行，§5.6、§5.7、§2.4，0.12、0.13）→ 开业务事务。
   两条规则：不在打开事务或持有行锁时带等待地 `GET_LOCK`；凡是写 `catalog_changes` 的路径都先取目录写锁。
+
+### 2.8 SKU 合并的接口、判定顺序、表示与存放（0.16，Q-70、Q-71）
+
+§2.4 的规则不变（状态机按 Q-70 简化），这里补接口、判定顺序、表示与存放，并定下 0.12、0.13 留到登记合并任务前的锁序、复核与名单估量。
+
+**通用**
+- scope：全部接口（含查询）要 `catalog.write` 与 `stock.write` 两者（§10 第 4 条）。角色（§10 第 3 条）：新建、执行、完成、取消要 `stock_admin`；录入实数要 `stock_operator` 或 `stock_admin`。
+  操作类型依次为 `sku_merges.create`、`sku_merges.count`、`sku_merges.execute`、`sku_merges.complete`、`sku_merges.cancel`，路径参数名 `merge_id`（§7.1）。
+- 池授权（§10 第 4 条，在取幂等锁之前）：录入实数按正文的 `pool_id`；执行按合并单录入实数时的池，属于“按 ID 指向池内对象”，顺序同 §10 第 4 条
+  （凭据没有销售入口 403；合并单不存在或属于别的租户 404 `SKU_MERGE_NOT_FOUND`，属于别的租户的记 `cross_tenant`，不保存；池不是获准的池 403）；
+  还没录入过实数的合并单没有池，只查凭据有没有销售入口；事务里先复核池（执行第 1 步，锁内的 403 作为确定结果保存），再按状态判。新建、完成、取消与查询不做池授权。
+- 录入实数、完成与取消在事务里 `FOR UPDATE` 读合并单行时判 404 `SKU_MERGE_NOT_FOUND`（属于别的租户的记 `cross_tenant`），作为确定结果保存（同 §2.6 第 4 条的 404）。
+- 隔离级别：本节的写事务都以 READ COMMITTED 开启——新建的重叠检查、执行的名单复核都靠普通读看到最新已提交的数据（同 §5.6）。
+- 锁序：合并单行（`FOR UPDATE`）→ 预留行（`FOR UPDATE`，按 `reservation_id` 升序）→ 订单行（`FOR UPDATE`，按 `order_line_id` 升序）→ 池行（`FOR SHARE`）
+  → 余额行（`FOR UPDATE`，按 §8.1 升序）→ SKU 行（按 `sku_id` 升序）；用不到的层跳过。只有本节的命令锁合并单行，所以它排在最前不会与别的命令成环；
+  其后几层与 §5.6 的锁序相同。新建只锁 SKU 行（`FOR UPDATE`）；录入实数跳过预留行、订单行；执行跳过池行（录入实数时已判过 `live`，池不会退回 `initializing`，同 §6.6）。
+
+**停售的判定**
+- 一个 SKU 是某张 `selling_paused` 或 `counted` 合并单的来源或规范 SKU，或某张 `reconcile_pending` 合并单的规范 SKU，就算**停售中**
+  （`reconcile_pending` 时来源 SKU 已合并，按已合并处理）。`completed`、`cancelled` 的合并单不停售。
+- 新预留（§5.6 第 5 步）：按 `sku_id` 升序 `FOR SHARE` 读 SKU 行与商品行之后，用普通读查所列 SKU 有没有使它停售的合并单。
+  判定顺序为已合并 → 停用 → 停售：409 `SKU_SELLING_PAUSED`，`details.sku_ids` 按请求顺序列出全部停售中的 SKU。
+  新建在事务里 `FOR UPDATE` 锁两个 SKU 行，所以与新预留在 SKU 行上排队：建单先提交的，之后读 SKU 行的预留用普通读一定看得到它；
+  预留先锁住 SKU 行的，建单等它提交，它占用的数量由合并的差额法照常保留。完成与取消解除停售时不锁 SKU 行：与它们并发的预留可能仍按停售拒绝，
+  拒绝不占用 `order_ref`（§5.6），网店换幂等键再试即可。
+- 可售量（§5.6）：`status` 在 `inactive` 之后、`sellable` 之前加 `selling_paused`，普通读，不加锁。
+
+**新建** `POST /v1/sku-merges`（`sku_merges.create`，`stock_admin`）
+- 正文：`{"source_sku_id": …, "canonical_sku_id": …, "reason": …}`，两个 ID 是字符串、不能相同（相同 422），`reason` 可选，规则同 §2.6 第 1 条；不接受别的字段。
+  `reason` 存在合并单上，执行时写进来源 SKU 的 `sku_merged` 变更记录。
+- 开事务之前取目录写锁（§2.7）：建单不改 SKU 行、不写 `catalog_changes`，取锁只为与目录命令串行——修改 SKU 编码时锁 SKU 行不按 `sku_id` 升序（§2.6 第 4 条锁要改的行，再读编码归属的 SKU 行），不串行会与建单成环。事务里依次：
+  1. 普通读查两个 SKU：不存在或属于别的租户 404 `SKU_NOT_FOUND`，`details.sku_ids` 按来源、规范的顺序列出全部这样的 ID，属于别的租户的记 `cross_tenant`；
+  2. 按 `sku_id` 升序 `FOR UPDATE` 锁两个 SKU 行；
+  3. 已有一张未结束（`completed`、`cancelled` 以外）的合并单，来源与规范都与请求相同：200，返回它的当前表示，不另建（换幂等键重报同一合并，同 §7.1 第 2 条“内容相同返回原结果”；
+     合并单只按这对 SKU 认，`reason` 不同也返回原单、不改它）；
+  4. 来源或规范已合并：409 `SKU_MERGED`（先查来源；`details` 带该 `sku_id` 与 `merged_into_sku_id`）；
+  5. 规范 SKU `inactive`：409 `SKU_INACTIVE`，`details.sku_ids` 为规范 SKU（只看 SKU 自己的状态，不看商品；来源停用不拦）；
+  6. 任一个 SKU 属于别的未结束合并单（作来源或规范）：409 `SKU_MERGE_IN_PROGRESS`，`details` 带那张单的 `merge_id`、`source_sku_id`、`canonical_sku_id`（有几张时取 `merge_id` 最小的一张）；
+  7. 写合并单，状态 `selling_paused`。成功 201，返回表示。
+- 并发建单：涉及同一个 SKU 的两笔建单在第 2 步排队，后一笔用普通读看得到前一笔已提交的合并单，所以“合并单互不重叠”（§2.4）不靠数据库约束也成立。
+
+**录入实数** `POST /v1/sku-merges/{merge_id}/count`（`sku_merges.count`，`stock_operator`、`stock_admin`）
+- 正文：`{"pool_id": …, "shelf_count": …, "unsellable_count": …}`，两项实数是 0–1,000,000 的 JSON 整数；不接受别的字段。
+- 开业务事务之前，用普通读取合并单的两个 SKU，照 §4.1 预建它们在该池的余额行（合并单不存在时跳过，由事务里报 404）。事务里依次：
+  1. `FOR UPDATE` 读合并单行：不存在或属于别的租户 404 `SKU_MERGE_NOT_FOUND`；
+  2. 状态不是 `selling_paused`、`counted`：409 `STATE_CONFLICT`，`details` 为 `{"status": 合并单状态}`；
+  3. 已录入过而 `pool_id` 与原来的不同：409 `STATE_CONFLICT`，`details` 为 `{"status": 合并单状态, "reason": "pool_mismatch"}`（V1 一张合并单只在一个池上录入与执行；V1 每个租户只有一个池，正常碰不到）；
+  4. `FOR SHARE` 读池行，不是 `live`：409 `POOL_NOT_LIVE`（§6.2 第 2 条）；
+  5. 按 §8.1 升序锁两个余额行，记下快照（四个量与 `balance_version`），连同两项实数与 `pool_id` 写入，已录入过的整份替换；状态改为 `counted`。
+  成功 200，返回表示。不写流水。不查 SKU 的状态（执行时在锁内复核）。
+- 幂等键要确定性派生，理由同 §6.6 提交实数：换键再录入会重取快照。只有真的重新点过实物时才换键。
+
+**执行** `POST /v1/sku-merges/{merge_id}/execute`（`sku_merges.execute`，`stock_admin`，没有请求体）
+- 开业务事务之前，依次（§2.7 的先后）：取目录写锁（执行写 `sku_merged` 变更记录）；照 §4.1 预建两个 SKU 在池授权时读到的池的余额行（录入实数时已建，照样走一遍；读到时还没有池就跳过，下一步也跳过）；
+  按 §5.6 的“先关到期”关掉两个 SKU 在同一个池上已到期的 `active` 预留（§2.4 第 0 步；上限 100 个、出错处理同 §5.6 预留的第 2 步，超出的随订单行迁到规范 SKU，之后照常关单）。
+  合并单的池只会从空变为有值：锁外读到时还没有池、锁内已录入（之间有人录入了实数）时，这两步都跳过了——余额行录入实数时已建；没关到的到期预留按 §2.4 第 0 步随订单行迁到规范 SKU，之后照常关单。
+- 事务里依次：
+  1. `FOR UPDATE` 读合并单行，先复核池：`pool_id` 非空且不是凭据获准的池，403 `FORBIDDEN`，记 `forbidden` 事件（被拒的类别为池，记合并单的 `pool_id`）。
+     池授权在锁外读合并单的池，读到时可能还没录入、之后才被别的凭据录入实数定下池，所以在锁内复核，并排在按状态分支之前（同 §10 第 4 条“池授权先于业务规则”）；
+     这个 403 按数据库状态判出，作为确定结果保存，事件照 §7.2 写入时机的第二种写（V1 每个租户只有一个池，碰不到）。`selling_paused` 的 `pool_id` 必为空，不受影响。
+     然后按状态：`reconcile_pending`、`completed`：200，返回当前表示，不再执行（合并单就是这个命令的业务引用，同 §6.3 期初确认的“已确认过”）；
+     `selling_paused`（还没录入实数）、`cancelled`：409 `STATE_CONFLICT`，`details` 为 `{"status": 合并单状态}`；
+  2. **名单**：普通读查出在来源 SKU（合并单的池）上有订单行、状态为 `active`、`expired`、`late_payment_review`、`committed` 的预留，按 `reservation_id` 升序 `FOR UPDATE` 锁住；
+     再按 `order_line_id` 升序 `FOR UPDATE` 读这些预留落在来源 SKU 上的订单行。锁住时预留已变成 `released`、`closed_refunded` 的，它的订单行不改挂（§2.4 第 1 步）；
+  3. 按 §8.1 升序锁住两个余额行；
+  4. **复核**：普通读查来源 SKU 上、所属预留为第 2 步四种状态的订单行；有不在第 2 步锁住的订单行里的（名单之后提交的故障补交新建，§5.7 第 5 步），回滚，
+     在同一连接上从预建余额行那一步整个重做（幂等锁与目录写锁仍持有）。一次请求最多做 3 遍；第 3 遍仍多出时 503 `UNAVAILABLE`，什么也不保存，可同键重试。
+     锁住余额行之后，故障补交要等来源的余额行，等到时已读得到来源 SKU 已合并，改去规范 SKU 重新判定（§5.7 第 5 步），不会再落在来源 SKU 上；所以多出的只来自名单与锁余额行之间的短暂间隙；
+  5. 按 `sku_id` 升序 `FOR UPDATE` 锁两个 SKU 行，复核（建单之后目录命令仍可停用规范 SKU）：来源或规范已合并 409 `SKU_MERGED`（`details` 同新建第 4 步）；规范 `inactive` 409 `SKU_INACTIVE`（`details` 同新建第 5 步）。
+     已合并的复核是防御性的：只有合并执行会设 `merged_into_sku_id`，互不重叠又保证没有别的合并单碰这两个 SKU，按现有规则碰不到，测试只覆盖规范 SKU 停用；
+     “互不重叠”“来源不等于规范”在建单之后不会变，不复核；
+  6. `COUNT_STALE`：按锁住的余额行做 §2.4 第 0 步后半的检查，`details.sku_ids` 列出快照之后有只改账流水的 SKU；
+  7. §2.4 第 1–3 步：成对写迁移流水、改挂订单行、按差额定数、查不变量。违反时 409 `COUNT_BELOW_COMMITMENTS`，`details` 同 §6（只有规范 SKU 一项）；
+     改挂的订单行 `sku_id` 设为规范 SKU，所属预留照 §5.9 设 `last_changed_at`；
+  8. 来源 SKU 改为 `inactive`、`merged_into_sku_id` 设为规范 SKU，版本加 1，写一条 `sku_merged` 变更记录（§2.7：`changes` 含 `merged_into_sku_id`，来源原来是 `active` 时还含 `status`；`reason` 取合并单的 `reason`）；
+  9. 合并单改为 `reconcile_pending`，记下执行的凭据、操作者、请求 ID 与时间，三条流水的 ID（定数流水没写时为空）与改挂的订单行数。
+  成功 200，返回表示。第 1、5–7 步的拒绝回滚全部写入，合并单留在原状态，作为确定结果保存；处理完原因后用新的幂等键再执行（§7.1）。
+- 流水：三条流水的 `source_type` 为 `sku_merge`，`source_ref` 为 `merge_id`，`reason_code`、`note`、`line_ref` 为空，`channel_id` 取凭据的销售入口，`occurred_at` 取数据库时间；
+  带凭据、操作者、请求 ID 与幂等键（同 §6 的库存命令）。§2.4 要求流水记的快照、实数与差额，经 `source_ref` 在合并单上查。
+- **事务长度与名单估量**：名单含来源 SKU 上全部历史 `committed` 预留，随订单增长。V1（Demo 实例）一个 SKU 的订单在数百量级，一个事务改挂没有问题。
+  每次执行在进程日志写一行改挂的订单行数与事务用时。验收要求单次执行的事务远短于 5 分钟（§5.9 窗口终点的余量）。改挂行数到了数万的量级时另行设计（例如只改挂还有余量的订单行），不在 V1。
+
+**完成** `POST /v1/sku-merges/{merge_id}/complete`（`sku_merges.complete`，`stock_admin`，没有请求体）
+- 事务里 `FOR UPDATE` 读合并单行：`reconcile_pending` 改为 `completed`，记下凭据、操作者、请求 ID 与时间；已是 `completed`：200，返回当前表示；其他状态 409 `STATE_CONFLICT`，`details` 为 `{"status": 合并单状态}`。
+- Core 不核实网店侧：映射是否已切换、对账是否一致，由网店在调用前自己确认（§2.4 末段）。完成后规范 SKU 不再停售。成功 200，返回表示。
+
+**取消** `POST /v1/sku-merges/{merge_id}/cancel`（`sku_merges.cancel`，`stock_admin`，没有请求体）
+- 事务里 `FOR UPDATE` 读合并单行：`selling_paused`、`counted` 改为 `cancelled`，记下凭据、操作者、请求 ID 与时间，两个 SKU 恢复可预留；已录入的实数与快照留在合并单上备查，不再使用。
+  已是 `cancelled`：200，返回当前表示；`reconcile_pending`、`completed`：409 `STATE_CONFLICT`，`details` 同上（已执行的合并不能撤销）。成功 200，返回表示。
+- 取消后，同一对 SKU 可以另建新单。
+
+**查询** `GET /v1/sku-merges/{merge_id}`：返回表示。不存在或属于别的租户 404 `SKU_MERGE_NOT_FOUND`，属于别的租户的记 `cross_tenant`（§7.2）。
+
+**表示**
+- `merge_id`（前缀 `smg_`）、`source_sku_id`、`canonical_sku_id`、`status`（`selling_paused`、`counted`、`reconcile_pending`、`completed`、`cancelled`）、`reason`、`pool_id`（录入实数前为 `null`）、`created_at`；
+- `count`：录入实数前为 `null`；之后为 `shelf_count`、`unsellable_count`、`counted_at`、`snapshots`（按 `sku_id` 升序，每项 `sku_id`、四个量与 `balance_version`），
+  以及按 §2.4 第 2 步的公式由快照与实数算出的 `d_shelf`、`d_u`（录入后就有，执行时落账的就是这两个数）；
+- `execution`：执行前为 `null`；之后为 `executed_at`、`transfer_out_entry_id`、`transfer_in_entry_id`、`adjustment_entry_id`（两个差额都为 0 时为 `null`）与 `repointed_line_count`；
+- `completed_at`、`cancelled_at`：只在对应状态时有值，其他为 `null`。
+
+**存放**（复合外键照 §10 第 1 条）
+- `sku_merges`：一张合并单一行。列有 `merge_id`（主键）、`tenant_id`、`source_sku_id`、`canonical_sku_id`、`status`（`VARCHAR(32)`，同 §5.6 存放的列宽理由：`reconcile_pending` 有 17 个字符）、`reason`、
+  `pool_id`、两项实数，新建、录入实数、执行、完成、取消各自的 `credential_id`、`actor_ref`、`actor_role`、`request_id` 与时间，执行写的三个流水 ID 与 `repointed_line_count`。
+  - `(tenant_id, merge_id)` 唯一，作复合外键的引用目标；`(tenant_id, source_sku_id)`、`(tenant_id, canonical_sku_id)` 索引，供重叠检查与停售判定；
+  - 检查约束：`source_sku_id <> canonical_sku_id`；`status` 限五个取值；`pool_id`、两项实数与录入实数的凭据、请求 ID、时间同有同无，`status` 为 `counted`、`reconcile_pending`、`completed` 时非空、为 `selling_paused` 时为空、为 `cancelled` 时不限；
+    执行的凭据、请求 ID、时间与两条迁移流水 ID、`repointed_line_count` 在 `reconcile_pending`、`completed` 时非空、其他状态为空（`adjustment_entry_id` 可空）；
+    完成的三列只在 `completed` 时非空，取消的三列只在 `cancelled` 时非空；各组操作者两列同有同无；
+  - 外键：`(tenant_id, source_sku_id)`、`(tenant_id, canonical_sku_id)` → `skus`，`(tenant_id, pool_id)` → `stock_pools`，各 `credential_id` → `credentials`，三个流水 ID → `ledger_entries`。
+  - “互不重叠”不在库里约束（MySQL 没有部分唯一索引），由新建锁两个 SKU 行后检查保证（见“新建”）。
+- `sku_merge_snapshots`：主键 `(merge_id, sku_id)`。列有 `tenant_id`、`pool_id`、四个量与 `balance_version`。外键 `(tenant_id, merge_id)` → `sku_merges`，`(tenant_id, pool_id, sku_id)` → `stock_balances`（录入时已预建）。
+  `pool_id` 与所属合并单的相同，由同一事务的服务层保证；重新录入时整份替换（同 §6.6 盘点行：还没落账，不留历史）。
+- 两张表只在本节的命令里写；合并单不删除。
 
 ---
 
@@ -455,20 +565,20 @@ Core 需求要求所有量非负、缺货时“暂停履约交管理员”（ORD
   3. `pending_dispatch_vs_orders`：每个余额行的 `paid_pending_dispatch`，等于落在该行的全部订单行的 `committed_qty − dispatched_qty − refund_restocked_qty` 之和
      （没确认的订单行这三个数都是 0）。
   4. `order_commit_state`：预留为 `committed` 时，它的每个订单行 `committed_qty = quantity`；其他状态时每行 `committed_qty = 0`（V1 整单确认，§5.6 存放）。
+  5. `merged_sku_lines`（0.16）：`active`、`expired`、`late_payment_review`、`committed` 四种状态的预留，它的订单行不指向已合并的 SKU（§2.4 第 1 步改挂漏了的行，上面四项查不出来）。
 
   第 2、3 项成立的依据：§4.3 里改 `reserved` 与 `paid_pending_dispatch` 的只有订单命令（`RESERVE`、`RELEASE`、`SALE_COMMIT`、`LATE_SALE_COMMIT`、`DISPATCH`、`REFUND_RESTOCK`）
   与合并迁移；订单命令在同一事务里同改订单行与预留状态，合并迁移把来源 SKU 的这两个量连同订单行一起转到规范 SKU（§2.4 第 1 步，没改挂的 `released`、`closed_refunded` 订单行对两项的贡献都是 0）；
   盘点、Demo 重置不动这两个量，更正不能更正销售类流水（§6.7）。
-- **以后加的**：登记 SKU 合并时加一项“`active`、`expired`、`late_payment_review`、`committed` 四种状态的预留的订单行不指向已合并的 SKU”（§2.4 第 1 步改挂漏了的行，上面四项查不出来）；合并单的表建立之前没有已合并的 SKU，这一项恒成立。
 - **不查的**：四个量非负、`available ≥ 0`、订单行累计量的上限，已由数据库检查约束保证（§4.1、§5.6 存放），存进库的数据不会违反；逐条流水的“变动后值”是否连贯，V1 不查。
 - **读法**：全部查询在一个只读事务里做（REPEATABLE READ，开启时即取读快照，同一个快照），不加锁。一笔命令一个事务（§12.1 第 1 条），并发提交的命令要么整笔在快照里、要么整笔不在，所以不会因并发误报。
   全表聚合，用时随流水条数增长；V1（Demo 实例）数据量小，接受。每次自查在进程日志写一行用时与违反项数；用时到了 30 秒量级时，另行设计成定时任务存结果（Q-68 未选的做法）。
 - **响应** 200（查出违反也是 200：违反是查出来的数据，不是请求出错）：
   - `checked_at`（读快照时的数据库时间）、`ok`（没有违反项为 `true`）、`violation_count`（总数）、`violations`（最多 100 项，超过时只返回前 100 项）；
-  - `violations` 按 `check` 的编号、再按 `pool_id`、`sku_id`（前三项）或 `reservation_id`（第 4 项）升序。每项：
+  - `violations` 按 `check` 的编号、再按 `pool_id`、`sku_id`（前三项）或 `reservation_id`（第 4、5 项）升序。每项：
     - 前三项：`check`、`pool_id`、`sku_id`、`expected`（由流水或订单行算出的值）、`actual`（余额行上的值）；
       `ledger_totals` 的 `expected` 是由流水算出的对象，键为四个量的名字、`entry_count`（流水条数）与 `max_balance_version_after`（没有流水时为 0）；`actual` 是余额行上的对象，键为四个量的名字与 `balance_version`。四个量有任何一个两边不等，或 `entry_count`、`max_balance_version_after` 有任何一个不等于 `balance_version`，就算违反；另两项检查的 `expected`、`actual` 都是整数；
-    - `order_commit_state`：`check`、`reservation_id`、`order_ref`、`status`、`line_refs`（不符的行，按 `line_ref` 升序）。
+    - `order_commit_state` 与 `merged_sku_lines`：`check`、`reservation_id`、`order_ref`、`status`、`line_refs`（不符的行，按 `line_ref` 升序）。
 - **查出违反怎么办**：说明实现有缺陷或库被绕过接口改过，Core 不自动修。按 `pool_id`、`sku_id` 用 §6.8 的流水查询、按 `order_ref` 用订单库存查询（§5.8）定位；
   查明原因之前不要用盘点或更正去“对平”（会把缺陷的痕迹盖掉）。
 - 谁定时调它、`ok` 为 `false` 时怎么告警，属于 OPS-04 的监控与告警，不在本节，另行登记。
@@ -586,7 +696,7 @@ Kelvin 2026-11-10 定：Core 不可用时网店**继续收款**，并**按故障
   原因：REPEATABLE READ 下按 `(tenant_id, reservation_id)` 加锁读订单行是范围扫描，会连同最后一行之后的间隙一起锁住；`reservation_id` 按时间递增，
   新预留的订单行正好插在那段间隙里，于是“新预留锁住余额行、插订单行被间隙锁挡住”与“释放锁住订单行间隙、再等余额行”成环。
   READ COMMITTED 下加锁读只锁匹配的行、不锁间隙，普通读每条语句都看到最新的已提交数据（第 1 步的业务引用与并发重报的重新判定都依赖这一点）。
-  以后读写预留或订单行的命令（确认销售、付款后的分支、SKU 合并的执行）在登记前按这个顺序细化（SKU 合并见 §2.4 第 0、1 步；付款后的分支见 §5.8，0.14）。
+  以后读写预留或订单行的命令（确认销售、付款后的分支、SKU 合并的执行）在登记前按这个顺序细化（SKU 合并见 §2.8 执行，0.16；付款后的分支见 §5.8，0.14）。
 - 订单行的 `sku_id`：预留时取请求里的 SKU；SKU 合并执行时改挂到规范 SKU（§2.4 第 1 步、§5.1）。所以释放与到期关单在锁住预留行之后，用加锁读（`FOR SHARE`）读订单行，
   按读到的 `sku_id` 锁余额行：加锁读会等正在进行、还没提交的合并结束，读到它改挂后的 `sku_id`；普通读不等，可能读到合并之前的 `sku_id`，去减已经迁走的 `reserved`。
 - 流水：预留写 `RESERVE`、释放与到期关闭写 `RELEASE`，每个订单行一条（§4.3）。`source_type` 为 `reservation`，`source_ref` 为 `order_ref`，`line_ref` 为该行的 `line_ref`；
@@ -615,7 +725,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
   4. 按 §8.1 升序锁住所列 SKU 的余额行；
   5. 按 `sku_id` 升序 `FOR SHARE` 读 SKU 行与所属商品行：已合并 409 `SKU_MERGED`（第一个，`details` 带 `sku_id` 与 `merged_into_sku_id`，§2.4）；
      SKU 或所属商品 `inactive`：409 `SKU_INACTIVE`，`details.sku_ids` 按请求顺序列出全部这样的 SKU（Q-36）。
-     合并进行中（§2.4 的 `selling_paused`、`counted`）的 SKU 409 `SKU_SELLING_PAUSED`，由登记 SKU 合并的任务实现；合并单的表建立之前没有这种 SKU；
+     然后用普通读查停售：停售中的 SKU（§2.8“停售的判定”）409 `SKU_SELLING_PAUSED`，`details.sku_ids` 按请求顺序列出全部这样的 SKU（0.16）；
   6. 可售：逐行比较 `quantity` 与锁住的余额行的 `available`；有任何一行不足，409 `INSUFFICIENT_STOCK`，`details.lines` 按请求顺序列出全部不足的行，
      每项 `line_ref`、`sku_id`、`quantity`、`available`；
   7. 写预留一行（`active`）、订单行（每行一条）与每行一条 `RESERVE` 流水，与幂等记录同一事务提交。
@@ -666,7 +776,7 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
 - 返回 `pool_id`、`pool_status`（`initializing` 或 `live`）与 `skus` 数组，按 `sku_id` 升序。每项：
   - `sku_id`、`available`（还没有余额行的为 0）；
   - `status`：`merged`（此时带 `merged_into_sku_id`，其他状态为 `null`）、`inactive`（SKU 或所属商品停用）或 `sellable`，按这个先后取第一个符合的（已合并的 SKU 也是停用的，报 `merged`）。
-    SKU 合并任务会加 `selling_paused`，排在 `inactive` 之后、`sellable` 之前（与新预留的判定顺序相同）；调用方把不认识的值当作不能新预留。
+    0.16 加 `selling_paused`（停售中，§2.8），排在 `inactive` 之后、`sellable` 之前（与新预留的判定顺序相同）；调用方把不认识的值当作不能新预留。
 - 只做普通读，不加锁；`available` 可能含已到期、还没关掉的预留（见上）。网店的故障收款封顶（§5.5）读的就是这个数。
 
 **存放**（复合外键照 §10 第 1 条）
@@ -740,8 +850,8 @@ API 与运维命令行读同一份配置，所以命令行也拒绝启动，与�
      - 普通读查 SKU：不存在或属于别的租户 404 `SKU_NOT_FOUND`（同 §5.6 预留第 3 步，`details.sku_ids` 按请求顺序列全，属于别的租户的记 `cross_tenant`）；
      - 各行的 `sku_id` 取请求 SKU 的合并去向；按 §8.1 升序锁住这些 SKU 的余额行，再按 `sku_id` 升序 `FOR SHARE` 读这些 SKU 行（§5.6 锁序，只为等正在进行的合并提交）：
        有一个已合并（去向在算出之后被并发的合并改了），回滚，重新判定（见“通用”）。
-       然后按 SKU 合计判可售。停用不拦（Q-58）；合并进行中（§2.4 的 `selling_paused`、`counted`）也不拦：§2.4 停售只停新预留，这是已付款的订单，差额法照常保留它的扣数。
-       这使 0.12 第三轮复审留下的前提“停售期间不会有新的订单行指向这两个 SKU”不再成立，SKU 合并找出要锁的预留行时要算上它们（登记合并任务前定）；
+       然后按 SKU 合计判可售。停用不拦（Q-58）；合并进行中（停售中，§2.8）也不拦：§2.4 停售只停新预留，这是已付款的订单，差额法照常保留它的扣数。
+       这使 0.12 第三轮复审留下的前提“停售期间不会有新的订单行指向这两个 SKU”不再成立，SKU 合并找出要锁的预留行时要算上它们（0.16 定为锁住余额行之后复核，§2.8 执行第 4 步）；
      - 写预留一行与订单行：`fault_mode` 为 `true`；`created_at` 为现在，`ttl_seconds` 取当前配置，`expires_at` = `created_at` + `ttl_seconds`（形式值：预留从未 `active`，它不起作用；表示里照样返回，调用方对非 `active` 的预留不看 `expires_at`），`closed_at` 为现在；
        `request_hash` 取“同内容的预留请求”的摘要（`path` 为 `{}`、`body` 为 `{"order_ref": …, "lines": 请求的 lines}`，§7.1），所以网店之后用同样的行补调预留时按 §5.6 第 1 步得到 200 与这个预留，而不是 409；
        创建的凭据、操作者与请求 ID 取本次请求。然后照下面晚到确认的“够”与“不够”两支写入。
@@ -905,7 +1015,7 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 **最后变更时间**
 - `reservations` 加列 `last_changed_at`：凡改动一个预留行或它的订单行任何一列的事务，在同一事务里把它设为本事务取的数据库时间；一个事务为写库取了不止一次（例如确认销售先关到期、再晚到确认，`closed_at` 与 `committed_at` 各取一次）时，用写库用到的最晚一次（只为生成响应而取的时间不算）；不写预留时间列的发货、退款回库、退货验收取本命令的时间。
   现有的这类事务：预留新建（等于 `created_at`）、释放、到期关单（各条触发路径都算，§5.6）、确认销售（正常与晚到）、第一次转入待审、故障补交新建、待审结案、发货、退款回库、退货验收（§5.6–§5.8）；
-  以后 SKU 合并执行改挂订单行（§2.4 第 1 步）时同样设。以后新增改预留行或订单行的命令，照这条设。
+  SKU 合并执行改挂订单行时同样设（§2.8 执行第 7 步，0.16）。以后新增改预留行或订单行的命令，照这条设。
 - 不改任何列的路径不设：幂等重放与换键重报返回已有结果、对已 `released` 或 `expired` 的预留再释放、待审重试仍不够（§5.7“不改预留的任何列”）、对已 `closed_refunded` 的再结案。
 - **存放**：`DATETIME(6)`，非空。迁移加列时以 `CURRENT_TIMESTAMP(6)` 为默认值，并在同一迁移里回填已有的行：取 `created_at`、`closed_at`、`committed_at`、`review_closed_at`
   与该预留的 `order_documents.created_at` 中最大的一个（空值不计）。转入待审的时刻没有单独记，回填值可能早于真实的最后变更时间，只影响上线前的旧订单落在哪个窗口（见下“第一次对账”）。
@@ -917,7 +1027,7 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 - **窗口终点至少早于现在 5 分钟**：`changed_to` 晚于“数据库时间减 300 秒”时 422 `INVALID_REQUEST`，`details` 为 `{"latest_changed_to": …}`（这一刻允许的最晚终点）。
   原因：`last_changed_at` 在事务里取、提交在其后；订单命令并发提交，读的那一刻还没提交的事务，稍后会带着更早的 `last_changed_at` 出现在已经读过的窗口里。
   Core 的命令事务以秒计（每条语句等锁的时间受 MySQL 的锁等待超时限制），终点留出 5 分钟，读到的窗口之后就不会再冒出新的行。
-  以后登记可能长时间持有事务的命令（如 SKU 合并执行，§2.4）时，把“单次事务远短于 5 分钟”写进验收。这也是不用自增 `id` 作游标的原因：`id` 的分配顺序与提交顺序不一致，读的人会越过还没提交的小 `id`；整机恢复后还会重用丢失的 `id`（Q-41 同类问题）。
+  以后登记可能长时间持有事务的命令时，把“单次事务远短于 5 分钟”写进验收（SKU 合并执行已写，§2.8“事务长度与名单估量”，0.16）。这也是不用自增 `id` 作游标的原因：`id` 的分配顺序与提交顺序不一致，读的人会越过还没提交的小 `id`；整机恢复后还会重用丢失的 `id`（Q-41 同类问题）。
 - 只查凭据的销售入口的预留（`(tenant_id, channel_id)`）；凭据没有销售入口（或入口已停用）时，在下面的各种 422 都判过之后返回空数组，`next_cursor` 照 §2.5（原样返回 `after`，没带为 `null`；同 §5.6 的 `order_ref` 查询）。
 - **分页**：按 `(last_changed_at, reservation_id)` 升序。`limit` 规则同 §2.5（1–100，不带为 100）；`after` 是上一页的 `next_cursor`。
   游标为 `v1.`、`last_changed_at` 的 UTC 微秒时间戳十进制、`.`、`reservation_id`、`.` 加窗口摘要（规范化后的 `changed_from`、`changed_to` 以换行符连接，取 SHA-256 小写十六进制的前 16 个字符，同 §6.8 绑定筛选条件）。
@@ -1042,10 +1152,10 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
    批量查询里查不到的 ID 不出现、不报错（§6.8 的余额，同 §2.6 第 6 条的 `ids`）。
 2. **池状态（Q-42）**：池建成时是 `initializing`。`initializing` 时只能做期初（预览、确认）、更正（§6.7，用于冲掉错的期初）和读；
    收货、不可售调整、盘点 409 `POOL_NOT_LIVE`。池切到 `live`（§6.3）后，期初的预览与确认 409 `POOL_ALREADY_LIVE`；`live` 不能回到 `initializing`。
-   销售类命令（§5）、Demo 重置（§6.1）与 SKU 合并里按池处理的命令（录入实数、执行，§2.4）同样只在 `live` 可用（409 `POOL_NOT_LIVE`），在登记它们的任务里实现。
+   销售类命令（§5）、Demo 重置（§6.1）与 SKU 合并的录入实数（§2.8；执行不读池行，录入实数时已判过）同样只在 `live` 可用（409 `POOL_NOT_LIVE`），在登记它们的任务里实现。
    命令在业务事务里先用 `SELECT … FOR SHARE` 读池行判定状态（池切 live 用 `FOR UPDATE`），然后才按 §8.1 锁余额行；这样池切 live 与期初确认不会交错。
 3. **SKU**：库存命令一律用 `sku_id` 指定 SKU，不接受编码或条码。
-   - 停用的 SKU（含所属商品停用）照常可以入账、盘点、标不可售与报损：实物还在，停用只停新预留（§2.1 第 3 条）。合并进行中（§2.4 的 `selling_paused`、`counted`）也照常可做。
+   - 停用的 SKU（含所属商品停用）照常可以入账、盘点、标不可售与报损：实物还在，停用只停新预留（§2.1 第 3 条）。合并进行中（停售中，§2.8）也照常可做。
    - 已合并的 SKU（`merged_into_sku_id` 非空）：409 `SKU_MERGED`，`details` 带 `sku_id` 与 `merged_into_sku_id`，改用规范 SKU。
    - 请求里的 `sku_id` 不存在或属于别的租户：404 `SKU_NOT_FOUND`，`details.sku_ids` 按请求顺序列出全部这样的 ID；其中属于别的租户的记 `cross_tenant`（§7.2）。
 4. **判定顺序**（取锁之后）：业务引用（第 7 条）→ 池状态 → SKU 不存在 → SKU 已合并 → 各命令自己的规则。一个请求有多种错误时只报最先遇到的一种。
@@ -1290,7 +1400,7 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
         操作类型、幂等键五项以换行符（0x0A）连接后 UTF-8 编码的 SHA-256 小写十六进制，64 个字符；带数据库名，同一 MySQL 实例上的
         Demo 库与生产库不会撞名。这个拼法定下后不改，否则新旧版本同时运行时互斥失效。
      2. 返回 0 → 409 `REQUEST_IN_PROGRESS`；返回 NULL（出错）→ 503 `UNAVAILABLE`。两种都什么也不写。
-     3. 返回 1 → 写目录的命令先再取目录写锁（§2.7），然后才在同一连接上开事务（读快照在取锁之后建立，看得到前一个持锁请求已提交的记录），查幂等记录，
+     3. 返回 1 → 写目录的命令与 SKU 合并新建先再取目录写锁（§2.7），然后才在同一连接上开事务（读快照在取锁之后建立，看得到前一个持锁请求已提交的记录），查幂等记录，
         按上面三种情况重放、冲突或执行命令；执行完写幂等记录并提交，或回滚。
      4. 写幂等记录撞上唯一约束（例如锁意外失效）时，回滚命令，另开事务读出已有记录，按重放或冲突返回，不返回 5xx；
         得到冲突时照常记 `idempotency_conflict` 事件；被回滚的命令登记的安全事件丢弃（那次执行没有生效）。
@@ -1298,14 +1408,14 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
         把这个连接从连接池作废、不放回池里（连接断开时 MySQL 释放它持有的锁）。
      幂等记录表因此只追加、只存确定结果，不存“处理中”状态。
    - **哪些结果保存**：判据是在哪一步产生。取锁之前的检查（§8.1 检查顺序的第 1–9 步）的拒绝都不保存，调用方改正后可以用同一个键重发；
-     取锁之后命令返回的 2xx 与 4xx 都作为确定结果保存，包括按数据库状态判出的 404、409、422（如缺货、盘点一个 SKU 都没提交）；
+     取锁之后命令返回的 2xx 与 4xx 都作为确定结果保存，包括按数据库状态判出的 404、409、422（如缺货、盘点一个 SKU 都没提交），以及 SKU 合并执行在锁内复核池的 403（§2.8）；
      不保存的只有 409 `REQUEST_IN_PROGRESS`、`IDEMPOTENCY_CONFLICT`、429 与 5xx（事务回滚，可重试）。
    - **业务拒绝时的写入**：命令以业务 4xx 拒绝时，默认撤销命令的全部写入，只保存幂等记录；契约规定被拒时也要留下状态变化的命令
      （如 §5.2 晚到支付缺货转入待审），把这些变化与幂等记录在同一事务提交。
    - **已保存的业务 4xx，同键只会重放。**处理完原因后要再试的（如补货后重试确认、`COUNT_BELOW_COMMITMENTS` 处理订单后
      “直接再确认或执行”），必须用**新的幂等键**；业务引用（第 2 条）保证换键不会让同一事实生效两次。
 2. **业务引用（事实级）**：`(channel, order_ref)` 一个预留；`(channel, payment_ref)`、`shipment_ref`、`refund_ref`、`return_ref`、
-   `receipt_ref`、`count_ref`、`adjustment_ref` 各自唯一，Demo 重置的 `(pool_id, business_date)` 唯一（库存管理命令的业务引用另见 §6.2 第 7 条、§6.3、§6.7，Demo 重置见 §6.1）。换幂等键重报同一业务引用：内容相同返回原结果，内容不同 409 `BUSINESS_REF_CONFLICT`（更正的例外见 §6.7）。
+   `receipt_ref`、`count_ref`、`adjustment_ref` 各自唯一，Demo 重置的 `(pool_id, business_date)` 唯一，SKU 合并新建按未结束的合并单的（来源，规范）一对 SKU 认、执行按合并单认（0.16，§2.8）（库存管理命令的业务引用另见 §6.2 第 7 条、§6.3、§6.7，Demo 重置见 §6.1）。换幂等键重报同一业务引用：内容相同返回原结果，内容不同 409 `BUSINESS_REF_CONFLICT`（更正的例外见 §6.7；SKU 合并新建只按这对 SKU 认、不比内容，见 §2.8）。
    这里的“原结果”是该业务对象**当前**的表示（状态可能已变，如盘点单已取消）；同键重放（第 1 条）才是首次保存的响应原样。
    这一层防止“调用方崩溃后用新键重试”造成重复扣库。业务引用只被**已生效**的命令占用：被业务规则拒绝的命令（如确认一个已释放的订单、行集不一致）
    不占用该引用，改正后可以用新幂等键、同一引用再试。例外（0.13，§5.7）：晚到支付缺货转入待审是被拒时留下的状态变化，预留记下这个 `payment_ref`，
@@ -1329,7 +1439,7 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
   `X-Actor-Ref` 时记它，见下；都不含姓名、邮箱）、HTTP 方法、
   请求路径（不含查询串）、`User-Agent`（截断到 200 字符）、不含令牌与请求体的补充说明（JSON）。
   补充说明的内容：401 记内部原因（头缺少、头格式不对、令牌不存在、令牌已吊销、令牌已到截止时间、凭据已吊销、租户已停用之一，只记在事件里，
-  不进响应）；403 记被拒的类别（scope、角色、池）及缺的 scope、被拒的角色或请求的 `pool_id`；跨租户 404 记对象类型与请求里的 ID；
+  不进响应）；403 记被拒的类别（scope、角色、池）及缺的 scope、被拒的角色或请求的 `pool_id`（按对象判定的记对象所属的池，例如合并单的 `pool_id`）；跨租户 404 记对象类型与请求里的 ID；
   冲突类记操作类型或业务引用类型与值；命令行操作记原因、目标凭据与令牌 ID、轮换时旧令牌的截止时间。
   “带了合格的 `X-Actor-Ref`”指两个操作者头都带且都合格（§8.1）；只带一个或不合格时不记操作者。
   事件类型：`invalid_credential`（401）、`forbidden`（403：缺 scope、池未获准、角色不被接受）、
@@ -1341,7 +1451,7 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
   写入时机：安全事件总在业务事务之外另开短事务写入，不随业务事务回滚，也不在业务事务进行中另占一个连接。通用规则：
   - 产生事件时没有打开的业务事务（§8.1 检查顺序第 4–9 步的 401、403、跨租户 404，读接口的跨租户 404），在返回响应前写，
     用处理这个请求的连接，还没取连接就从池里取一个；
-  - 产生事件时有业务事务（写命令取锁之后：幂等冲突、业务引用冲突、命令执行中按请求里的 ID 找到别的租户的对象，如第 9 步池授权没覆盖的 SKU ID），先结束事务、释放命名锁
+  - 产生事件时有业务事务（写命令取锁之后：幂等冲突、业务引用冲突、命令执行中按请求里的 ID 找到别的租户的对象，如第 9 步池授权没覆盖的 SKU ID；SKU 合并执行锁内复核池的 403，§2.8），先结束事务、释放命名锁
     （§7.1 执行顺序第 5 步），再用同一个连接写；那个连接已被作废时，从池里另取一个。
   写入失败只记进程日志，不改变对调用方的响应。
   事件写入后不改；除保留期清理（满 1 年的事件整批删除，由 Core 自己的定时任务用 Core 的数据库账号执行，另做任务）外不删。
@@ -1397,7 +1507,7 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 | | `POST /v1/products/{product_id}/skus`，`GET/PATCH /v1/skus/{sku_id}`，`POST /v1/skus/{id}/deactivate`、`/reactivate` | CAT-01～03 |
 | | `GET /v1/skus?sku_code=&barcode=&ids=` | CAT-01 |
 | | `POST /v1/catalog-imports`，`POST /v1/catalog-imports/{id}/confirm`，`GET /v1/catalog-imports/{id}` | CAT-04 |
-| | `POST /v1/sku-merges`，`POST /v1/sku-merges/{id}/{pause,count,execute,complete,cancel}`，`GET /v1/sku-merges/{id}` | CAT-05 |
+| | `POST /v1/sku-merges`，`POST /v1/sku-merges/{id}/{count,execute,complete,cancel}`，`GET /v1/sku-merges/{id}`（§2.8） | CAT-05 |
 | | `GET /v1/catalog-changes?after=&limit=` | CAT-03 |
 | 库存 | `GET /v1/availability?sku_ids=…`（批量 ≤100，只回 `available` 与状态，§5.6） | ORD-01 |
 | | `GET /v1/balances?pool_id=&sku_ids=`（四个账面量＋版本，管理用，§6.8） | STK-01 |
@@ -1422,12 +1532,13 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 | 400/422 | `INVALID_REQUEST` | 修正请求；不重试 |
 | 401 / 403 | `UNAUTHORIZED` / `FORBIDDEN` | 凭据或权限问题；不重试，告警 |
 | 405 | `METHOD_NOT_ALLOWED` | 调用方 bug；不重试 |
-| 404 | `NOT_FOUND`（`PRODUCT_NOT_FOUND`、`SKU_NOT_FOUND`、`IMPORT_NOT_FOUND`、`RESERVATION_NOT_FOUND`、`POOL_NOT_FOUND`、`COUNT_NOT_FOUND`、`STOCK_IMPORT_NOT_FOUND`、`ENTRY_NOT_FOUND`…） | 跨租户对象同样返回 404，不暴露存在性：同一类对象不存在与属于别的租户，错误码与 message 完全相同；路由不存在用 `NOT_FOUND` |
+| 404 | `NOT_FOUND`（`PRODUCT_NOT_FOUND`、`SKU_NOT_FOUND`、`IMPORT_NOT_FOUND`、`RESERVATION_NOT_FOUND`、`POOL_NOT_FOUND`、`COUNT_NOT_FOUND`、`STOCK_IMPORT_NOT_FOUND`、`ENTRY_NOT_FOUND`、`SKU_MERGE_NOT_FOUND`…） | 跨租户对象同样返回 404，不暴露存在性：同一类对象不存在与属于别的租户，错误码与 message 完全相同；路由不存在用 `NOT_FOUND` |
 | 409 | `INSUFFICIENT_STOCK` | 整单不进入付款；`details.lines` 列出不足的行。标不可售超过可售量也用它（§6.5） |
 | 409 | `POOL_NOT_LIVE` / `POOL_ALREADY_LIVE` | 库存池还在初始化，只能做期初、更正与读 / 池已上线，期初一律拒绝（§6.2 第 2 条）；不重试 |
 | 409 | `QUANTITY_EXCEEDS_UNAVAILABLE` | 恢复可售或报损的件数超过不可售量（§6.5）；不重试 |
 | 409 | `ENTRY_NOT_CORRECTABLE` / `CORRECTION_BREAKS_INVARIANTS` | 这条流水不能更正，或更正后账面不合法；改走盘点（§6.7）；`details.reason` 为 `already_corrected` 时别人已经更正过，查看已有的那条更正；不重试 |
-| 409 | `SKU_INACTIVE` / `SKU_MERGED` / `SKU_SELLING_PAUSED` | 不可新预留（`SKU_MERGED` 也用于重新启用、或清空条码以外的修改已合并的 SKU，§2.6） |
+| 409 | `SKU_INACTIVE` / `SKU_MERGED` / `SKU_SELLING_PAUSED` | 不可新预留（`SKU_MERGED` 也用于重新启用、或清空条码以外的修改已合并的 SKU，§2.6；`SKU_MERGED`、`SKU_INACTIVE` 也用于 SKU 合并的新建与执行，§2.8） |
+| 409 | `SKU_MERGE_IN_PROGRESS` | SKU 合并新建时，两个 SKU 之一已在别的未结束合并单里；`details` 带那张单（§2.8，0.16）；先完成或取消那张单 |
 | 409 | `SKU_CODE_TAKEN` / `SKU_CODE_RETIRED` / `BARCODE_TAKEN` | 编码是别的 SKU 的当前编码 / 退役编码（永不再分配），条码已被别的 SKU 使用；换一个再提交（§2.2、§2.6） |
 | 409 | `IMPORT_EXPIRED` | 批量导入或期初导入的预览已过有效期；重新预览（§2.3、§6.3） |
 | 409 | `VERSION_CONFLICT` | 重新读取后让人决定 |
@@ -1542,7 +1653,7 @@ Core 健康检查返回的环境标记（`demo` / `production`）必须与网店
    | 命令 | 接受的角色 |
    | --- | --- |
    | 目录写命令（商品与 SKU 的新建、修改、停用、重新启用）、批量导入的预览与确认 | `catalog_admin` |
-   | SKU 合并的新建、暂停、执行、完成、取消 | `stock_admin` |
+   | SKU 合并的新建、执行、完成、取消（0.16 去掉暂停，§2.8） | `stock_admin` |
    | SKU 合并的录入实数（与盘点提交实数一致） | `stock_operator`、`stock_admin` |
    | 期初导入的预览与确认；池切 live（0.9，§6.3） | `stock_admin` |
    | 收货；盘点开单、提交实数、取消；标不可售、恢复可售 | `stock_operator`、`stock_admin` |
@@ -1583,11 +1694,11 @@ Core 健康检查返回的环境标记（`demo` / `production`）必须与网店
    - **池授权**：凭据获准操作的池，就是它的销售入口绑定的池（第 3 节）。销售入口已停用（inactive）时视同没有销售入口。
      池的状态（`initializing`、`live`）不影响池授权，各命令在哪种状态下可用由该命令的规则定（如期初只在 `initializing`，§6）。
      - 销售类命令不带 `pool_id`，池由入口绑定决定；凭据没有销售入口时 403。
-     - 正文或路径带 `pool_id` 的命令（库存管理、Demo 重置、SKU 合并里按池处理的命令，如录入实数与执行）按顺序判定：凭据没有销售入口 403；
+     - 正文或路径带 `pool_id` 的命令（库存管理、Demo 重置、SKU 合并的录入实数）按顺序判定：凭据没有销售入口 403；
        `pool_id` 不属于本租户 404；属于本租户但不是获准的池 403。
-     - 按 ID 指向池内对象的命令（期初导入的确认，盘点单的提交、确认、取消，更正所指的原流水等）按这个对象所属的池判定，顺序同上：凭据没有销售入口 403；
+     - 按 ID 指向池内对象的命令（期初导入的确认，盘点单的提交、确认、取消，更正所指的原流水，SKU 合并的执行〔合并单录入实数时的池；还没录入的只查有没有销售入口；锁内再复核一次，那里的 403 保存，§2.8〕等）按这个对象所属的池判定，顺序同上：凭据没有销售入口 403；
        对象不属于本租户 404；对象所属的池不是获准的池 403。
-     - 其余命令（目录命令，SKU 合并的新建、暂停、完成、取消与查询）不做池授权，只查 scope 与角色。
+     - 其余命令（目录命令，SKU 合并的新建、完成、取消与查询）不做池授权，只查 scope 与角色。
      - 读接口不做池授权，只限定在本租户（0.9，§6.2 第 1 条）；例外是可售量查询，池取凭据的销售入口，没有入口 403（0.12，§5.6）。
 5. **网络（Q-12）：**Core 不暴露公网入口（不挂到 `infra_nginx` 的公开 vhost）。与网店同机时只挂在仅内部的容器网络上，
    **不加 TLS**：流量不出宿主机，靠凭据鉴权。这偏离 REQUIREMENTS OPS-02“服务间通信加密”的字面要求，Kelvin 已接受；
@@ -1728,7 +1839,7 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 
 ---
 
-## 14. 变更记录（0.3、0.4 于 2026-11-10、0.5 于 2026-11-12、0.6 于 2026-11-13、0.7、0.8 于 2026-11-14、0.9、0.10 于 2026-11-15、0.11、0.12、0.13 于 2026-11-16、0.14 于 2026-11-18、0.15 于 2026-11-19 经 Kelvin 批准）
+## 14. 变更记录（0.3、0.4 于 2026-11-10、0.5 于 2026-11-12、0.6 于 2026-11-13、0.7、0.8 于 2026-11-14、0.9、0.10 于 2026-11-15、0.11、0.12、0.13 于 2026-11-16、0.14 于 2026-11-18、0.15、0.16 于 2026-11-19 经 Kelvin 批准）
 
 来源：登记 CORE-TASK-001、002 时跑的设计预审（`worker.design_precheck`），两个任务都判 `NOT_READY`，共 8 条发现。逐条处理如下：
 
@@ -2089,3 +2200,36 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 `last_changed_at` 只取写库用到的最晚一次时间，发货、退款回库、退货验收取命令时间；时间下界并入判定顺序的格式一步；页首范围补 §13；第 88 条写上并集比对；网店侧变化补“下单”。
 
 第三轮复审（提交 `1ab0921`，通过：阻塞 0 条、非阻塞 1 条）之后的修改：§4.4 响应里“另两项是整数”单起一句，与违反判定分开。
+
+### 0.16（2026-11-19 起草，Kelvin 同日批准）
+
+来源：登记「SKU 合并」前对 §2.4 的通读。§2.4 有状态机与定数规则，但接口、判定顺序、表示与存放都没有正文；0.12、0.13 把执行的锁序、名单复核的上限与名单大小的估量留到登记合并任务前定（第 76 条②与 0.13 写进 §2.4 的复核）；
+§5.6 的 `SKU_SELLING_PAUSED`、可售量的 `selling_paused`、§2.5 的 `sku_merged`、§4.4 的“改挂漏了的行”都写着“登记 SKU 合并时加”。
+第 91 条的取舍由 Kelvin 2026-11-19 定（Q-70），第 92、93 条按 §5.6、§5.7、§6.6、§6.3 的既有写法补齐（Q-71）。
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 91 | 0.5 的状态机里 `migrating`、`failed_paused` 在库里看不到：执行是一个事务，出错整笔回滚，合并单本来就留在 `counted`；要记下这两个状态得另开事务，没有用处。`draft` 与单独的“暂停”命令只是多一步 | 未决定 | 建单即停售；状态为 `selling_paused` → `counted` → `reconcile_pending` → `completed`，前两个可 `cancelled`；去掉 `draft`、“暂停”命令、`migrating`、`failed_paused`；执行出错留在 `counted`、直接再执行（Q-70） | §2.4、§8.2、§10 第 3、4 条 |
+| 92 | 合并的六个接口没有正文、判定顺序、表示与存放；停售怎么判、新建的重叠检查怎么防并发、新建换键重报怎么认、合并单在哪个池上录入与执行都没定 | 未决定 | 新建锁两个 SKU 行后查重叠，同一对 SKU 的未结束单换键重报返回原单，别的重叠 409 `SKU_MERGE_IN_PROGRESS`；停售中 = `selling_paused`、`counted` 的两个 SKU 与 `reconcile_pending` 的规范 SKU，新预留在读 SKU 行之后用普通读判；录入实数同 §6.6 提交实数，一张单一个池；执行按合并单认业务引用，已执行的 200；完成不核实网店侧；表 `sku_merges`、`sku_merge_snapshots`；`sku_merged` 事件；自查加第 5 项（Q-71） | §2.8、§2.4、§2.5、§2.7、§4.4、§5.6、§5.7、§5.9、§6.2 第 2、3 条、§7.1 第 1、2 条、§7.2、§8.2、§8.3、§10 第 4 条 |
+| 93 | 执行的锁序、名单复核“多出就回滚重来”的次数上限、名单随历史 `committed` 预留增长的估量没定（0.12、0.13 留到登记前）；来源四个量全为 0 时要不要写迁移流水没写明 | 未决定 | 锁序：合并单行 → 预留行 → 订单行（`FOR UPDATE`，要改挂）→ 余额行 → SKU 行；一次请求最多 3 遍，仍多出 503；V1 一个 SKU 的订单在数百量级，进程日志记改挂行数与用时，验收要求单次事务远短于 5 分钟；迁移流水全为 0 也成对写，好让来源 SKU 执行前的流水不能再更正（Q-71） | §2.8、§2.4 |
+
+不改库存数量规则：§2.4 的差额法与例子、§4.1 的不变量、§4.3 的流水类型、§5.2 的预留状态机都不变。
+对调用方（网店）的影响：
+- 合并向导少一步：建单即停售，没有“暂停”；
+- 新预留与可售量多一种停售（`SKU_SELLING_PAUSED`、`selling_paused`），从建单到完成或取消；
+- 执行被拒（`COUNT_STALE`、`COUNT_BELOW_COMMITMENTS`、SKU 状态变了）或出错时合并单仍是 `counted`，处理后用新幂等键再执行；
+- 目录变更流多一种事件 `sku_merged`；
+- Demo：把映射切到规范 SKU 时，同时从每日重置的清单里去掉来源 SKU（执行之后带它整批重置会 409 `SKU_MERGED`，§6.1）；
+  `DEMO_RESET` 是只改账的流水，跨过重置的录入实数会在执行时 `COUNT_STALE`，所以录入实数与执行尽量在同一个营业日内做完；
+- 合并执行持有目录写锁期间，本租户的目录写命令与合并新建要等锁，等满 5 秒 503 `UNAVAILABLE`（确定未生效，同键重试即可，§2.7）。
+
+首轮独立审查（PR #142，提交 `816123d`，通过：阻塞 0 条、非阻塞 10 条）之后的修改，并进上面第 91–93 条，不另编号：
+§10 第 4 条与 §6.2 第 2 条把执行归入“按 ID 指向池内对象”、写明执行不读池行；§7.1 第 2 条注明新建只按这对 SKU 认；§5.6、§5.7、§5.9 的前向引用改指 §2.8；
+页首与第 92 条的“改了哪里”补齐；执行与录入实数、完成、取消的 `STATE_CONFLICT` 带 `{"status"}`，执行第 5 步的 `details` 同新建并注明不复核重叠；
+录入实数那组列在 `selling_paused` 时为空；§2.4“到 `completed` 才恢复”与 §2.7 `actor_role` 的措辞；新建也取目录写锁，免得与修改编码按不同顺序锁 SKU 行而死锁；“对调用方的影响”补 Demo 重置。
+
+第二轮复审（提交 `190438e`，通过：阻塞 0 条、非阻塞 4 条）之后的修改，同样并进第 91–93 条：§7.1 执行顺序第 3 步与 §2.7 首句写明新建也取目录写锁；执行在锁内复核合并单的池是否获准（锁外读池时可能还没录入）；执行第 5 步注明已合并的复核是防御性的，§2.4 改指 §2.8；“对调用方的影响”补目录写锁的等待。
+
+第三轮复审（提交 `5ec2028`，通过：阻塞 0 条、非阻塞 4 条）之后的修改，同样并进第 91–93 条：执行第 1 步先复核池、再按状态分支，写明开事务前两步用锁外读到的池；§2.8 通用、§10 第 4 条、§7.1“哪些结果保存”、§7.2 的补充说明与写入时机补上这个锁内 403；执行第 5 步恢复“已合并 → 停用”的先后（上一轮误对调）；“改了哪里”补 §7.1 第 1 条与 §7.2。
+
+第四轮复审（提交 `8423ec7`，通过：阻塞 0 条、非阻塞 2 条）之后只改措辞：§7.1“哪些结果保存”的例子括注挪回 404、409、422 之后；执行第 1 步末尾的说明句挪到开事务前两步之后，写明只有“锁外为空、锁内已录入”一种情形。
