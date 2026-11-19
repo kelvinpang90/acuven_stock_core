@@ -2321,7 +2321,7 @@ tasks:
       next_cursor 为最后一张的游标，没有新单据时原样返回请求里的 after、没带则为 null。不返回流水。
       三，若现有读接口的连接与事务写法放在 app/services/stock_queries.py 或 app/api/stock_queries.py，照着写，不改那两个文件。
       明确不做：对账变更流与按状态列出待审（契约 5.4，登记对账任务时另定）；流水的按订单查询（契约第 13 节第 11 条）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-052
     acceptance_criteria:
