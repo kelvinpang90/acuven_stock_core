@@ -65,6 +65,16 @@ FOR UPDATE 按 order_ref 读预留行：没有 404 RESERVATION_NOT_FOUND；
 late_payment_review 改为 closed_refunded，记下结案的时间与 review_closed_* 各列，不写流水，200；
 已是 closed_refunded 不写任何东西，200 与当前表示；
 其他状态 409 STATE_CONFLICT（details 带表示里的状态，已到期未关的 active 为 expired），不关单。
+
+最后变更时间（§5.9）：写预留行的同一条 UPDATE 或 INSERT 里设 last_changed_at，
+取本事务写库用到的最晚一次数据库时间：
+- 正常确认为 committed_at；故障补交新建为 created_at（与 closed_at、committed_at 相同）；
+  待审结案为 review_closed_at；
+- 晚到确认在同一事务里先关到期时，关单的 closed_at 取在命令时间之后，取两者中晚的；
+  否则为 committed_at；
+- 第一次转入待审：同一事务里先关到期的，close_if_due 已设为关单的 closed_at，不再改；
+  否则不写任何时间列，取本命令的时间（paid_at 是调用方给的业务时间，不用它）；
+- 幂等重放、换键重报返回已有结果、待审重试仍不够、对已 closed_refunded 的再结案不设。
 """
 
 from collections.abc import Iterable, Sequence
@@ -383,6 +393,7 @@ def _commit(
             "closed_at": now,
             "late": False,
             "fault_mode": committed.fault_mode,
+            "last_changed_at": now,
             **_commit_columns(execution),
         },
     )
@@ -422,7 +433,7 @@ def _late_commit(
         if reservation.status != LATE_PAYMENT_REVIEW:
             execution.keep_on_rejection(
                 lambda kept: _to_review(
-                    execution, kept, reservation, commit, fault_mode, closed_here
+                    execution, kept, reservation, commit, fault_mode, closed_here, now
                 )
             )
         # 已在待审的（重试仍不够）不改预留的任何列。
@@ -464,6 +475,10 @@ def _late_commit(
         late=True,
         fault_mode=fault_mode,
     )
+    # 本事务先关到期时 closed_at 在命令时间之后取，取写库用到的最晚一次（§5.9）。
+    last_changed_at = now
+    if closed_here and reservation.closed_at is not None:
+        last_changed_at = max(now, reservation.closed_at)
     _update_reservation(
         connection,
         tenant_id,
@@ -475,6 +490,7 @@ def _late_commit(
             "committed_at": now,
             "late": True,
             "fault_mode": fault_mode,
+            "last_changed_at": last_changed_at,
             **_commit_columns(execution),
         },
     )
@@ -488,28 +504,29 @@ def _to_review(
     commit: SaleCommit,
     fault_mode: bool,
     close_first: bool,
+    now: datetime,
 ) -> None:
     """第一次转入待审（keep_on_rejection 的写入，在命令的保存点回滚之后执行）。
 
     close_first 为真时命令里的到期关单已随保存点撤销：先再关一次，
-    使 RELEASE 流水、reserved 的减回与 closed_at 和待审一起提交。
+    使 RELEASE 流水、reserved 的减回与 closed_at 和待审一起提交；
+    last_changed_at 由关单设为它的 closed_at（在命令时间 now 之后取），这里不再改。
+    否则这次不写任何时间列，last_changed_at 取命令时间 now（§5.9）。
     """
     tenant_id = _tenant_id(execution)
     reservation_id = reservation.reservation_id
     if close_first and not close_if_due(connection, tenant_id, reservation_id):
         raise RuntimeError(f"reservation {reservation_id} was due but not closed")
-    _update_reservation(
-        connection,
-        tenant_id,
-        reservation_id,
-        {
-            "status": LATE_PAYMENT_REVIEW,
-            "payment_ref": commit.payment_ref,
-            "paid_at": commit.paid_at,
-            "fault_mode": fault_mode,
-            **_commit_columns(execution),
-        },
-    )
+    values: dict[str, Any] = {
+        "status": LATE_PAYMENT_REVIEW,
+        "payment_ref": commit.payment_ref,
+        "paid_at": commit.paid_at,
+        "fault_mode": fault_mode,
+        **_commit_columns(execution),
+    }
+    if not close_first:
+        values["last_changed_at"] = now
+    _update_reservation(connection, tenant_id, reservation_id, values)
 
 
 # --- 故障补交新建 ---
@@ -582,6 +599,8 @@ def _insert_created(
         "committed_at": reservation.committed_at,
         "late": reservation.late,
         "fault_mode": reservation.fault_mode,
+        # 与 created_at、closed_at（及 committed_at）同一个命令时间（§5.9）。
+        "last_changed_at": reservation.created_at,
         **_commit_columns(execution),
     }
     try:
@@ -824,6 +843,7 @@ def close_late_payment_review(execution: Execution, order_ref: str) -> CommandRe
             review_closed_actor_ref=None if access.actor is None else access.actor.ref,
             review_closed_actor_role=None if access.actor is None else access.actor.role,
             review_closed_request_id=execution.request.state.request_id,
+            last_changed_at=now,
         )
     )
     closed = replace(reservation, status=CLOSED_REFUNDED, review_closed_at=now)
