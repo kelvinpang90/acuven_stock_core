@@ -42,6 +42,10 @@ from app.domain.reservations import (
 from app.models.catalog import EXACT_COLLATION, ID, NOW, TABLE_OPTIONS, TIMESTAMP
 from app.models.inventory import CODE32, REF, ZERO
 
+# 对账查询与待审列表的两条索引（契约 5.9）。按命名约定生成的名字超过 64 字符，显式命名。
+LAST_CHANGED_INDEX = "ix_reservations_channel_last_changed_at"
+STATUS_INDEX = "ix_reservations_channel_status"
+
 # 释放时才有、且必有的列；释放的操作者两列可选，另行约束。
 RELEASE_COLUMNS = ("release_reason", "released_credential_id", "released_request_id")
 
@@ -120,6 +124,9 @@ class Reservation(Base):
         UniqueConstraint("tenant_id", "reservation_id"),
         # 定时任务按 expires_at 扫描 active 的预留。
         Index("ix_reservations_status_expires_at", "status", "expires_at"),
+        # 对账查询与待审列表（契约 5.9）。
+        Index(LAST_CHANGED_INDEX, "tenant_id", "channel_id", "last_changed_at", "reservation_id"),
+        Index(STATUS_INDEX, "tenant_id", "channel_id", "status", "reservation_id"),
         CheckConstraint(_in("status", STATUSES), name="status"),
         CheckConstraint(_in("release_reason", RELEASE_REASONS), name="release_reason"),
         CheckConstraint(f"ttl_seconds BETWEEN {TTL_MIN} AND {TTL_MAX}", name="ttl_seconds"),
@@ -222,6 +229,9 @@ class Reservation(Base):
     review_closed_actor_ref: Mapped[str | None] = mapped_column(REF)
     review_closed_actor_role: Mapped[str | None] = mapped_column(CODE32)
     review_closed_request_id: Mapped[str | None] = mapped_column(REF)
+    # 最后变更时间（契约 5.9）：改预留行或它的订单行的事务在同一事务里设为写库用到的最晚一次
+    # 数据库时间，由服务层写入；默认值只为加列时的已有行，迁移随即回填。不进预留的表示。
+    last_changed_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=NOW)
 
 
 class OrderLine(Base):

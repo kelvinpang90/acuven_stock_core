@@ -42,6 +42,8 @@ EXPIRE 在同一事务里按 close_if_due 关单；UNCHANGED 不写；CONFLICT 4
 表示由 reservation_representation 从预留行、订单行与数据库时间算出，它不读库：
 active 而数据库时间已到 expires_at 的显示为 expired（读接口不写库，§5.6）。
 §5.7 加的付款、确认、late、fault_mode 与结案字段照存的列返回（列按状态的有无由表的检查约束保证）。
+最后变更时间（§5.9）：新建、释放与到期关单在写预留行的同一条语句里设 last_changed_at，
+取写进预留的 created_at 或 closed_at；不改列的路径（同键重放、再释放）不设，它也不进表示。
 确认销售（app/services/sale_commits.py）复用这里的读预留、读订单行、表示与新预留之前的关单。
 """
 
@@ -435,6 +437,7 @@ def _reserve(
             "actor_role": None if access.actor is None else access.actor.role,
             "request_id": execution.request.state.request_id,
             "created_at": now,
+            "last_changed_at": now,
         },
     )
     connection = execution.connection
@@ -567,7 +570,8 @@ def close_if_due(connection: Connection, tenant_id: str, reservation_id: str) ->
 
     FOR UPDATE 读预留行；不存在、不是 active 或数据库时间早于 expires_at，什么也不做。
     否则每行一条 RELEASE（reason_code 为 expired，身份只有预留的销售入口），
-    预留改为 expired、closed_at 记数据库时间。
+    预留改为 expired、closed_at 与 last_changed_at 记数据库时间。
+    之后同一事务里再改预留的（晚到确认、转入待审），这次的时间是写库用到的最晚一次。
     """
     reservation = lock_reservation(connection, tenant_id, reservation_id)
     if reservation is None:
@@ -580,7 +584,7 @@ def close_if_due(connection: Connection, tenant_id: str, reservation_id: str) ->
     statement = update(Reservation).where(
         Reservation.tenant_id == tenant_id, Reservation.reservation_id == reservation_id
     )
-    connection.execute(statement.values(status=EXPIRED, closed_at=now))
+    connection.execute(statement.values(status=EXPIRED, closed_at=now, last_changed_at=now))
     return True
 
 
@@ -749,6 +753,7 @@ def release_reservation(execution: Execution, reservation_id: str, reason: str) 
             released_actor_role=identity.actor_role,
             released_request_id=identity.request_id,
             closed_at=now,
+            last_changed_at=now,
         )
     )
     released = replace(reservation, status=RELEASED, release_reason=reason, closed_at=now)
