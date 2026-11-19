@@ -114,18 +114,18 @@ Redis 只用于限流（`app/services/rate_limit.py`），不涉及库存。
 
 ## 8. 每日对账要比较的项（ORD-08，网店发起）
 
-对每个在对账窗口内有变化的订单行：
+对每个在对账窗口内有变化的订单（逐行比对）——两边的并集：Core 对账查询窗口里的订单，加上网店自己在同一窗口有变化的订单与仍未补交的故障收款订单（后两类逐单查 Core，否则发现不了漏通知；契约 §5.9）：
 
-| 网店侧 | Core 侧（`GET /v1/reconciliation/order-lines`） | 不一致的典型原因 |
+| 网店侧 | Core 侧（`GET /v1/reconciliation/orders`，契约 §5.9） | 不一致的典型原因 |
 | --- | --- | --- |
 | 订单已付款 | `committed_qty = quantity` | 确认命令结果未知后未补交 |
 | 订单已取消（付款前） | 预留 `released/expired`，`committed_qty = 0` | 释放未送达（会在 Core 到期后自愈，但仍记差异） |
 | 已发货件数 | `dispatched_qty` | 发货命令漏发/重复 |
 | 已批准且确认未交运的退款件数 | `refund_restocked_qty` | 退款回库漏发 |
 | 已验收退货件数（可售/不可售） | `returned_sellable_qty` / `returned_unsellable_qty` | 验收回执漏发 |
-| 晚到支付待办 | 预留 `late_payment_review` | 管理员未处理 |
+| 晚到支付待办 | 预留 `late_payment_review`（另有待审列表，契约 §5.9） | 管理员未处理 |
 
-外加 Core 自查：四个账面量 = 流水累计（`/v1/ops/invariants`）。
+外加 Core 自查：四个账面量 = 流水累计，`reserved`、`paid_pending_dispatch` 与订单行对得上（`/v1/ops/invariants`，契约 §4.4）。
 
 ## 9. 现有测试里将来要改写或作废的
 
