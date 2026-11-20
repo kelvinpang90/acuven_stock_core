@@ -2603,7 +2603,7 @@ tasks:
       二，可售量：app/domain/reservations.py 的 availability_status 加 selling_paused（排在 inactive 之后、sellable 之前）；app/services/stock_queries.py 的可售量查询读出停售与否，app/api/stock_queries.py 照新状态返回。
       三，停售只停新预留：已有预留的释放、确认销售、故障补交与付款后的命令都不查停售（契约 2.4、5.7）。
       明确不做：合并单的接口（CORE-TASK-060）；执行（CORE-TASK-062）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-055
       - CORE-TASK-058
