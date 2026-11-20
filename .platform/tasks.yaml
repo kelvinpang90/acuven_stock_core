@@ -2640,7 +2640,7 @@ tasks:
       三，重做次数：在 app/services/idempotency.py 的 run_idempotent 加一个参数指定最多做几遍（默认保持现在的 2 遍，现有调用方的行为不变），执行传 3；最后一遍仍抛 RedoCommand 时 503 UNAVAILABLE、什么也不保存。
       四，在 app/domain/catalog.py 的 EVENT_TYPES 加 sku_merged。五，每次执行在进程日志写一行合并单 ID、改挂的订单行数与事务用时。
       明确不做：不变量自查的第 5 项（CORE-TASK-063）；网店侧的映射切换。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-055
       - CORE-TASK-058
