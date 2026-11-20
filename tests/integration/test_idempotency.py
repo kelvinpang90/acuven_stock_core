@@ -11,6 +11,7 @@
 （地点名记下请求摘要与先插那一行的 ID），撞主键时抛 BusinessRefTaken，按引用地点重新判定。
 重做路由声明了余额行预建、READ COMMITTED 与开事务前的钩子，命令同上插地点；
 预建函数与钩子可以按 marker 换掉，用来数调用次数、在重做期间停住。
+三遍路由声明了 READ COMMITTED 与最多做 3 遍，命令同上插地点。
 造数据与观察都用测试自己的连接；应用用自己的连接池。
 """
 
@@ -82,6 +83,8 @@ REFS = "test-refs.claim"
 REFS_URL = "/test/refs"
 REDO_NOTES = "test-redo-notes.create"
 REDO_NOTES_URL = "/test/redo/notes"
+THREE_ATTEMPTS_NOTES = "test-three-attempts-notes.create"
+THREE_ATTEMPTS_NOTES_URL = "/test/three-attempts/notes"
 KEY = "shop:note:1"
 REJECTED = "NOTE_REJECTED"
 REF_CONFLICT = "BUSINESS_REF_CONFLICT"
@@ -275,6 +278,17 @@ def add_test_routes(app) -> None:
             balance_rows=BALANCE_ROWS.get(note.marker, balance_rows_of(note)),
             read_committed=True,
             before_transaction=BEFORE_TRANSACTION.get(note.marker),
+        )
+
+    @app.post(THREE_ATTEMPTS_NOTES_URL, dependencies=[WRITE])
+    def create_three_attempts_note(request: Request, body: NoteBody) -> Response:
+        return run_idempotent(
+            request,
+            operation=THREE_ATTEMPTS_NOTES,
+            body=body,
+            command=lambda execution: write_note(execution, body.model),
+            read_committed=True,
+            attempts=3,
         )
 
 
@@ -1347,6 +1361,65 @@ def test_a_second_redo_is_unavailable_and_saves_nothing(client, engine):
     assert "Idempotency-Replayed" not in retry.headers
     assert notes(engine, caller, "m") == 1
     assert len(records(engine, caller)) == 1
+
+
+def test_a_command_given_three_attempts_saves_the_third_result(client, engine):
+    caller = issue(engine)
+    seen: list[int] = []
+    HOOKS["m"] = redo_first(2, seen)
+    body = {"marker": "m", "event": True}
+    response = send(client, caller, url=THREE_ATTEMPTS_NOTES_URL, json=body)
+    assert response.status_code == 201
+    assert seen == [1, 2, 3]
+
+    # 前两遍的写入都回滚了，只留第三遍的；响应是第三遍的。
+    assert notes(engine, caller, "attempt-1") == 0
+    assert notes(engine, caller, "attempt-2") == 0
+    assert notes(engine, caller, "attempt-3") == 1
+    assert notes(engine, caller, "m") == 1
+    [record] = records(engine, caller, operation=THREE_ATTEMPTS_NOTES)
+    assert record["response_status"] == 201
+    assert record["response_body"] == response.json()
+
+    # 前两遍登记的事件丢弃，第三遍的照常写。
+    recorded = events(engine, rid_of(response))
+    details = sorted((event["details"]["ref_type"], event["details"]["ref"]) for event in recorded)
+    assert details == [("attempt", "3"), ("note", "m")]
+
+    replay = send(client, caller, url=THREE_ATTEMPTS_NOTES_URL, json=body)
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == response.json()
+    assert seen == [1, 2, 3]
+
+
+def test_a_redo_on_the_last_of_three_attempts_is_unavailable_and_saves_nothing(client, engine):
+    caller = issue(engine)
+    seen: list[int] = []
+    HOOKS["m"] = redo_first(3, seen)
+    body = {"marker": "m", "event": True}
+    failed = send(client, caller, url=THREE_ATTEMPTS_NOTES_URL, json=body)
+    error = error_of(failed, 503)
+    assert error["code"] == "UNAVAILABLE"
+    assert error["retryable"] is True
+    assert seen == [1, 2, 3]
+
+    assert records(engine, caller, operation=THREE_ATTEMPTS_NOTES) == []
+    for marker in ("m", "attempt-1", "attempt-2", "attempt-3"):
+        assert notes(engine, caller, marker) == 0
+    # 三遍登记的事件都丢弃。
+    assert events(engine, rid_of(failed)) == []
+    assert_lock_free(engine, note_lock(caller, operation=THREE_ATTEMPTS_NOTES))
+
+
+def test_the_default_still_allows_one_redo_only(client, engine):
+    """不传 attempts 的命令照旧最多做 2 遍：第 2 遍再要重做就 503。"""
+    caller = issue(engine)
+    seen: list[int] = []
+    HOOKS["m"] = redo_first(2, seen)
+    failed = send(client, caller, url=READ_COMMITTED_NOTES_URL, json={"marker": "m"})
+    assert error_of(failed, 503)["code"] == "UNAVAILABLE"
+    assert seen == [1, 2]
+    assert records(engine, caller, operation=READ_COMMITTED_NOTES) == []
 
 
 def test_a_redo_stays_read_committed_and_the_isolation_is_reset_afterwards(client, engine):

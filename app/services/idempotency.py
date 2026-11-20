@@ -105,8 +105,9 @@
   在同一连接上（幂等锁、目录写锁与 READ COMMITTED 仍在）从余额行预建那一步整个重做：
   重新调用 balance_rows 并预建它这次返回的行、重新调用 before_transaction，
   再开新事务执行同一个命令。重做的结果照常处理（保存、重放、冲突、500 都与第一次相同）。
-- 每个请求最多重做一次：重做里再抛 RedoCommand 时回滚，
-  503 UNAVAILABLE（retryable 为真），不保存幂等记录，两次登记的安全事件都丢弃；
+- 一个请求最多做 attempts 遍（run_idempotent 的参数，默认 2，即最多重做一次；
+  SKU 合并执行传 3，§2.8 执行第 4 步）：最后一遍仍抛 RedoCommand 时回滚，
+  503 UNAVAILABLE（retryable 为真），不保存幂等记录，各遍登记的安全事件都丢弃；
   同键重试会重新执行。
 
 READ COMMITTED（契约 §4.1 下文、§6.6）：
@@ -246,9 +247,9 @@ class BusinessRefTaken(Exception):
 
 
 class RedoCommand(Exception):
-    """命令要求回滚后从余额行预建那一步整个重做一次（§5.7 通用的“重新判定”）。
+    """命令要求回滚后从余额行预建那一步整个重做（§5.7 通用的“重新判定”）。
 
-    命令本身、keep_on_rejection 登记的写入或 rejudge 抛出；重做里再抛时 503。
+    命令本身、keep_on_rejection 登记的写入或 rejudge 抛出；最后一遍里再抛时 503。
     """
 
     def __init__(self) -> None:
@@ -281,6 +282,7 @@ def run_idempotent(
     balance_rows: BalanceRows | None = None,
     read_committed: bool = False,
     before_transaction: BeforeTransaction | None = None,
+    attempts: int = 2,
 ) -> Response:
     """第 10 步：取命名锁，重放、冲突或执行命令，释放锁，再写安全事件。
 
@@ -288,7 +290,8 @@ def run_idempotent(
     balance_rows 给了时，取锁之后、开业务事务之前用单独的短事务预建它返回的余额行（§4.1）。
     read_committed 为真时业务事务（与重新判定事务）以 READ COMMITTED 开启。
     before_transaction 给了时，设好隔离级别之后、开业务事务之前在同一连接上调用它。
-    命令抛 RedoCommand 时回滚，从预建那一步整个重做一次；重做里再抛 503。
+    命令抛 RedoCommand 时回滚，从预建那一步整个重做；一个请求最多做 attempts 遍
+    （默认 2），最后一遍仍抛时 503。
     """
     if (
         not isinstance(operation, str)
@@ -296,6 +299,8 @@ def run_idempotent(
         or not _OPERATION.fullmatch(operation)
     ):
         raise ValueError(f"invalid operation name: {operation!r}")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        raise ValueError(f"attempts must be a positive integer, got {attempts!r}")
     access = get_access(request)
     if access.idempotency_key is None:
         raise RuntimeError("a write endpoint needs authorize(..., write=True)")
@@ -320,22 +325,22 @@ def run_idempotent(
         _acquire(request, connection, name)
         if catalog_lock:
             _acquire_catalog(request, connection, catalog_lock_name(database, scope.tenant_id))
-        redone = False
+        attempt = 1
         while True:
             if balance_rows is not None:
                 _prepare_balances(request, connection, scope.tenant_id, balance_rows)
-            if read_committed and not redone:
+            if read_committed and attempt == 1:
                 # 重做时会话仍是 READ COMMITTED：由 _release_locks 才设回默认。
                 _read_committed(request, connection)
             if before_transaction is not None:
                 _before_transaction(request, connection, before_transaction)
             try:
                 response, events = _execute(
-                    request, connection, scope, digest, command, may_redo=not redone
+                    request, connection, scope, digest, command, may_redo=attempt < attempts
                 )
             except RedoCommand:
                 # 业务事务已回滚，这次登记的事件丢弃；从预建那一步重做（§5.7 通用）。
-                redone = True
+                attempt += 1
                 continue
             break
     finally:
@@ -517,7 +522,7 @@ def _execute(
 
     返回响应与要在释放锁之后写的安全事件。
     命令（或被拒仍保留的写入、rejudge）抛 RedoCommand 时回滚：
-    may_redo 为真时把它传出，由调用方重做；否则 503，事件都丢弃。
+    may_redo 为真时把它传出，由调用方重做；否则（最后一遍）503，事件都丢弃。
     """
     request_id = request.state.request_id
     execution = Execution(request, connection, scope.operation, digest)
@@ -560,8 +565,10 @@ def _execute(
         _rollback_quietly(transaction)
         if may_redo:
             raise
-        # 重做里又要重做：确定未生效，两次的事件都丢弃（§5.7 通用、§7.1 第 2 条的例外）。
-        _log.warning("the command asked to be redone twice (request_id=%s)", request_id)
+        # 最后一遍又要重做：确定未生效，各遍的事件都丢弃（§5.7 通用、§7.1 第 2 条的例外）。
+        _log.warning(
+            "the command asked to be redone on its last attempt (request_id=%s)", request_id
+        )
         return error_response(request_id, unavailable()), []
     except Exception:
         _log.exception("idempotent command failed (request_id=%s)", request_id)

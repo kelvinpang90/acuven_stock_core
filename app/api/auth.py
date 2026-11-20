@@ -109,10 +109,13 @@ class Access:
 
 
 class ObjectPool(NamedTuple):
-    """按 ID 指向池内对象的命令：对象所属的租户与池。"""
+    """按 ID 指向池内对象的命令：对象所属的租户与池。
+
+    pool_id 为 None 表示对象还没有池（还没录入实数的 SKU 合并单，§2.8）。
+    """
 
     tenant_id: str
-    pool_id: str
+    pool_id: str | None
 
 
 # --- 错误与安全事件 ---
@@ -431,22 +434,27 @@ def require_object_pool(
     *,
     object_type: str,
     not_found_code: str,
-) -> Callable[..., str]:
+) -> Callable[..., str | None]:
     """按 ID 指向池内对象的命令（盘点单的提交、确认、取消等），按对象所属的池判定。
 
     find_pool 由接口提供：按对象 ID 查它所属的租户与池，不存在时返回 None（不按租户过滤）。
     顺序同 require_pool；对象不存在与属于别的租户都是 404 not_found_code，后者另记 cross_tenant。
-    返回对象所属的池。
+    本租户的对象还没有池（pool_id 为 None，§2.8 还没录入实数的合并单）时
+    只跳过“不是获准的池 403”这一步，没有销售入口照样 403。
+    返回对象所属的池（还没有池时为 None）。
     """
 
     def dependency(
         request: Request, object_id: Annotated[str, Depends(object_id_dependency)]
-    ) -> str:
+    ) -> str | None:
         principal = _principal(request)
         found = _read(request, lambda conn: find_pool(conn, object_id))
         in_tenant = found is not None and found.tenant_id == principal.tenant_id
-        object_pool = "" if found is None else found.pool_id
-        decision = authorize_pool(principal.pool_id, object_pool, pool_in_tenant=in_tenant)
+        if in_tenant and found.pool_id is None:
+            decision = authorize_sales_command(principal.pool_id)
+        else:
+            object_pool = "" if found is None or found.pool_id is None else found.pool_id
+            decision = authorize_pool(principal.pool_id, object_pool, pool_in_tenant=in_tenant)
         if decision is PoolDecision.NOT_FOUND:
             if found is not None:
                 raise cross_tenant_not_found(

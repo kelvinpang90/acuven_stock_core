@@ -14,6 +14,7 @@ from app.domain.catalog import (
     SKU,
     SKU_CODE_RETIRED,
     SKU_CODE_TAKEN,
+    SKU_MERGED,
     Conflict,
     InvalidField,
     InvalidParameter,
@@ -430,7 +431,7 @@ class CatalogLockNameTest(unittest.TestCase):
 
 
 class EventTypeTest(unittest.TestCase):
-    def test_eight_event_types(self):
+    def test_nine_event_types(self):
         self.assertEqual(
             EVENT_TYPES,
             {
@@ -442,8 +443,13 @@ class EventTypeTest(unittest.TestCase):
                 "sku_updated",
                 "sku_deactivated",
                 "sku_reactivated",
+                "sku_merged",
             },
         )
+
+    def test_sku_merged_is_written_for_the_source_sku_of_a_merge(self):
+        self.assertEqual(SKU_MERGED, "sku_merged")
+        self.assertIn(SKU_MERGED, EVENT_TYPES)
 
 
 class CursorTest(unittest.TestCase):
