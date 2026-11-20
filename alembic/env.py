@@ -20,7 +20,7 @@ from sqlalchemy import Connection, engine_from_config, inspect, pool, text
 from alembic import context
 from app.db import Base
 from app.domain.environment import check_instance_marker, parse_core_env
-from app.models import catalog, instance, inventory, orders, service_auth  # noqa: F401
+from app.models import catalog, instance, inventory, merges, orders, service_auth  # noqa: F401
 
 config = context.config
 target_metadata = Base.metadata
