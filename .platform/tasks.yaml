@@ -2510,7 +2510,7 @@ tasks:
       两个快照相加后用 count_deltas 算出的 d_shelf 与 d_u、定数后的规范四个量与是否写定数流水（两个差额都为 0 时不写）；落账后违反不变量时抛 CountBelowCommitments（缺口照契约 6 的公式，只有规范 SKU 一项）。
       快照是否作废用 is_stale 对两个 SKU 各判一次，给出作废的 sku_id 列表。
       明确不做：数据库表与迁移（CORE-TASK-059）；接口（CORE-TASK-060、062）；可售量与新预留的停售状态（CORE-TASK-061）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 函数与常量在 app/domain/sku_merges.py，不 import FastAPI、SQLAlchemy 或做 I/O 的库；单元测试在 tests/unit/test_sku_merges.py，用 unittest
