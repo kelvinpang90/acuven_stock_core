@@ -148,7 +148,7 @@ def consistent(pair: Pair, status: str) -> dict[str, object]:
     return values
 
 
-def merge_insert(pair: Pair, status: str, **overrides: object) -> Executable:
+def merge_insert(pair: Pair, status: str, /, **overrides: object) -> Executable:
     return insert(SkuMerge).values(consistent(pair, status) | overrides)
 
 
