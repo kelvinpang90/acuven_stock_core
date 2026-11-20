@@ -2540,7 +2540,7 @@ tasks:
       二，sku_merge_snapshots：主键 (merge_id, sku_id)，列与外键照契约 2.8，四个量与 balance_version 的检查约束照余额行的写法（非负）。
       三，迁移只加表（契约 2.2）；downgrade 删两张表。“互不重叠”不建约束（契约写明由新建命令保证）。
       明确不做：任何命令与接口（CORE-TASK-060～062）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-055
       - CORE-TASK-058
