@@ -20,6 +20,7 @@ from app.api import (
     reconciliation,
     reservations,
     sale_commits,
+    sku_merges,
     stock_documents,
     stock_imports,
     stock_queries,
@@ -126,6 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(stock_imports.router)
     app.include_router(stock_documents.router)
     app.include_router(counts.router)
+    app.include_router(sku_merges.router)
     app.include_router(reservations.router)
     app.include_router(sale_commits.router)
     app.include_router(fulfilment.router)
