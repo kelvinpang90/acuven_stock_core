@@ -56,6 +56,8 @@ SKU_CREATED = "sku_created"
 SKU_UPDATED = "sku_updated"
 SKU_DEACTIVATED = "sku_deactivated"
 SKU_REACTIVATED = "sku_reactivated"
+# SKU 合并执行时给来源 SKU 写（§2.8 执行第 8 步）。
+SKU_MERGED = "sku_merged"
 EVENT_TYPES = frozenset(
     {
         PRODUCT_CREATED,
@@ -66,6 +68,7 @@ EVENT_TYPES = frozenset(
         SKU_UPDATED,
         SKU_DEACTIVATED,
         SKU_REACTIVATED,
+        SKU_MERGED,
     }
 )
 

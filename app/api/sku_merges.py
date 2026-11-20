@@ -1,14 +1,19 @@
-"""SKU 合并的新建、录入实数、完成、取消与查询接口。
+"""SKU 合并的新建、录入实数、执行、完成、取消与查询接口。
 
 契约 §2.4、§2.7、§2.8、§7.2、§10 第 3、4 条。
 全部接口（含查询）要求 catalog.write 与 stock.write 两者。
-四个写命令经幂等执行器，业务事务以 READ COMMITTED 开启（§2.8 通用）。
-新建、完成、取消只接受 stock_admin；录入实数接受 stock_operator 与 stock_admin。
-新建不写目录，也取目录写锁（§2.7、§2.8 新建），与修改编码等目录命令串行。
-池授权只有录入实数做，按正文的 pool_id；开事务之前按这个池预建合并单两个 SKU 的余额行。
-录入实数、完成与取消的 404 在事务里判出、作为确定结果保存（app/services/sku_merges.py）。
-完成与取消没有请求体。查询不要求角色，不存在或属于别的租户 404，后者记 cross_tenant。
-执行不在这里（另行登记）。查库与写库在 app/services/sku_merges.py。
+五个写命令经幂等执行器，业务事务以 READ COMMITTED 开启（§2.8 通用）。
+新建、执行、完成、取消只接受 stock_admin；录入实数接受 stock_operator 与 stock_admin。
+新建不写目录，也取目录写锁（§2.7、§2.8 新建），与修改编码等目录命令串行；
+执行写 sku_merged 变更记录，同样取目录写锁。
+池授权：录入实数按正文的 pool_id，开事务之前按这个池预建合并单两个 SKU 的余额行；
+执行按合并单录入实数时的池（按 ID 指向池内对象，还没录入的只查有没有销售入口），
+开事务之前按池授权时读到的池预建两个余额行、先关两个 SKU 上已到期的预留，
+复核多出订单行时一个请求最多做 3 遍。
+录入实数、执行、完成与取消的 404 在事务里判出、作为确定结果保存（app/services/sku_merges.py）；
+执行的池授权在取幂等锁之前，它的 403、404 不保存。
+执行、完成与取消没有请求体。查询不要求角色，不存在或属于别的租户 404，后者记 cross_tenant。
+查库与写库在 app/services/sku_merges.py。
 """
 
 import logging
@@ -24,6 +29,7 @@ from app.api.auth import (
     authorize,
     cross_tenant_not_found,
     get_access,
+    require_object_pool,
     require_pool,
     require_role,
 )
@@ -55,6 +61,7 @@ from app.services.sku_merges import SKU_MERGE, SKU_MERGE_NOT_FOUND
 
 SKU_MERGES_CREATE = "sku_merges.create"
 SKU_MERGES_COUNT = "sku_merges.count"
+SKU_MERGES_EXECUTE = "sku_merges.execute"
 SKU_MERGES_COMPLETE = "sku_merges.complete"
 SKU_MERGES_CANCEL = "sku_merges.cancel"
 
@@ -65,7 +72,7 @@ _log = logging.getLogger("app.api")
 router = APIRouter()
 _READ = [Depends(authorize(CATALOG_WRITE, STOCK_WRITE))]
 _WRITE = [Depends(authorize(CATALOG_WRITE, STOCK_WRITE, write=True))]
-# 完成与取消没有请求体：no_body 在 authorize 之后，空请求体跳过、非空 422。
+# 执行、完成与取消没有请求体：no_body 在 authorize 之后，空请求体跳过、非空 422。
 _WRITE_WITHOUT_BODY = [*_WRITE, Depends(no_body)]
 
 OperatorOrAdmin = Annotated[Actor, Depends(require_role(STOCK_OPERATOR, STOCK_ADMIN))]
@@ -127,6 +134,19 @@ def _count_pool(fields: Annotated[dict, Depends(checked_count)]) -> str:
     return fields[POOL_ID]
 
 
+def _path_merge_id(merge_id: str) -> str:
+    return merge_id
+
+
+# 执行的池授权：按合并单录入实数时的池；还没录入（池为空）的只查有没有销售入口。
+_merge_pool = require_object_pool(
+    _path_merge_id,
+    sku_merges.find_merge_pool,
+    object_type=SKU_MERGE,
+    not_found_code=SKU_MERGE_NOT_FOUND,
+)
+
+
 # --- 新建 ---
 
 
@@ -183,6 +203,36 @@ def count_merge(
         command=command,
         balance_rows=balance_rows,
         read_committed=True,
+    )
+
+
+# --- 执行 ---
+
+
+@router.post(SKU_MERGES + "/{merge_id}/execute", dependencies=_WRITE_WITHOUT_BODY)
+def execute_merge(
+    request: Request,
+    merge_id: str,
+    actor: Admin,
+    pool_id: Annotated[str | None, Depends(_merge_pool)],
+) -> Response:
+    tenant_id = get_access(request).principal.tenant_id
+    # 池授权时读到的池；为 None 时开事务前的预建与先关到期都跳过。
+    skus = sku_merges.ExecutionSkus(tenant_id, merge_id, pool_id)
+
+    def command(execution: Execution) -> CommandResult:
+        return sku_merges.execute_merge(execution, merge_id)
+
+    return run_idempotent(
+        request,
+        operation=SKU_MERGES_EXECUTE,
+        body=None,
+        command=command,
+        catalog_lock=True,
+        balance_rows=skus.balance_rows,
+        read_committed=True,
+        before_transaction=skus.close_due,
+        attempts=sku_merges.EXECUTE_ATTEMPTS,
     )
 
 
