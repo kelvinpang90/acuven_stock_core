@@ -3,7 +3,7 @@
 每个函数收旧账面量、返回新账面量，不改原值；结果违反不变量时抛 InvariantViolation。
 另有余额行两个判定列（last_book_only_version、last_reconciled_version）的默认更新规则、
 不可售调整的上限检查与更正的判定。
-SKU 合并迁移（MERGE_TRANSFER_OUT/IN）的落账规则不在这里，随合并任务加。
+SKU 合并迁移（MERGE_TRANSFER_OUT/IN）的落账规则不在这里，见 app/domain/sku_merges.py。
 """
 
 from enum import StrEnum
