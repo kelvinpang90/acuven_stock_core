@@ -172,7 +172,9 @@ def balance_representation(balance: BalanceRecord) -> dict:
 
 
 def availability_representation(record: AvailabilityRecord) -> dict:
-    """available 与状态（§5.6 可售量）；merged_into_sku_id 只在 merged 时有值。"""
+    """available 与状态（§5.6 可售量，0.16 加 selling_paused）；
+    merged_into_sku_id 只在 merged 时有值。
+    """
     quantities = Quantities(
         record.stock_balance, record.reserved, record.unavailable, record.paid_pending_dispatch
     )
@@ -180,6 +182,7 @@ def availability_representation(record: AvailabilityRecord) -> dict:
         record.merged_into_sku_id,
         sku_active=record.sku_status == ACTIVE,
         product_active=record.product_status == ACTIVE,
+        selling_paused=record.selling_paused,
     )
     return {
         "sku_id": record.sku_id,
