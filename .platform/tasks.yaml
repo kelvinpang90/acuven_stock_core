@@ -2571,7 +2571,7 @@ tasks:
       二，录入实数 POST /v1/sku-merges/{merge_id}/count：池授权按正文 pool_id；开事务之前预建两个 SKU 的余额行（balance_rows）；判定顺序照契约 2.8 录入实数第 1–5 步，404 SKU_MERGE_NOT_FOUND，STATE_CONFLICT 的 details 照契约；快照照 app/services/counts.py 提交实数的写法取，已录入的整份替换。
       三，完成与取消：判定照契约 2.8，没有请求体，不做池授权；404 在事务里判出、作为确定结果保存。四，查询 GET /v1/sku-merges/{merge_id}：表示照契约 2.8（count、execution 在对应阶段之前为 null）；属于别的租户的 404 记 cross_tenant。
       明确不做：新预留与可售量的停售判定（CORE-TASK-061）；执行（CORE-TASK-062）；不变量自查的第 5 项（CORE-TASK-063）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-058
       - CORE-TASK-059
