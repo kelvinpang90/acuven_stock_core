@@ -1,4 +1,5 @@
-"""池、余额、流水与可售量查询的数据库读取（契约 §5.6 可售量、§6.2 第 1 条、§6.3 池的查询、§6.8）。
+"""池、余额、流水与可售量查询的数据库读取（契约 §5.6 可售量、§6.2 第 1 条、§6.3 池的查询、§6.8），
+以及 SKU 合并的停售判定（§2.8）。
 
 read_* 都按租户过滤，不管事务：调用方在自己的连接上读完再结束事务；都是普通读，不加锁。
 pool_owner 不按租户过滤，只在按 ID 找不到时用来区分不存在与属于别的租户
@@ -10,10 +11,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Connection, and_, select
+from sqlalchemy import Connection, and_, or_, select
 
+from app.domain.sku_merges import CANONICAL, OPEN_STATUSES, SOURCE, pauses_selling
 from app.models.catalog import Product, Sku
 from app.models.inventory import QUANTITIES, LedgerEntry, StockBalance, StockPool
+from app.models.merges import SkuMerge
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,30 @@ class AvailabilityRecord:
     merged_into_sku_id: str | None
     sku_status: str
     product_status: str
+    selling_paused: bool
+
+
+def selling_paused_sku_ids(
+    connection: Connection, tenant_id: str, sku_ids: Collection[str]
+) -> set[str]:
+    """sku_ids 里停售中的 SKU（§2.8 停售的判定）：普通读本租户未结束的合并单，
+    按 pauses_selling 判每个 SKU 在单上的角色。新预留第 5 步与可售量共用。
+    """
+    if not sku_ids:
+        return set()
+    wanted = set(sku_ids)
+    columns = (SkuMerge.status, SkuMerge.source_sku_id, SkuMerge.canonical_sku_id)
+    statement = select(*columns).where(
+        SkuMerge.tenant_id == tenant_id,
+        SkuMerge.status.in_(OPEN_STATUSES),
+        or_(SkuMerge.source_sku_id.in_(wanted), SkuMerge.canonical_sku_id.in_(wanted)),
+    )
+    paused = set()
+    for status, source_sku_id, canonical_sku_id in connection.execute(statement):
+        for sku_id, role in ((source_sku_id, SOURCE), (canonical_sku_id, CANONICAL)):
+            if sku_id in wanted and pauses_selling(status, role):
+                paused.add(sku_id)
+    return paused
 
 
 def pool_owner(connection: Connection, pool_id: str) -> str | None:
@@ -120,9 +147,11 @@ def read_availability(
     """sku_ids 里属于本租户的 SKU 在这个池的可售量所需的字段，按 sku_id 升序。
 
     不存在或属于别的租户的 SKU 不出现；已合并、停用的照常出现。池取自凭据的销售入口。
+    selling_paused 由 selling_paused_sku_ids 读出，同样是普通读。
     """
     if not sku_ids:
         return []
+    paused = selling_paused_sku_ids(connection, tenant_id, sku_ids)
     statement = (
         select(
             Sku.sku_id,
@@ -154,6 +183,7 @@ def read_availability(
             merged_into_sku_id=row["merged_into_sku_id"],
             sku_status=row["sku_status"],
             product_status=row["product_status"],
+            selling_paused=row["sku_id"] in paused,
         )
         for row in connection.execute(statement).mappings()
     ]

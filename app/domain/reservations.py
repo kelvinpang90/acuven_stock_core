@@ -46,6 +46,8 @@ LINE_QUANTITY_MAX = 1000000
 
 MERGED = "merged"
 INACTIVE = "inactive"
+# 停售中（§2.8 停售的判定，0.16）。
+SELLING_PAUSED = "selling_paused"
 SELLABLE = "sellable"
 
 
@@ -116,11 +118,19 @@ def find_shortfalls(
 
 
 def availability_status(
-    merged_into_sku_id: str | None, sku_active: bool, product_active: bool
+    merged_into_sku_id: str | None,
+    sku_active: bool,
+    product_active: bool,
+    selling_paused: bool = False,
 ) -> str:
-    """可售量的状态：已合并先于停用，停用先于可售（§5.6 可售量）。"""
+    """可售量的状态：已合并先于停用，停用先于停售，停售先于可售（§5.6 可售量）。
+
+    与新预留第 5 步的判定顺序相同；selling_paused 为 SKU 是否停售中（§2.8）。
+    """
     if merged_into_sku_id is not None:
         return MERGED
     if not (sku_active and product_active):
         return INACTIVE
+    if selling_paused:
+        return SELLING_PAUSED
     return SELLABLE

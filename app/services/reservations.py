@@ -11,6 +11,7 @@
 4. 按 (pool_id, sku_id) 升序锁余额行；
 5. 按 sku_id 升序 FOR SHARE 读 SKU 行、按 product_id 升序 FOR SHARE 读商品行：
    已合并 409 SKU_MERGED，SKU 或所属商品停用 409 SKU_INACTIVE；
+   然后普通读查合并单，停售中（§2.8）409 SKU_SELLING_PAUSED；
 6. 可售不足 409 INSUFFICIENT_STOCK；
 7. 取一次数据库时间，写预留、订单行与每行一条 RESERVE 流水，201。
 
@@ -28,6 +29,7 @@
 释放（release_reservation）在执行器的事务里按 release_decision：
 RELEASE 每行一条 RELEASE（reason_code 为请求的原因），预留改为 released，记原因、时间与请求方；
 EXPIRE 在同一事务里按 close_if_due 关单；UNCHANGED 不写；CONFLICT 409 STATE_CONFLICT。
+停售只停新预留（§2.4）：释放与到期关单不查停售。
 
 到期关单（close_if_due）在调用方给的事务里运行、自己不提交；锁内复核状态与到期，
 几条路径同时关同一个预留只关一次。流水只带预留的销售入口（channel_id），
@@ -96,12 +98,14 @@ from app.services.stock import (
     require_skus_exist,
     write_entry,
 )
+from app.services.stock_queries import selling_paused_sku_ids
 
 # 对象类型与错误码（§5.6、§8.3）。
 RESERVATION = "reservation"
 RESERVATION_NOT_FOUND = "RESERVATION_NOT_FOUND"
 ORDER_REFERENCE_CONFLICT = "ORDER_REFERENCE_CONFLICT"
 SKU_INACTIVE = "SKU_INACTIVE"
+SKU_SELLING_PAUSED = "SKU_SELLING_PAUSED"
 INSUFFICIENT_STOCK = "INSUFFICIENT_STOCK"
 STATE_CONFLICT = "STATE_CONFLICT"
 # ORDER_REFERENCE_CONFLICT 的 details.ref_type。
@@ -374,6 +378,17 @@ def _require_sellable_skus(execution: Execution, sku_ids: Sequence[str]) -> None
         raise ApiError(409, SKU_INACTIVE, "sku is inactive", details=details)
 
 
+def _require_selling(execution: Execution, sku_ids: Sequence[str]) -> None:
+    """第 5 步的停售判定（已合并、停用先判）：读了 SKU 行与商品行之后，
+    普通读查使所列 SKU 停售的合并单（§2.8 停售的判定）；
+    停售中的按请求顺序列全，409 SKU_SELLING_PAUSED。
+    """
+    paused = selling_paused_sku_ids(execution.connection, _tenant_id(execution), sku_ids)
+    if paused:
+        details = {"sku_ids": [sku_id for sku_id in sku_ids if sku_id in paused]}
+        raise ApiError(409, SKU_SELLING_PAUSED, "sku selling is paused", details=details)
+
+
 def _insert_reservation(execution: Execution, values: dict[str, Any]) -> None:
     """撞 (tenant_id, channel_id, order_ref) 唯一约束时抛 BusinessRefTaken，
     由 create_reservation 换上重新判定。
@@ -400,6 +415,7 @@ def _reserve(
     balances = lock_balances(execution, pool_id, sku_ids)
     require_not_merged(execution, sku_ids)
     _require_sellable_skus(execution, sku_ids)
+    _require_selling(execution, sku_ids)
     available = {sku_id: balance.quantities.available for sku_id, balance in balances.items()}
     requested = [(line.line_ref, line.sku_id, line.quantity) for line in lines]
     shortfalls = find_shortfalls(requested, available)

@@ -59,8 +59,13 @@ class ConstantsTest(unittest.TestCase):
 
     def test_availability_statuses(self):
         self.assertEqual(
-            (reservations.MERGED, reservations.INACTIVE, reservations.SELLABLE),
-            ("merged", "inactive", "sellable"),
+            (
+                reservations.MERGED,
+                reservations.INACTIVE,
+                reservations.SELLING_PAUSED,
+                reservations.SELLABLE,
+            ),
+            ("merged", "inactive", "selling_paused", "sellable"),
         )
 
 
@@ -212,6 +217,24 @@ class AvailabilityStatusTest(unittest.TestCase):
 
     def test_sellable(self):
         self.assertEqual(availability_status(None, True, True), "sellable")
+        self.assertEqual(availability_status(None, True, True, False), "sellable")
+
+    def test_merged_comes_before_selling_paused(self):
+        for sku_active in (True, False):
+            for product_active in (True, False):
+                with self.subTest(sku_active=sku_active, product_active=product_active):
+                    status = availability_status("sku_canonical", sku_active, product_active, True)
+                    self.assertEqual(status, "merged")
+
+    def test_inactive_comes_before_selling_paused(self):
+        self.assertEqual(availability_status(None, True, False, True), "inactive")
+        self.assertEqual(availability_status(None, False, True, True), "inactive")
+        self.assertEqual(availability_status(None, False, False, True), "inactive")
+
+    def test_selling_paused_comes_before_sellable(self):
+        self.assertEqual(availability_status(None, True, True, True), "selling_paused")
+        status = availability_status(None, True, True, selling_paused=True)
+        self.assertEqual(status, "selling_paused")
 
 
 if __name__ == "__main__":
