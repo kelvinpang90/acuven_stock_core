@@ -26,7 +26,6 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-063` 不变量自查加第五项，查未结订单行是否仍指向已合并的 SKU
 
 ### 已阻塞
 
