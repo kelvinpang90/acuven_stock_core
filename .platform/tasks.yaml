@@ -2743,14 +2743,14 @@ tasks:
       一，deploy/monitor.sh（bash，set -euo pipefail，通过 shellcheck）：同 deploy/healthcheck.sh 按 compose 标签找 core_api 容器，另加 com.docker.compose.oneoff=False 的过滤，不是恰好一个容器就算没查成；
       docker exec 进容器，用容器里的 Python 经容器内回环取就绪检查与不变量自查；判据、级别、各步限时（找容器 10 秒、就绪检查外层 15 秒内层 10 秒、自查外层 60 秒内层 45 秒、每次推心跳 10 秒）、
       不合格隔 45 秒整轮复核一次、没查成的原因取固定几种、通知正文的内容与不写的内容、系统日志、推心跳失败只记日志、不加 flock，都按 8.5。
-      二，配置：从服务器 .env 只读四个键 CORE_MONITOR_TOKEN、CORE_HEALTHCHECK_READYZ_URL、CORE_HEALTHCHECK_PERIODIC_URL、CORE_HEALTHCHECK_INVARIANTS_URL，按行解析、不 source 整个文件；
+      二，配置：从服务器 .env 只读四个键 CORE_MONITOR_TOKEN、CORE_HEALTHCHECK_READYZ_URL、CORE_HEALTHCHECK_PERIODIC_URL、CORE_HEALTHCHECK_INVARIANTS_URL，按行解析、不 source 整个文件：取第一个等号之后的值，去掉首尾空白与一对成对的单引号或双引号，同一个键出现多次取最后一个，不认行尾注释；
       .env 的默认路径按脚本自己的位置定为检出根目录下的 .env（与当前目录无关，cron 在运行账号的家目录里跑），可用环境变量 CORE_MONITOR_ENV_FILE 覆盖，复核秒数可用 CORE_MONITOR_RECHECK_SECONDS 覆盖；
       .env 不存在或读不了时，按没配令牌与没配心跳地址处理。令牌经 docker exec -e 按名字传入，不出现在任何命令行参数、日志与通知正文里；心跳地址不出现在日志、通知正文与 docker 的参数里。
       三，推心跳照心跳服务的约定：合格时向地址本身发 POST，不合格时向地址加 /fail 发 POST，正文作请求体；每个维度每轮都推。
       某个维度没配心跳地址时记一行不会通知任何人（只写键名），本轮以非 0 退出，即使其余维度全部合格；有不合格时也以非 0 退出，全部合格且都配了地址时以 0 退出。
       四，deploy/monitor.cron：每 5 分钟一行，用 bash 显式调用脚本（不依赖文件的执行权限），带运行账号字段，检出目录与运行账号用占位符，不含 flock，文件以换行结尾。
       五，docs/OPS_MONITORING.md 运行手册：Core 单独开一个心跳服务账号；建三个检查，名字带实例（stock_core demo readyz、stock_core demo periodic、stock_core demo invariants，以后的生产实例各建三个），周期 5 分钟、宽限 15 分钟、接 Telegram；
-      签发 ops.read 运维凭据（不设截止时间，轮换按契约 10 第 4 条、换完改 .env）；写服务器 .env；把 cron 文件拷进系统的 cron.d 目录时换成不带点的文件名、属 root、权限 0644、不用 crontab 命令整份替换；
+      签发 ops.read 运维凭据（不设截止时间，轮换按契约 10 第 4 条、换完改 .env）；写服务器 .env（四个值不加引号、不写行尾注释）；把 cron 文件拷进系统的 cron.d 目录时换成只含字母、数字、下划线、连字符的文件名、属 root、权限 0644、不用 crontab 命令整份替换；
       装好后先确认三个检查在 5 分钟内都收到了由 cron 触发的心跳，再做错令牌演练（覆盖 .env 路径，临时 .env 只给运行账号可读、演练完删除，会记 2 条 invalid_credential 是预期的；预期 invariants 变红、Telegram 收到、改回后恢复，不为演练停容器或改库）；
       三个维度变红时怎么查，以及只有安全事件清理 stale 时先查原因、再用重启或下次部署清掉。可以写系统标准目录，不写本项目在服务器上的检出目录、账号名、主机名与地址。
       明确不做：改应用代码（就绪检查的 periodic 由 CORE-TASK-064 提供）；部署时自动装 cron；命令失败率、积压、备份状态的监控；第二个租户的自查。
@@ -2762,7 +2762,7 @@ tasks:
       - 测试用 bash 跑脚本，在 PATH 里放假的 docker 与 logger（按需也放假的 timeout）按场景给出输出并记下收到的参数，在本机回环上起一个记录请求的假心跳服务，复核秒数设为 0；每个场景核对推到哪个检查、推到地址本身还是加 /fail、请求体里的级别与内容、退出码，并核对日志、请求体与假 docker 收到的参数里没有令牌原文与心跳地址
       - 场景覆盖：全绿；容器不在；有两个容器；找容器或就绪检查超时（readyz P1、periodic 没查成 P2）；就绪检查 503（readyz 推失败 P1，任务正常时 periodic 照样从 503 的正文读出并推成功）；就绪检查 200 但正文没有 periodic；periodic 为 stale 且正文写出任务名
       - 场景还覆盖：自查 ok 为 false（正文写违反总数、各 check 的项数与最多前 5 项的 ID，不写 order_ref；违反总数超过 100 时注明只数了前 100 项）；自查 200 但正文读不出；自查 401；自查 503；自查超时；没配运维令牌
-      - 场景还覆盖：第一轮不合格、复核时已恢复则三个都推成功；某个维度没配心跳地址时记一行不会通知任何人且以非 0 退出，即使其余全绿；心跳服务连不上时只记日志、结论与退出码不变；.env 不存在；在别的当前目录下运行、不设覆盖时仍读到检出根目录的 .env
+      - 场景还覆盖：第一轮不合格、复核时已恢复则三个都推成功；某个维度没配心跳地址时记一行不会通知任何人且以非 0 退出，即使其余全绿；心跳服务连不上时只记日志、结论与退出码不变；.env 不存在；在别的当前目录下运行、不设覆盖时仍读到检出根目录的 .env（把脚本拷进临时目录搭的假检出目录里跑，不往真实检出写 .env）；.env 的值带成对引号时去掉引号
       - 测试对 deploy/monitor.sh 跑 shellcheck 并要求零退出（CI 机器上有 shellcheck，没有时测试失败而不是跳过）；核对 cron 文件用 bash 调用脚本、有运行账号字段、不含 flock、以换行结尾；cron 文件与运行手册里没有主机名、地址与本项目在服务器上的检出目录
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；脚本测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
