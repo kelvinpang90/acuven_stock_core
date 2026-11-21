@@ -2831,7 +2831,7 @@ tasks:
       六，.github/workflows/ci.yml 只改两步：compose 文件可解析那一步补上 instance.sh 导出的变量（取 Demo 的值），shellcheck 那一步加上 deploy/instance.sh 与 deploy/monitor.sh 并能跟进 source。
       明确不做：部署工作流（CORE-TASK-068）；生产运行手册（CORE-TASK-069）；改应用代码与迁移；建生产库、生产检出或网络（由人与 vps_infra 做）。
       预计改动约 900 行（脚本约 250、测试约 600）；接近约 1500 行时把生产迁移前备份拆成单独的任务。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-066
     acceptance_criteria:
