@@ -2749,7 +2749,7 @@ tasks:
       三，推心跳照心跳服务的约定：合格时向地址本身发 POST，不合格时向地址加 /fail 发 POST，正文作请求体；每个维度每轮都推。
       某个维度没配心跳地址时记一行不会通知任何人（只写键名），本轮以非 0 退出，即使其余维度全部合格；有不合格时也以非 0 退出，全部合格且都配了地址时以 0 退出。
       四，deploy/monitor.cron：每 5 分钟一行，用 bash 显式调用脚本（不依赖文件的执行权限），带运行账号字段，检出目录与运行账号用占位符，不含 flock，文件以换行结尾。
-      五，docs/OPS_MONITORING.md 运行手册：Core 单独开一个心跳服务账号；建三个检查，名字带实例（stock_core demo readyz、stock_core demo periodic、stock_core demo invariants，以后的生产实例各建三个），周期 5 分钟、宽限 15 分钟、接 Telegram；
+      五，docs/OPS_MONITORING.md 运行手册：在现有的心跳服务账号里（与计费平台同一个账号，不另开账号，契约 0.18）建三个检查，要等计费平台合并告警维度腾出位置之后；名字带实例（stock_core demo readyz、stock_core demo periodic、stock_core demo invariants，以后的生产实例各建三个），周期 5 分钟、宽限 15 分钟、接 Telegram；
       签发 ops.read 运维凭据（不设截止时间，轮换按契约 10 第 4 条、换完改 .env）；写服务器 .env（四个值不加引号、不写行尾注释）；把 cron 文件拷进系统的 cron.d 目录时换成只含字母、数字、下划线、连字符的文件名、属 root、权限 0644、不用 crontab 命令整份替换；
       装好后先确认三个检查在 5 分钟内都收到了由 cron 触发的心跳，再做错令牌演练（覆盖 .env 路径，临时 .env 只给运行账号可读、演练完删除，会记 2 条 invalid_credential 是预期的；预期 invariants 变红、Telegram 收到、改回后恢复，不为演练停容器或改库）；
       三个维度变红时怎么查，以及只有安全事件清理 stale 时先查原因、再用重启或下次部署清掉。可以写系统标准目录，不写本项目在服务器上的检出目录、账号名、主机名与地址。
