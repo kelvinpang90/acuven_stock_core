@@ -2711,7 +2711,7 @@ tasks:
       进入 lifespan 后 app.state 上的 security_event_purge 与 reservation_expiry 仍是已启动的 PeriodicTask（已有的接入测试断言这一点）。
       现有 PeriodicTask 的行为（首次等待、间隔、异常记日志后继续、停止）与就绪检查原有的 status、reason 不变；两个已有测试把就绪检查的正文断言为全等，只把它们改成核对 status 为 ok，原本验证的内容不变。
       明确不做：巡检脚本、cron 与运行手册（CORE-TASK-065）；新的配置项；改 /healthz 或任何 /v1 接口。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 改动在 app/domain/periodic.py（新）、app/services/periodic.py、app/main.py；单元测试在 tests/unit/test_periodic.py（新）；PeriodicTask 记录结果的测试加在 tests/integration/test_security_event_purge.py（已有的 PeriodicTask 测试在这里），就绪检查的测试在 tests/integration/test_health_api.py；已有的测试照常通过

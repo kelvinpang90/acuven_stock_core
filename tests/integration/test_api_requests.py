@@ -122,7 +122,7 @@ def test_healthz_ignores_an_invalid_request_id_and_keeps_its_body(client):
 def test_readyz_ignores_an_invalid_request_id_and_keeps_its_body(client):
     response = client.get("/readyz", headers={"X-Request-ID": "has space"})
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json()["status"] == "ok"
     assert GENERATED_ID.fullmatch(response.headers["X-Request-ID"])
 
 

@@ -8,7 +8,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,11 +17,12 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Settings
 from app.db import Base
+from app.domain.periodic import FAILED, SUCCEEDED, is_stale
 from app.main import SECURITY_EVENT_PURGE, create_app
 from app.models.catalog import Tenant
 from app.models.service_auth import Credential, SecurityEvent
 from app.services import security_events
-from app.services.periodic import PeriodicTask
+from app.services.periodic import PeriodicTask, TaskState
 from app.services.security_events import PURGE_BATCH_SIZE, purge_expired_security_events
 from tests.integration.conftest import TEST_DATABASE_URL, add_credential, new_id
 from tests.integration.test_inventory_schema import add_tenant
@@ -301,6 +302,102 @@ def test_periodic_task_stop_before_the_first_run_never_calls():
     assert time.monotonic() - started < 5
     assert not task.is_alive()
     assert calls == []
+
+
+def assert_state_matches_the_domain_rule(task: PeriodicTask, now: float) -> TaskState:
+    state = task.state(now)
+    assert state.stale == is_stale(
+        alive=state.alive,
+        interval=task.interval,
+        first_delay=task.first_delay,
+        started_at=state.started_at,
+        last_success_at=state.last_success_monotonic,
+        last_outcome=state.last_outcome,
+        now=now,
+    )
+    return state
+
+
+def test_periodic_task_state_before_start_is_not_alive_and_stale():
+    task = PeriodicTask("unstarted", lambda: None, interval=30, first_delay=30)
+    state = assert_state_matches_the_domain_rule(task, time.monotonic())
+    assert state.name == "unstarted"
+    assert not state.alive
+    assert state.started_at is None
+    assert state.last_outcome is None
+    assert state.last_success_at is None
+    assert state.last_failure_at is None
+    assert state.stale
+
+
+def test_periodic_task_records_a_success():
+    calls: list[None] = []
+    task = PeriodicTask("succeeds", lambda: calls.append(None), interval=60, first_delay=0)
+    before = datetime.now(UTC)
+    started = time.monotonic()
+    task.start()
+    try:
+        wait_until(lambda: task.state().last_outcome == SUCCEEDED)
+        state = assert_state_matches_the_domain_rule(task, time.monotonic())
+        assert state.alive
+        assert state.started_at is not None and state.started_at >= started
+        assert state.last_success_monotonic is not None
+        assert state.last_success_monotonic >= state.started_at
+        assert state.last_success_at is not None
+        assert state.last_success_at.tzinfo is not None
+        assert before <= state.last_success_at <= datetime.now(UTC)
+        assert state.last_failure_at is None
+        assert not state.stale
+        # 超过 2 个间隔加 300 秒没再正常结束即 stale，判定只用单调时钟。
+        limit = state.last_success_monotonic + 2 * task.interval + 300
+        assert not assert_state_matches_the_domain_rule(task, limit - 1).stale
+        assert assert_state_matches_the_domain_rule(task, limit + 1).stale
+    finally:
+        task.stop()
+
+    state = assert_state_matches_the_domain_rule(task, time.monotonic())
+    assert not state.alive
+    assert state.stale
+    # 停止后记录还在。
+    assert state.last_outcome == SUCCEEDED
+    assert state.last_success_at is not None
+
+
+def test_periodic_task_records_a_failure_and_keeps_running():
+    calls: list[None] = []
+    fail = threading.Event()
+    fail.set()
+
+    def flaky() -> None:
+        calls.append(None)
+        if fail.is_set():
+            raise RuntimeError("database went away")
+
+    task = PeriodicTask("records-failure", flaky, interval=0.01, first_delay=0)
+    task.start()
+    try:
+        wait_until(lambda: task.state().last_outcome == FAILED)
+        state = assert_state_matches_the_domain_rule(task, time.monotonic())
+        assert state.alive
+        assert state.last_failure_at is not None
+        assert state.last_failure_at.tzinfo is not None
+        assert state.last_success_at is None
+        assert state.stale
+
+        # 线程继续跑；之后正常结束一次就恢复，失败的时间留着作展示。
+        failed_calls = len(calls)
+        fail.clear()
+        wait_until(lambda: task.state().last_outcome == SUCCEEDED)
+        state = assert_state_matches_the_domain_rule(task, time.monotonic())
+        assert task.is_alive()
+        assert len(calls) > failed_calls
+        assert state.last_success_at is not None
+        assert state.last_failure_at is not None
+        assert not state.stale
+    finally:
+        task.stop()
+    assert not task.is_alive()
+    assert assert_state_matches_the_domain_rule(task, time.monotonic()).stale
 
 
 # --- 接入 ---
