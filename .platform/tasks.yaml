@@ -2790,7 +2790,7 @@ tasks:
       写明重新通知会多一条恢复通知、状态文件的默认位置与覆盖方法；只有 P2 红着时当天清掉（生产重启 core_api，不等下次部署）；演练改为两个检查；如果服务器上已照 065 的手册给 Demo 装了 cron 与三个检查，066 合并后撤掉 cron、删掉三个检查。
       手册开头写明：装到生产要等 CORE-TASK-067、068 合并（在那之前巡检只找得到 Demo 的容器，生产实例也还不能部署）。可以写系统标准目录，不写本项目在服务器上的检出目录、账号名、主机名与地址。
       明确不做：按 CORE_ENV 区分实例与经实例片段找容器（CORE-TASK-067）；改应用代码、部署脚本、工作流、CI；改 .env.example（由登记 PR 写）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-065
     acceptance_criteria:
