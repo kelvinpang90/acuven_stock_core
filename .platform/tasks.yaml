@@ -2784,7 +2784,7 @@ tasks:
       二，配置：从 .env 只读三个键 CORE_MONITOR_TOKEN、CORE_HEALTHCHECK_READYZ_URL、CORE_HEALTHCHECK_INVARIANTS_URL，按 065 的按行规则解析；不再读 CORE_HEALTHCHECK_PERIODIC_URL（0.20 取消，.env 里留着也不读）。
       三，重新通知与状态文件：状态文件按检查分别记上一次推送成功的失败里带的问题（维度加级别，P1 高于 P2）。默认位置在检出目录之外：运行账号的 XDG 状态目录（XDG_STATE_HOME，未设时为家目录下的 .local/state）里的 stock_core_monitor/state，可用环境变量 CORE_MONITOR_STATE_FILE 覆盖；目录不存在时建成只有运行账号可读写，写入先写同目录的临时文件再改名。
       每个检查每轮：合格时推成功，推送成功后把这个检查的记录清空（全绿即清空）；不合格且记录为空时推失败；不合格且记录不空、而本轮有记录里没有的维度或某个维度的级别比记录里高时，先推一次成功、紧接着推失败；不合格且问题与记录相同或更少时只推失败、不重复通知。
-      状态文件不存在、读不出或内容不合格式时，本轮只要这个检查不合格就先推成功、再推失败。只有失败那一推送成功之后才把记录更新为本轮的问题；任何一推没推成就不改这个检查的记录。状态文件写不进去只记一行日志，不改变本轮结论与退出码。
+      状态文件不存在、读不出或内容不合格式时，本轮只要这个检查不合格就先推成功、再推失败。只有失败那一推送成功之后才把记录更新为本轮的问题；任何一推没推成就不改这个检查的记录。整份文件读不出时，本轮没推成的检查在重写的文件里记为未知，下一轮对它按读不出处理（不合格就先成功后失败），不记为空。状态文件写不进去只记一行日志，不改变本轮结论与退出码。
       退出码：全部合格且两个心跳地址都配了为 0，否则为 1。限时照 8.5：每次推心跳 10 秒，重新通知时多推一次。
       四，deploy/monitor.cron 照旧，注释改成只装在生产实例的检出上。docs/OPS_MONITORING.md 改为只对生产实例：在现有的心跳服务账号里建两个检查 stock_core production readyz、stock_core production invariants（周期 5 分钟、宽限 15 分钟，接 Telegram；第 3 个位置留给 vps_infra 的 infra_mysql backup，由那边建），.env 只写三个键，Demo 不装 cron、不签巡检令牌；
       写明重新通知会多一条恢复通知、状态文件的默认位置与覆盖方法；只有 P2 红着时当天清掉（生产重启 core_api，不等下次部署）；演练改为两个检查；如果服务器上已照 065 的手册给 Demo 装了 cron 与三个检查，066 合并后撤掉 cron、删掉三个检查。
@@ -2799,7 +2799,7 @@ tasks:
       - 065 已有的各个场景改成两个检查后照样通过，含就绪检查超时（readyz 那个检查推失败，正文里 readyz 为 P1、periodic 为没查成的 P2）与就绪检查 503；.env 里另有 CORE_HEALTHCHECK_PERIODIC_URL 时不往它推
       - 场景覆盖：readyz 合格而 periodic 为 stale 时推 readyz 那个检查失败；两个维度同一轮都不合格时正文两行都在；复核时只剩一个不合格时正文只有剩下的那个
       - 场景覆盖重新通知：记录为空时不合格只推一次失败；记录里只有 periodic 的 P2、本轮出现 readyz 的 P1 时先推成功、再推失败并更新记录；invariants 记录为 P2、本轮为 P1 时同样重新通知；同样的问题持续时只推失败、不推成功；问题变少时只推失败、记录更新为剩下的问题；全绿时推成功并清空记录
-      - 场景覆盖状态文件：不存在、内容损坏时本轮不合格的检查先成功后失败，合格的只推成功；失败那一推没推成（假心跳服务对它回错或连不上）时记录不变、下一轮照样重新通知；状态文件写不进去时只记日志，结论与退出码不变；没设覆盖时写到 XDG 状态目录下（测试里把 XDG_STATE_HOME 指到临时目录）
+      - 场景覆盖状态文件：不存在、内容损坏时本轮不合格的检查先成功后失败，合格的只推成功；失败那一推没推成（假心跳服务对它回错或连不上）时记录不变、下一轮照样重新通知；状态文件写不进去时只记日志，结论与退出码不变；状态文件损坏且本轮只有一个检查的失败推成功时，另一个检查记为未知、下一轮对它照样先成功后失败；没设覆盖时写到 XDG 状态目录下（测试里把 XDG_STATE_HOME 指到临时目录）
       - 某个检查没配心跳地址时记一行不会通知任何人（只写键名）并以非 0 退出；运行手册与 cron 文件里没有主机名、地址与本项目在服务器上的检出目录，手册只写两个生产检查与三个键
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；脚本测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
@@ -2824,10 +2824,10 @@ tasks:
       二，docker-compose.yml：去掉固定的 name，网络名与别名写成必填变量、不给默认值，由 instance.sh 导出；两个实例都恰好挂一条数据网络和一条调用方内部网络，生产不挂 data_net。用变量表达即可，不新增覆盖文件。不经 instance.sh 的 compose 调用因变量缺失直接报错。
       三，deploy/deploy.sh：先 source instance.sh，失败即退出、什么也不碰；之后所有 compose 调用一律带 -p 本实例的项目名；调用方内部网络照旧不存在才建，用实例给的名字；生产的数据网络不存在就失败、什么也不改，不自己建；主机锁里写的持锁方带实例名（stock_core demo 或 stock_core production）；
       清旧镜像仍按 acuven.project=stock_core 标签、只在成功路径换完容器之后跑。
-      四，生产实例在拉镜像之后、迁移之前备份本库：经 docker exec 进 infra_mysql 容器，用它环境变量里的 root 密码（只在容器里展开，不出现在命令行参数与日志里）跑 mysqldump，参数 --single-transaction --no-tablespaces --set-gtid-purged=OFF --databases 加库名，不加 --source-data；
-      库名从 .env 的 CORE_DATABASE_URL 按与 CORE_ENV 相同的读法取出（取最后一个斜杠之后、问号之前的部分），只接受字母、数字与下划线，否则失败；整次备份限时 60 秒。
+      四，生产实例在拉镜像之后、迁移之前备份本库：经 docker exec 进 infra_mysql 容器，用它环境变量里的 root 密码跑 mysqldump：密码在容器里的 shell 中经环境变量 MYSQL_PWD 传给 mysqldump，不用 -p，不出现在 docker 与 mysqldump 的命令行参数和日志里，参数 --single-transaction --no-tablespaces --set-gtid-purged=OFF --databases 加库名，不加 --source-data；
+      库名从 .env 的 CORE_DATABASE_URL 按与 CORE_ENV 相同的读法取出（先在第一个问号处截断，再取最后一个斜杠之后的部分），只接受字母、数字与下划线，否则失败；整次备份限时 60 秒。
       导出先写到临时文件，末尾含 Dump completed 才改名为正式文件（文件名带 UTC 时间与 SHA），否则删掉临时文件、以失败结束、什么也不改。备份目录在检出目录之外：部署账号的 XDG 状态目录（XDG_STATE_HOME，未设时为家目录下的 .local/state）里的 stock_core_production/pre_migration，可用环境变量 CORE_BACKUP_DIR 覆盖；目录权限 700、文件 600，只保留最近 5 份。Demo 不备份。
-      五，deploy/healthcheck.sh 与 deploy/monitor.sh 都 source instance.sh、经它找本实例的容器；monitor.sh 在实例片段报错时按找不到容器处理（readyz 没查成，原因为容器数不对），另写一行系统日志说明 CORE_ENV 不对。docs/OPS_MONITORING.md 里找容器的命令改为经 instance.sh 的函数。
+      五，deploy/healthcheck.sh 与 deploy/monitor.sh 都 source instance.sh、经它找本实例的容器；monitor.sh 在实例片段报错时按找不到容器处理（readyz 没查成，原因为容器数不对），另写一行系统日志说明 CORE_ENV 不对。docs/OPS_MONITORING.md 与 README.md 里找容器的命令改为经 instance.sh 的函数（README 只改这一段与它的说明）。
       六，.github/workflows/ci.yml 只改两步：compose 文件可解析那一步补上 instance.sh 导出的变量（取 Demo 的值），shellcheck 那一步加上 deploy/instance.sh 与 deploy/monitor.sh 并能跟进 source。
       明确不做：部署工作流（CORE-TASK-068）；生产运行手册（CORE-TASK-069）；改应用代码与迁移；建生产库、生产检出或网络（由人与 vps_infra 做）。
       预计改动约 900 行（脚本约 250、测试约 600）；接近约 1500 行时把生产迁移前备份拆成单独的任务。
@@ -2839,7 +2839,7 @@ tasks:
       - 测试用 bash 跑脚本，在 PATH 里放假的 docker（记下收到的参数，按场景给出容器列表与输出，按标签过滤），.env 与检出目录放在临时目录里搭的假检出中，主机锁用 ACUVEN_DEPLOY_LOCK 指到临时文件
       - instance.sh 的场景：demo 与 production 各给出上面的项目名、网络名与别名；CORE_ENV 缺失、写错、带引号、带空格、带行尾注释、出现两行时都失败；找容器时只认 working_dir 标签与本检出相同的那一个，别的检出的容器、一次性容器不算，有两个时算没找到
       - deploy.sh 的场景：CORE_ENV 不对时以失败结束且没有任何 docker 调用；每个 compose 调用都带 -p 本实例的项目名；持锁方文字带实例名；生产的数据网络不存在时失败且没有拉镜像、迁移、换容器；Demo 不备份
-      - 生产备份的场景：备份在迁移之前；mysqldump 的参数如上且命令行参数里没有密码；导出不以 Dump completed 结尾或 docker exec 失败时以失败结束、没有迁移与换容器、不留下临时文件；成功时文件权限 600、目录 700，已有 5 份时删掉最旧的一份；CORE_DATABASE_URL 的库名不合格时失败
+      - 生产备份的场景：备份在迁移之前；mysqldump 的参数如上、密码经 MYSQL_PWD 传、假 docker 收到的参数里没有密码与 -p；导出不以 Dump completed 结尾或 docker exec 失败时以失败结束、没有迁移与换容器、不留下临时文件；成功时文件权限 600、目录 700，已有 5 份时删掉最旧的一份；CORE_DATABASE_URL 的库名按先截问号再取最后一个斜杠取出（查询串里带斜杠时也取对），不合格时失败
       - healthcheck.sh 与 monitor.sh 只找本实例检出的容器；monitor.sh 在 CORE_ENV 不对时推 readyz 那个检查失败（没查成、容器数不对）并以非 0 退出；066 的巡检场景照样通过
       - 测试对 docker-compose.yml 跑 docker compose config：不设实例变量时报错；按 demo 与 production 的值各解析出上面的网络与别名，生产没有 data_net；测试对 deploy 目录下的四个脚本跑 shellcheck 并要求零退出（没有 shellcheck 或 docker 时测试失败而不是跳过）
       - 改动只落在 allowed_change_paths；不改 .platform/、部署工作流；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；脚本测试由 PR 的必需 CI 检查 integration 执行并通过
@@ -2850,6 +2850,7 @@ tasks:
       - deploy/monitor.sh
       - docker-compose.yml
       - docs/OPS_MONITORING.md
+      - README.md
       - .github/workflows/ci.yml
       - tests/integration/test_deploy_scripts.py
       - tests/integration/test_monitor_script.py
