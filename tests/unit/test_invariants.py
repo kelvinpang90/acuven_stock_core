@@ -5,6 +5,7 @@ from app.domain.invariants import (
     CHECKS,
     LEDGER_TOTALS,
     MAX_VIOLATIONS,
+    MERGED_SKU_LINES,
     ORDER_COMMIT_STATE,
     PENDING_DISPATCH_VS_ORDERS,
     RESERVED_VS_ORDERS,
@@ -15,11 +16,16 @@ from app.domain.invariants import (
     ReservationLines,
     check_balance_row,
     check_ledger_totals,
+    check_merged_sku_lines,
     check_order_commit_state,
     check_pending_dispatch_vs_orders,
+    check_reservation,
     check_reserved_vs_orders,
     summarize_violations,
 )
+
+MERGE_FOLLOWING = ("active", "expired", "late_payment_review", "committed")
+NOT_FOLLOWING = ("released", "closed_refunded")
 
 
 def row(pool_id="pool_A", sku_id="sku_A", **values):
@@ -62,10 +68,17 @@ class ConstantsTest(unittest.TestCase):
                 "reserved_vs_orders",
                 "pending_dispatch_vs_orders",
                 "order_commit_state",
+                "merged_sku_lines",
             ),
         )
         self.assertEqual(
-            (LEDGER_TOTALS, RESERVED_VS_ORDERS, PENDING_DISPATCH_VS_ORDERS, ORDER_COMMIT_STATE),
+            (
+                LEDGER_TOTALS,
+                RESERVED_VS_ORDERS,
+                PENDING_DISPATCH_VS_ORDERS,
+                ORDER_COMMIT_STATE,
+                MERGED_SKU_LINES,
+            ),
             CHECKS,
         )
         self.assertEqual(MAX_VIOLATIONS, 100)
@@ -255,6 +268,66 @@ class OrderCommitStateTest(unittest.TestCase):
                 self.assertEqual(violation["status"], status)
                 self.assertEqual(violation["line_refs"], ["1", "3"])
 
+    def test_merged_sku_does_not_affect_commit_state(self):
+        self.assertIsNone(check_order_commit_state(reservation("active", ("1", 2, 0, True))))
+
+
+def committed_qty_for(status, quantity):
+    return quantity if status == "committed" else 0
+
+
+class MergedSkuLinesTest(unittest.TestCase):
+    def test_line_defaults_to_unmerged(self):
+        self.assertFalse(OrderLine("1", 1, 0).sku_merged)
+
+    def test_following_statuses_report_lines_on_merged_skus(self):
+        for status in MERGE_FOLLOWING:
+            with self.subTest(status=status):
+                lines = [
+                    (ref, 2, committed_qty_for(status, 2), merged)
+                    for ref, merged in (("c", True), ("b", False), ("a", True))
+                ]
+                violation = check_merged_sku_lines(reservation(status, *lines))
+                self.assertEqual(
+                    violation,
+                    {
+                        "check": "merged_sku_lines",
+                        "reservation_id": "rsv_A",
+                        "order_ref": "order-1",
+                        "status": status,
+                        "line_refs": ["a", "c"],
+                    },
+                )
+                self.assertEqual(
+                    list(violation), ["check", "reservation_id", "order_ref", "status", "line_refs"]
+                )
+
+    def test_released_and_closed_refunded_are_not_reported(self):
+        for status in NOT_FOLLOWING:
+            with self.subTest(status=status):
+                lines = (("1", 2, 0, True), ("2", 1, 0, True))
+                self.assertIsNone(check_merged_sku_lines(reservation(status, *lines)))
+
+    def test_no_lines_on_merged_skus_pass(self):
+        for status in MERGE_FOLLOWING + NOT_FOLLOWING:
+            with self.subTest(status=status):
+                lines = (
+                    ("1", 2, committed_qty_for(status, 2)),
+                    ("2", 1, committed_qty_for(status, 1), False),
+                )
+                self.assertIsNone(check_merged_sku_lines(reservation(status, *lines)))
+                self.assertEqual(check_reservation(reservation(status, *lines)), [])
+
+    def test_reservation_without_lines_passes(self):
+        self.assertIsNone(check_merged_sku_lines(reservation("active")))
+
+    def test_reservation_reports_both_checks_in_order(self):
+        both = reservation("active", ("2", 1, 0, True), ("1", 1, 1, False))
+        self.assertEqual(
+            [(v["check"], v["line_refs"]) for v in check_reservation(both)],
+            [(ORDER_COMMIT_STATE, ["1"]), (MERGED_SKU_LINES, ["2"])],
+        )
+
 
 class SummarizeTest(unittest.TestCase):
     def test_no_violations(self):
@@ -277,6 +350,40 @@ class SummarizeTest(unittest.TestCase):
             violations,
             [ledger_a1, ledger_a2, ledger_b, reserved_a, reserved_b, pending, commit_a, commit_b],
         )
+
+    def test_merged_sku_lines_after_order_commit_state(self):
+        def merged(reservation_id):
+            created = reservation("active", ("1", 1, 0, True), reservation_id=reservation_id)
+            return check_merged_sku_lines(created)
+
+        def commit(reservation_id):
+            created = reservation("active", ("1", 1, 1), reservation_id=reservation_id)
+            return check_order_commit_state(created)
+
+        merged_c, merged_a, merged_b = merged("c"), merged("a"), merged("b")
+        commit_z, commit_a = commit("z"), commit("a")
+        pending = check_pending_dispatch_vs_orders(row("pool_Z", "sku_Z"), OrderTotals())
+        count, violations = summarize_violations(
+            [merged_c, commit_z, merged_a, pending, merged_b, commit_a]
+        )
+        self.assertEqual(count, 6)
+        self.assertEqual(violations, [pending, commit_a, commit_z, merged_a, merged_b, merged_c])
+
+    def test_merged_sku_lines_count_toward_the_total_and_truncate(self):
+        ledgers = [
+            check_ledger_totals(row("pool_A", f"sku_{index:03d}"), LedgerTotals())
+            for index in range(99)
+        ]
+        merged = [
+            check_merged_sku_lines(
+                reservation("committed", ("1", 1, 1, True), reservation_id=f"rsv_{index}")
+            )
+            for index in reversed(range(3))
+        ]
+        count, kept = summarize_violations(merged + ledgers)
+        self.assertEqual((count, len(kept)), (102, 100))
+        self.assertEqual(kept[:99], ledgers)
+        self.assertEqual(kept[99]["reservation_id"], "rsv_0")
 
     def test_truncates_to_100_and_counts_all(self):
         violations = [

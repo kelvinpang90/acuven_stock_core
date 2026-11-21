@@ -9,9 +9,10 @@ checked_at 是这个事务里的数据库时间。
 - 余额行，与按余额行聚合的流水（四个增量之和、条数、最大的 balance_version_after）；
 - 按 (pool_id, sku_id) 聚合的订单行：所属预留为 active 的 quantity 之和，
   与全部订单行的 committed_qty − dispatched_qty − refund_restocked_qty 之和；
-- 全部预留的状态与它们订单行的 quantity、committed_qty。
+- 全部预留的状态与它们订单行的 quantity、committed_qty，及订单行所指的 SKU 是否已合并
+  （只看 skus 表的 merged_into_sku_id 非空，不读合并单）。
 流水与订单行都有外键指向余额行，所以从余额行出发不会漏；没有流水或订单行的余额行按全 0 比对。
-比对、排序与截断用 app/domain/invariants.py。不查 SKU 合并改挂（merged_sku_lines）。
+比对、排序与截断用 app/domain/invariants.py。
 """
 
 from collections import defaultdict
@@ -27,11 +28,12 @@ from app.domain.invariants import (
     OrderTotals,
     ReservationLines,
     check_balance_row,
-    check_order_commit_state,
+    check_reservation,
     summarize_violations,
 )
 from app.domain.invariants import OrderLine as LineCommit
 from app.domain.reservations import ACTIVE
+from app.models.catalog import Sku
 from app.models.inventory import LedgerEntry, StockBalance
 from app.models.orders import OrderLine, Reservation
 from app.services.reservations import database_now
@@ -119,11 +121,21 @@ def _read_order_totals(connection: Connection, tenant_id: str) -> dict[BalanceKe
 def _read_reservations(connection: Connection, tenant_id: str) -> list[ReservationLines]:
     lines: dict[str, list[LineCommit]] = defaultdict(list)
     statement = select(
-        OrderLine.reservation_id, OrderLine.line_ref, OrderLine.quantity, OrderLine.committed_qty
+        OrderLine.reservation_id,
+        OrderLine.line_ref,
+        OrderLine.quantity,
+        OrderLine.committed_qty,
+        Sku.merged_into_sku_id.is_not(None).label("sku_merged"),
+    )
+    # 外连接：订单行不因找不到 SKU 行而少读，找不到的按未合并。
+    statement = statement.outerjoin(
+        Sku, and_(Sku.tenant_id == OrderLine.tenant_id, Sku.sku_id == OrderLine.sku_id)
     )
     statement = statement.where(OrderLine.tenant_id == tenant_id)
     for row in connection.execute(statement).mappings():
-        line = LineCommit(row["line_ref"], row["quantity"], row["committed_qty"])
+        line = LineCommit(
+            row["line_ref"], row["quantity"], row["committed_qty"], bool(row["sku_merged"])
+        )
         lines[row["reservation_id"]].append(line)
     statement = select(Reservation.reservation_id, Reservation.order_ref, Reservation.status)
     statement = statement.where(Reservation.tenant_id == tenant_id)
@@ -149,8 +161,6 @@ def check_invariants(connection: Connection, tenant_id: str) -> InvariantReport:
         ledger = ledgers.get(key, LedgerTotals())
         violations.extend(check_balance_row(row, ledger, orders.get(key, OrderTotals())))
     for reservation in _read_reservations(connection, tenant_id):
-        violation = check_order_commit_state(reservation)
-        if violation is not None:
-            violations.append(violation)
+        violations.extend(check_reservation(reservation))
     violation_count, shown = summarize_violations(violations)
     return InvariantReport(checked_at, violation_count, shown)

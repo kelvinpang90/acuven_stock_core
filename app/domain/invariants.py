@@ -7,14 +7,24 @@
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from app.domain.reservations import COMMITTED
+from app.domain.reservations import ACTIVE, COMMITTED, EXPIRED, LATE_PAYMENT_REVIEW
 
 LEDGER_TOTALS = "ledger_totals"
 RESERVED_VS_ORDERS = "reserved_vs_orders"
 PENDING_DISPATCH_VS_ORDERS = "pending_dispatch_vs_orders"
 ORDER_COMMIT_STATE = "order_commit_state"
+MERGED_SKU_LINES = "merged_sku_lines"
 # 按契约的编号顺序；违反项先按这个顺序排。
-CHECKS = (LEDGER_TOTALS, RESERVED_VS_ORDERS, PENDING_DISPATCH_VS_ORDERS, ORDER_COMMIT_STATE)
+CHECKS = (
+    LEDGER_TOTALS,
+    RESERVED_VS_ORDERS,
+    PENDING_DISPATCH_VS_ORDERS,
+    ORDER_COMMIT_STATE,
+    MERGED_SKU_LINES,
+)
+
+# 第 5 项查的预留状态：合并时订单行要改挂到规范 SKU 的那些（§2.4 第 1 步）。
+MERGE_FOLLOWING_STATUSES = (ACTIVE, EXPIRED, LATE_PAYMENT_REVIEW, COMMITTED)
 
 MAX_VIOLATIONS = 100
 
@@ -66,9 +76,12 @@ class OrderTotals:
 
 @dataclass(frozen=True)
 class OrderLine:
+    """sku_merged：所指的 SKU 的 merged_into_sku_id 非空。"""
+
     line_ref: str
     quantity: int
     committed_qty: int
+    sku_merged: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,10 +159,24 @@ def check_order_commit_state(reservation: ReservationLines) -> dict | None:
         bad = [line for line in reservation.lines if line.committed_qty != line.quantity]
     else:
         bad = [line for line in reservation.lines if line.committed_qty != 0]
+    return _reservation_violation(ORDER_COMMIT_STATE, reservation, bad)
+
+
+def check_merged_sku_lines(reservation: ReservationLines) -> dict | None:
+    """第 5 项：MERGE_FOLLOWING_STATUSES 里的预留，订单行不指向已合并的 SKU。"""
+    if reservation.status not in MERGE_FOLLOWING_STATUSES:
+        return None
+    bad = [line for line in reservation.lines if line.sku_merged]
+    return _reservation_violation(MERGED_SKU_LINES, reservation, bad)
+
+
+def _reservation_violation(
+    check: str, reservation: ReservationLines, bad: list[OrderLine]
+) -> dict | None:
     if not bad:
         return None
     return {
-        "check": ORDER_COMMIT_STATE,
+        "check": check,
         "reservation_id": reservation.reservation_id,
         "order_ref": reservation.order_ref,
         "status": reservation.status,
@@ -157,8 +184,14 @@ def check_order_commit_state(reservation: ReservationLines) -> dict | None:
     }
 
 
+def check_reservation(reservation: ReservationLines) -> list[dict]:
+    """一个预留的第 4、5 项，按编号顺序，只含违反的。"""
+    results = (check_order_commit_state(reservation), check_merged_sku_lines(reservation))
+    return [violation for violation in results if violation is not None]
+
+
 def _sort_key(violation: dict) -> tuple:
-    # 前三项没有 reservation_id，第 4 项没有 pool_id、sku_id；缺的按空串，同一项内不受影响。
+    # 前三项没有 reservation_id，第 4、5 项没有 pool_id、sku_id；缺的按空串，同一项内不受影响。
     return (
         _CHECK_ORDER[violation["check"]],
         violation.get("pool_id", ""),
@@ -170,7 +203,7 @@ def _sort_key(violation: dict) -> tuple:
 def summarize_violations(violations: Iterable[dict]) -> tuple[int, list[dict]]:
     """违反项排序截断，返回总数与至多 100 项。
 
-    按 check 的编号，再按 pool_id、sku_id（前三项）或 reservation_id（第 4 项）升序。
+    按 check 的编号，再按 pool_id、sku_id（前三项）或 reservation_id（第 4、5 项）升序。
     """
     ordered = sorted(violations, key=_sort_key)
     return len(ordered), ordered[:MAX_VIOLATIONS]
