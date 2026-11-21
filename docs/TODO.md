@@ -26,7 +26,6 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
-1. `CORE-TASK-065` 加服务器巡检脚本、cron 文件与运行手册，把三项运行告警推到心跳服务
 
 ### 已阻塞
 
