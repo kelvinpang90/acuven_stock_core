@@ -2820,14 +2820,14 @@ tasks:
       一，新文件 deploy/instance.sh，被其他脚本 source，source 时只定义变量与函数，不因配置不对而退出调用方，由调用方决定怎么失败。按本文件所在检出的根目录找 .env（与当前目录无关），只读 CORE_ENV 一个键、不 source 整个文件：
       恰好一行以 CORE_ENV= 开头，等号之后整行严格等于 demo 或 production（不去空格、不认引号与行尾注释）；没有这一行、多于一行或别的值一律失败。
       由它给出两个实例的具体值：compose 项目名 acuven_stock_core 与 acuven_stock_core_production；调用方内部网络 stock_core_net 与 stock_core_production_net，Core 在上面的别名 core_api 与 stock_core_production；数据网络 data_net 与 infra_mysql_core_production_net。
-      另提供找本实例 core_api 容器的函数：按 compose 项目标签与服务标签找、排除一次性容器，再核对标签 com.docker.compose.project.working_dir 与本检出的根目录相同（两边都先 realpath）；不是恰好一个就算没找到。不另设 COMPOSE_PROJECT_NAME、网络名之类的 .env 键。
+      另提供找本实例 core_api 容器的函数：按 compose 项目标签与服务标签找、排除一次性容器，再核对标签 com.docker.compose.project.working_dir 与本检出的根目录相同（两边都先 realpath）；函数按行输出找到的容器 ID，由调用方计数、不是恰好一个就算没找到；函数里的 docker 调用自带限时（找容器 10 秒），docker ps 失败与超时用不同的返回码区分，巡检据此写出没查成的原因（容器数不对、超时）。不另设 COMPOSE_PROJECT_NAME、网络名之类的 .env 键。
       二，docker-compose.yml：去掉固定的 name，网络名与别名写成必填变量、不给默认值，由 instance.sh 导出；两个实例都恰好挂一条数据网络和一条调用方内部网络，生产不挂 data_net。用变量表达即可，不新增覆盖文件。不经 instance.sh 的 compose 调用因变量缺失直接报错。
       三，deploy/deploy.sh：先 source instance.sh，失败即退出、什么也不碰；之后所有 compose 调用一律带 -p 本实例的项目名；调用方内部网络照旧不存在才建，用实例给的名字；生产的数据网络不存在就失败、什么也不改，不自己建；主机锁里写的持锁方带实例名（stock_core demo 或 stock_core production）；
       清旧镜像仍按 acuven.project=stock_core 标签、只在成功路径换完容器之后跑。
       四，生产实例在拉镜像之后、迁移之前备份本库：经 docker exec 进 infra_mysql 容器，用它环境变量里的 root 密码跑 mysqldump：密码在容器里的 shell 中经环境变量 MYSQL_PWD 传给 mysqldump，不用 -p，不出现在 docker 与 mysqldump 的命令行参数和日志里，参数 --single-transaction --no-tablespaces --set-gtid-purged=OFF --databases 加库名，不加 --source-data；
       库名从 .env 的 CORE_DATABASE_URL 按与 CORE_ENV 相同的读法取出（先在第一个问号处截断，再取最后一个斜杠之后的部分），只接受字母、数字与下划线，否则失败；整次备份限时 60 秒。
       导出先写到同目录的临时文件，末尾含 Dump completed 才改名为正式文件，否则删掉临时文件、以失败结束、什么也不改。正式文件名为 UTC 时间（年月日 T 时分秒 Z，例如 20261121T083000Z）加连字符加完整 SHA 加 .sql；只保留最近 5 份时只数符合这个文件名的文件，按文件名排序删最旧的，临时文件与别的文件不算也不删。备份目录在检出目录之外：部署账号的 XDG 状态目录（XDG_STATE_HOME，未设时为家目录下的 .local/state）里的 stock_core_production/pre_migration，可用环境变量 CORE_BACKUP_DIR 覆盖；目录权限 700、文件 600，只保留最近 5 份。Demo 不备份。
-      五，deploy/healthcheck.sh 与 deploy/monitor.sh 都 source instance.sh、经它找本实例的容器；monitor.sh 在实例片段报错时按找不到容器处理（readyz 没查成，原因为容器数不对），另写一行系统日志说明 CORE_ENV 不对。docs/OPS_MONITORING.md 与 README.md 里找容器的命令改为经 instance.sh 的函数（README 只改这一段与它的说明）。
+      五，deploy/healthcheck.sh 与 deploy/monitor.sh 都 source instance.sh、经它找本实例的容器；monitor.sh 在实例片段报错时按找不到容器处理（readyz 没查成，原因为容器数不对），另写一行系统日志说明 CORE_ENV 不对。docs/OPS_MONITORING.md 与 README.md 里找容器的命令改为经 instance.sh 的函数（README 只改这一段与它的说明）；OPS_MONITORING.md 里用到 docker compose 的命令（例如查容器状态的 docker compose ps）改为带 instance.sh 给出的项目名与变量。
       六，.github/workflows/ci.yml 只改两步：compose 文件可解析那一步补上 instance.sh 导出的变量（取 Demo 的值），shellcheck 那一步加上 deploy/instance.sh 与 deploy/monitor.sh 并能跟进 source。
       明确不做：部署工作流（CORE-TASK-068）；生产运行手册（CORE-TASK-069）；改应用代码与迁移；建生产库、生产检出或网络（由人与 vps_infra 做）。
       预计改动约 900 行（脚本约 250、测试约 600）；接近约 1500 行时把生产迁移前备份拆成单独的任务。
@@ -2840,7 +2840,7 @@ tasks:
       - instance.sh 的场景：demo 与 production 各给出上面的项目名、网络名与别名；CORE_ENV 缺失、写错、带引号、带空格、带行尾注释、出现两行时都失败；找容器时只认 working_dir 标签与本检出相同的那一个，别的检出的容器、一次性容器不算，有两个时算没找到
       - deploy.sh 的场景：CORE_ENV 不对时以失败结束且没有任何 docker 调用；每个 compose 调用都带 -p 本实例的项目名；持锁方文字带实例名；生产的数据网络不存在时失败且没有拉镜像、迁移、换容器；Demo 不备份
       - 生产备份的场景：备份在迁移之前；mysqldump 的参数如上、密码经 MYSQL_PWD 传、假 docker 收到的参数里没有密码与 -p；导出不以 Dump completed 结尾或 docker exec 失败时以失败结束、没有迁移与换容器、不留下临时文件；成功时文件权限 600、目录 700，已有 5 份时删掉最旧的一份；CORE_DATABASE_URL 的库名按先截问号再取最后一个斜杠取出（查询串里带斜杠时也取对），不合格时失败
-      - healthcheck.sh 与 monitor.sh 只找本实例检出的容器；monitor.sh 在 CORE_ENV 不对时推 readyz 那个检查失败（没查成、容器数不对）并以非 0 退出；066 的巡检场景照样通过
+      - healthcheck.sh 与 monitor.sh 只找本实例检出的容器；monitor.sh 在 CORE_ENV 不对时推 readyz 那个检查失败（没查成、容器数不对）并以非 0 退出；现有巡检测试改为把 monitor.sh 与 instance.sh 一起拷进假检出、假 docker 给出 working_dir 标签，066 的巡检场景照样通过；healthcheck.sh 找不到容器的场景用假的 sleep，不真等
       - 测试对 docker-compose.yml 跑 docker compose config：不设实例变量时报错；按 demo 与 production 的值各解析出上面的网络与别名，生产没有 data_net；测试对 deploy 目录下的四个脚本跑 shellcheck 并要求零退出（没有 shellcheck 或 docker 时测试失败而不是跳过）
       - 改动只落在 allowed_change_paths；不改 .platform/、部署工作流；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；脚本测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
@@ -2896,7 +2896,7 @@ tasks:
       按设计 docs/PRODUCTION_AND_RECOVERY.md 0.5 的第 1.2 节第 6 条，新建 docs/PRODUCTION_RUNBOOK.md，把第 1.3 节首次上线、第 1.4 节升级与回滚的界线、第 2.4 节整机恢复与误操作恢复、第 2.5 节演练写成可以照着做的步骤与命令，末尾留演练记录一节（日期、执行人、各步用时、丢失窗口、发现的问题）。
       照设计写，不改设计内容：首次上线的六步（建生产库与账号、vps_infra 建专用数据网络、生产检出与 .env、手工触发部署选生产、经 instance.sh 找容器开通与签发、真实期初之前的四项核对）；
       升级前列出两个 SHA 之间的迁移并按先加后删核对、没有 Demo 部署在跑时才触发、回滚只能回到上一个好的 SHA 且不早于实例片段进库的提交；
-      整机恢复的九步，含 catalog_changes 的自增起点调到最大 id 加 1000000（表为空按 0）且调完不能再重放 binlog、开放写入前先做一次全量导出、令牌丢了在原凭据下重新签发、用最后一次成功的生产手工部署的 SHA；误操作恢复在临时实例上用停止位置或停止时间、mysqlbinlog 设 TZ 为 UTC；
+      整机恢复的九步，含两个实例的库各把 catalog_changes 的自增起点调到最大 id 加 1000000（表为空按 0）且调完不能再重放 binlog、开放写入前先做一次全量导出、令牌丢了在原凭据下重新签发、用最后一次成功的生产手工部署的 SHA；误操作恢复在临时实例上用停止位置或停止时间、mysqlbinlog 设 TZ 为 UTC；
       演练在另一台机器上做、用标记表量丢失窗口、演练机不改 DNS、不装 cron、不填心跳地址、外发凭据换假值、读 R2 用只读令牌；核对项照第 2.5 节。
       巡检的装法仍在 docs/OPS_MONITORING.md，手册里只链过去；vps_infra 那边的步骤写成指向 vps_infra 的说明，不抄它的脚本。
       命令里服务器上的目录、账号、主机名、库名与地址一律用占位符；密钥只写从密码管理器取回，不写值。
