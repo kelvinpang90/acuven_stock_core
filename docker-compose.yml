@@ -1,14 +1,18 @@
-# 生产栈（目前只部署 Demo Core 实例，CORE_ENV=demo）：只有 Core 的 API 一个容器，数据库用共享基建的 infra_mysql
-# 里的独立库，本项目不起数据库容器。
+# 生产栈（Demo 与生产两个 Core 实例共用这一个文件，各一个检出）：只有 Core 的 API 一个容器，数据库用共享基建的
+# infra_mysql 里的独立库，本项目不起数据库容器。
 #
 # 只在服务器上用，由 deploy/deploy.sh 驱动：它设置 CORE_API_IMAGE 为本次提交 SHA 标记的镜像。
+# 项目名、网络名与别名由 deploy/instance.sh 按 .env 的 CORE_ENV 给出（docs/PRODUCTION_AND_RECOVERY.md 第 1.1、1.2 节）：
+# 项目名经 -p 传，网络名与别名经它导出的环境变量传，这里不给默认值、也不写固定的 name，
+# 不经 instance.sh 的 compose 命令因变量缺失直接报错，不会悄悄落到 Demo 的名字上。
 # 其余变量从服务器上本目录的 .env 读（模板见 .env.example），不进仓库。
 #
 # Core 不开公网入口（契约 §10 第 5 条）：不挂 proxy_net、不发布端口。
-# data_net 连共享数据库；stock_core_net 是只给 Core 与它的调用方（网店）用的内部网络，由 deploy/deploy.sh 确保存在。
-# 服务名带 core_ 前缀：compose 把服务名注册成网络上的 DNS 别名，data_net 是多个项目共用的。
-
-name: acuven_stock_core
+# 两个实例都恰好挂两条网络：
+# - 数据网络连共享数据库：Demo 是 data_net（多个项目共用，所以服务名带 core_ 前缀，compose 把服务名注册成网络上的 DNS 别名）；
+#   生产是只有 infra_mysql 与生产 Core 的 infra_mysql_core_production_net，不挂 data_net。都由 vps_infra 建。
+# - 调用方内部网络只给 Core 与它的调用方用：Demo 是 stock_core_net（别名 core_api），生产是 stock_core_production_net
+#   （别名 stock_core_production），由 deploy/deploy.sh 确保存在。
 
 x-logging: &logging
   driver: json-file
@@ -27,7 +31,11 @@ services:
       CORE_DATABASE_URL: ${CORE_DATABASE_URL:?set CORE_DATABASE_URL in .env (see .env.example)}
       # 预留有效期（秒），60–3600；没设时取 900（契约 5.6）。
       CORE_RESERVATION_TTL_SECONDS: ${CORE_RESERVATION_TTL_SECONDS:-900}
-    networks: [data_net, stock_core_net]
+    networks:
+      data: {}
+      callers:
+        aliases:
+          - ${CORE_CALLER_ALIAS:?set by deploy/instance.sh from CORE_ENV}
     healthcheck:
       test:
         - CMD
@@ -40,7 +48,9 @@ services:
       start_period: 20s
 
 networks:
-  data_net:
+  data:
+    name: ${CORE_DATA_NETWORK:?set by deploy/instance.sh from CORE_ENV}
     external: true
-  stock_core_net:
+  callers:
+    name: ${CORE_CALLER_NETWORK:?set by deploy/instance.sh from CORE_ENV}
     external: true

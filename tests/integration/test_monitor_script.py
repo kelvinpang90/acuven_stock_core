@@ -1,7 +1,10 @@
-"""deploy/monitor.sh 的场景测试（契约 0.20 §8.5，CORE-TASK-065、066）。
+"""deploy/monitor.sh 的场景测试（契约 0.20 §8.5，CORE-TASK-065、066、067）。
 
+monitor.sh 与 deploy/instance.sh 一起拷进临时目录里搭的假检出，
+检出的 .env 默认只有 CORE_ENV=production。
 用 bash 跑脚本；PATH 最前面放假的 docker、timeout 与 logger，都把收到的参数记进假工具的目录：
-- 假 docker 的 ps 按场景列出容器；exec 把交给容器里 Python 的代码换成本机 Python 跑，
+- 假 docker 的 ps 按标签过滤场景里的容器（本检出的默认带生产的项目名与本检出的 working_dir 标签），
+  按 --format 打出 ID 与标签；exec 把交给容器里 Python 的代码换成本机 Python 跑，
   只带 -e 按名字传入的变量，容器内回环的地址换成本机回环上的假 Core
   （就绪检查与不变量自查按场景回应，自查照真实接口按令牌鉴权）；
 - 假 timeout 按场景让某一步超时（退出码 124，不真等），其余照常执行那条命令，并记下每一步的限时；
@@ -32,6 +35,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "deploy" / "monitor.sh"
+INSTANCE = ROOT / "deploy" / "instance.sh"
+PROJECT = "acuven_stock_core_production"
 CRON = ROOT / "deploy" / "monitor.cron"
 RUNBOOK = ROOT / "docs" / "OPS_MONITORING.md"
 
@@ -59,6 +64,7 @@ def state(readyz: str = "none", invariants: str = "none") -> str:
 FAKE_DOCKER = r"""
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -69,8 +75,21 @@ args = sys.argv[1:]
 with open(os.path.join(state, "calls.jsonl"), "a") as file:
     file.write(json.dumps({"tool": "docker", "argv": args}) + "\n")
 if args[:1] == ["ps"]:
+    rest, wanted, template = args[1:], [], None
+    while rest:
+        option = rest.pop(0)
+        if option == "--filter" and rest[0].startswith("label=") and "=" in rest[0][6:]:
+            wanted.append(rest.pop(0)[6:].split("=", 1))
+        elif option == "--format":
+            template = rest.pop(0)
+        else:
+            sys.exit(2)
     for container in config["containers"]:
-        print(container)
+        labels = container["labels"]
+        if template and all(labels.get(key) == value for key, value in wanted):
+            line = template.replace("{{.ID}}", container["id"])
+            line = re.sub(r'\{\{\.Label "([^"]+)"\}\}', lambda m: labels.get(m[1], ""), line)
+            print(line)
     sys.exit(0)
 if args[:1] != ["exec"]:
     sys.exit(2)
@@ -81,7 +100,8 @@ while rest and rest[0].startswith("-"):
     name = rest.pop(0)
     if name in os.environ:
         env[name] = os.environ[name]
-if len(rest) != 4 or rest[0] not in config["containers"] or rest[1:3] != ["python", "-c"]:
+ids = [container["id"] for container in config["containers"]]
+if len(rest) != 4 or rest[0] not in ids or rest[1:3] != ["python", "-c"]:
     sys.exit(126)
 code = rest[3].replace("http://127.0.0.1:8000", config["core_url"])
 sys.exit(subprocess.run([sys.executable, "-I", "-c", code], env=env).returncode)
@@ -119,6 +139,20 @@ state = os.environ["FAKE_STATE_DIR"]
 with open(os.path.join(state, "calls.jsonl"), "a") as file:
     file.write(json.dumps({"tool": "logger", "argv": sys.argv[1:]}) + "\n")
 """
+
+
+def container(
+    container_id: str, working_dir: Path, project: str = PROJECT, oneoff: str = "False"
+) -> dict:
+    """假 docker 列出的一个运行中的 core_api 容器与它的 compose 标签。"""
+    labels = {
+        "com.docker.compose.project": project,
+        "com.docker.compose.service": "core_api",
+        "com.docker.compose.oneoff": oneoff,
+        "com.docker.compose.project.working_dir": str(working_dir),
+    }
+    return {"id": container_id, "labels": labels}
+
 
 Handle = Callable[[str, str, dict, bytes], tuple[int, bytes]]
 
@@ -278,6 +312,16 @@ class Monitor:
         self.home = tmp_path / "home"
         for directory in (self.bin, self.fakes, self.home):
             directory.mkdir()
+        # 假检出：monitor.sh 与 instance.sh 一起拷进来，instance.sh 读这里的 .env
+        # （每次运行前按 checkout_env 写）。
+        self.checkout = tmp_path / "checkout"
+        (self.checkout / "deploy").mkdir(parents=True)
+        self.script = self.checkout / "deploy" / "monitor.sh"
+        shutil.copyfile(SCRIPT, self.script)
+        shutil.copyfile(INSTANCE, self.checkout / "deploy" / "instance.sh")
+        self.checkout_env: str | None = "CORE_ENV=production\n"
+        # 本检出之外的容器（别的检出、一次性容器等），照样由假 docker 列出。
+        self.others: list[dict] = []
         # 状态文件：默认经 CORE_MONITOR_STATE_FILE 指到这里，先写成两个检查的记录都为空。
         self.state_file = tmp_path / "records" / "state"
         self.state_file.parent.mkdir()
@@ -319,9 +363,10 @@ class Monitor:
             text = "".join(f"{key}={value}\n" for key, value in self.values.items())
         path.write_text(text)
 
-    def run(self, script: Path = SCRIPT, cwd: Path | None = None, override: bool = True) -> Result:
+    def run(self, cwd: Path | None = None, override: bool = True) -> Result:
+        mine = [container(name, self.checkout) for name in self.containers]
         config = {
-            "containers": self.containers,
+            "containers": mine + self.others,
             "timeouts": self.timeouts,
             "core_url": self.core_url,
         }
@@ -337,12 +382,14 @@ class Monitor:
         }
         if self.state_override:
             env["CORE_MONITOR_STATE_FILE"] = str(self.state_file)
+        if self.checkout_env is not None:
+            (self.checkout / ".env").write_text(self.checkout_env)
         if override:
             env["CORE_MONITOR_ENV_FILE"] = str(self.env_file)
             if self.env_present:
                 self.write_env(self.env_file)
         completed = subprocess.run(
-            ["bash", str(script)],
+            ["bash", str(self.script)],
             cwd=cwd or self.home,
             env=env,
             capture_output=True,
@@ -446,7 +493,7 @@ def test_all_green(monitor: Monitor) -> None:
 
     (ps,) = result.docker("ps")
     for label in (
-        "label=com.docker.compose.project=acuven_stock_core",
+        f"label=com.docker.compose.project={PROJECT}",
         "label=com.docker.compose.service=core_api",
         "label=com.docker.compose.oneoff=False",
     ):
@@ -475,6 +522,38 @@ def test_container_count_is_not_one(monitor: Monitor, containers: list[str]) -> 
     assert rounds(result) == 2
     assert result.docker("exec") == []
     assert result.state == state("readyz:P1,periodic:P2", "invariants:P2")
+
+
+def test_only_this_checkouts_container(monitor: Monitor, tmp_path: Path) -> None:
+    other = tmp_path / "other_checkout"
+    other.mkdir()
+    monitor.others = [
+        container("0bad0bad0001", other),
+        container("0bad0bad0002", monitor.checkout, oneoff="True"),
+        container("0bad0bad0003", monitor.checkout, project="acuven_stock_core"),
+    ]
+    result = monitor.run()
+    assert result.returncode == 0
+    assert_ok(result, *CHECKS)
+    assert {argv[1] for argv in result.docker("exec") if argv[1] != "-e"} == {CONTAINER}
+    assert {argv[3] for argv in result.docker("exec") if argv[1] == "-e"} == {CONTAINER}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [None, "CORE_ENV=prod\n", 'CORE_ENV="production"\n', "CORE_ENV=production\n" * 2],
+    ids=["missing", "misspelled", "quoted", "twice"],
+)
+def test_core_env_wrong_counts_as_no_container(monitor: Monitor, text: str | None) -> None:
+    monitor.checkout_env = text
+    result = monitor.run()
+    assert result.returncode == 1
+    reason = "not checked: found 0 running core_api containers, expected exactly 1"
+    assert_fail(result, "readyz", f"P1 readyz: {reason}", f"P2 periodic: {reason}")
+    assert_fail(result, "invariants", f"P2 invariants: {reason}")
+    assert [call for call in result.calls if call["tool"] == "docker"] == []
+    (line,) = [line for line in result.logs if "CORE_ENV" in line]
+    assert "must be exactly one line CORE_ENV=demo or CORE_ENV=production" in line
 
 
 def test_finding_the_container_times_out(monitor: Monitor) -> None:
@@ -713,17 +792,16 @@ def test_env_file_missing(monitor: Monitor) -> None:
     assert result.state == state()
 
 
-def test_default_env_is_the_checkout_root(monitor: Monitor, tmp_path: Path) -> None:
-    checkout = tmp_path / "checkout"
-    (checkout / "deploy").mkdir(parents=True)
-    script = checkout / "deploy" / "monitor.sh"
-    shutil.copyfile(SCRIPT, script)
-    monitor.write_env(checkout / ".env")
+def test_default_env_is_the_checkout_root(monitor: Monitor) -> None:
+    checkout_env = monitor.checkout / ".env"
+    monitor.write_env(checkout_env)
+    checkout_env.write_text(checkout_env.read_text() + "CORE_ENV=production\n")
+    monitor.checkout_env = None
     # 当前目录（cron 在运行账号的家目录里跑）与脚本所在目录里的 .env 都不该被读到。
-    decoy = f"CORE_MONITOR_TOKEN={WRONG_TOKEN}\n"
+    decoy = f"CORE_MONITOR_TOKEN={WRONG_TOKEN}\nCORE_ENV=demo\n"
     (monitor.home / ".env").write_text(decoy)
-    (checkout / "deploy" / ".env").write_text(decoy)
-    result = monitor.run(script=script, cwd=monitor.home, override=False)
+    (monitor.checkout / "deploy" / ".env").write_text(decoy)
+    result = monitor.run(cwd=monitor.home, override=False)
     assert result.returncode == 0
     assert_ok(result, *CHECKS)
 
@@ -1046,7 +1124,9 @@ def test_default_state_location(monitor: Monitor, tmp_path: Path, xdg: bool) -> 
 def test_shellcheck() -> None:
     shellcheck = shutil.which("shellcheck")
     assert shellcheck, "shellcheck is not installed"
-    checked = subprocess.run([shellcheck, str(SCRIPT)], capture_output=True, text=True)
+    checked = subprocess.run(
+        [shellcheck, "-x", str(SCRIPT)], cwd=ROOT, capture_output=True, text=True
+    )
     assert checked.returncode == 0, checked.stdout + checked.stderr
 
 

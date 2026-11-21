@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 #
 # 运行告警巡检（契约 0.20 §8.5）。只装在生产实例的检出上，由服务器 cron 每 5 分钟跑一次（deploy/monitor.cron，
 # 装法见 docs/OPS_MONITORING.md）。
@@ -14,8 +15,9 @@
 # 记录读不出（文件不存在、读不了、不合格式，或记为未知）时，本轮这个检查只要不合格就先成功后失败。
 # 失败那一推（合格时为成功那一推）送到之后才改这个检查的记录；任何一推没推成就不改。
 #
-# 连接同 deploy/healthcheck.sh：按 compose 标签找 core_api 容器（另排除一次性容器），
-# docker exec 进去用容器里的 Python 取容器内回环。每一步都限时，超时按该维度没查成处理。
+# 连接同 deploy/healthcheck.sh：经 deploy/instance.sh 找本实例、本检出的 core_api 容器（按检出 .env 的 CORE_ENV，
+# 另排除一次性容器；不是恰好一个就算没查成），docker exec 进去用容器里的 Python 取容器内回环。
+# 每一步都限时，超时按该维度没查成处理。CORE_ENV 读不对时按找不到容器处理，另记一行系统日志。
 #
 # 配置只从 .env 读三个键，按行解析、不 source 整个文件：CORE_MONITOR_TOKEN、CORE_HEALTHCHECK_READYZ_URL、
 # CORE_HEALTHCHECK_INVARIANTS_URL（0.20 取消的 CORE_HEALTHCHECK_PERIODIC_URL 留着也不读）。.env 默认是本脚本所在
@@ -31,18 +33,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=instance.sh
+. "$SCRIPT_DIR/instance.sh"
 ENV_FILE="${CORE_MONITOR_ENV_FILE:-$(dirname -- "$SCRIPT_DIR")/.env}"
 RECHECK_SECONDS="${CORE_MONITOR_RECHECK_SECONDS:-45}"
 [[ "$RECHECK_SECONDS" =~ ^[0-9]+$ ]] || RECHECK_SECONDS=45
 STATE_FILE="${CORE_MONITOR_STATE_FILE:-${XDG_STATE_HOME:-${HOME:-}/.local/state}/stock_core_monitor/state}"
 STATE_HEADER="stock_core_monitor state 1"
 LOG_TAG=stock_core_monitor
-
-CONTAINER_FILTERS=(
-    --filter label=com.docker.compose.project=acuven_stock_core
-    --filter label=com.docker.compose.service=core_api
-    --filter label=com.docker.compose.oneoff=False
-)
 
 # 容器里的 Python 共用的部分：取一个路径，只把结论按行打到标准输出，不打错误原文。
 # 这几段经命令行参数传进容器，只用 ASCII，免得受容器里语言环境的影响。
@@ -346,7 +344,11 @@ check_invariants() {
 check_round() {
     readyz_text="" periodic_text="" invariants_text=""
     local ids status=0 count
-    ids="$(timeout 10 docker ps -q "${CONTAINER_FILTERS[@]}" 2>/dev/null)" || status=$?
+    if [ -z "$CORE_INSTANCE" ]; then
+        not_checked_all "found 0 running core_api containers, expected exactly 1"
+        return
+    fi
+    ids="$(core_find_api_containers)" || status=$?
     if [ "$status" -eq 124 ]; then
         not_checked_all "timed out finding the core_api container"
         return
@@ -433,6 +435,9 @@ report() {
 }
 
 read_env "$ENV_FILE"
+if [ -z "$CORE_INSTANCE" ]; then
+    log "$CORE_INSTANCE_ERROR; treating the core_api container as not found"
+fi
 
 check_round
 if [ -n "$readyz_text$periodic_text$invariants_text" ]; then

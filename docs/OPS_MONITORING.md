@@ -1,7 +1,7 @@
 # 运行告警运行手册（契约 §8.5，OPS-04）
 
 > **只对生产实例。** 巡检只装在生产实例的检出上；Demo 实例不装巡检的 cron、不签巡检用的令牌、不建心跳检查（契约 0.20）。
-> **装到生产要等 CORE-TASK-067、068 合并**：在那之前巡检只按 compose 标签找容器，找到的是 Demo 的容器，生产实例也还不能部署。
+> **装到生产要等 CORE-TASK-067、068 合并**：067 起巡检经 `deploy/instance.sh` 按检出 `.env` 的 `CORE_ENV` 只找本实例、本检出的容器；生产实例要等 068 才能部署。
 
 生产服务器上的 cron 每 5 分钟跑一次 `deploy/monitor.sh`，查三个维度，把结论推到心跳服务（Healthchecks）的两个检查，由它通知 Telegram：
 
@@ -32,12 +32,16 @@ journalctl -t stock_core_monitor --since "1 hour ago"
 - 推心跳没送到时不改那个检查的记录，下一轮照样会重新通知。状态文件写不进去时只记一行 `state file could not be written`，结论与退出码不变；看运行账号对那个目录有没有写权限。
 
 下面的步骤都由人做，部署不会自动做其中任何一步。文中 `<检出目录>` 指服务器上生产实例检出的根目录，`<运行账号>` 指运行巡检的账号
-（要能读检出目录里的 `.env`、能用 `docker`）。找 Core 容器的命令（与脚本相同的标签过滤）：
+（要能读检出目录里的 `.env`、能用 `docker`）。找 Core 容器与脚本一样经 `deploy/instance.sh`：在 `<检出目录>` 里 `source` 它，
+第一行应打出 `production`，第二行应恰好一个容器 ID（只认本检出的 `core_api`，排除一次性容器）；不是就停下，按第 6.1 节查：
 
 ```bash
-container="$(docker ps -q --filter label=com.docker.compose.project=acuven_stock_core \
-    --filter label=com.docker.compose.service=core_api --filter label=com.docker.compose.oneoff=False)"
+. deploy/instance.sh; echo "${CORE_INSTANCE:-$CORE_INSTANCE_ERROR}"
+container="$(core_find_api_containers)"; echo "$container"
 ```
+
+下面用到 `docker compose` 的命令也在同一个 shell 里跑：项目名用它给出的 `$CORE_COMPOSE_PROJECT`，网络名与别名的变量已由它导出；
+镜像变量 `CORE_API_IMAGE` 只由部署脚本设置，查状态时随便给一个值即可。
 
 ## 0. 撤掉照 CORE-TASK-065 装的 Demo 巡检
 
@@ -147,7 +151,8 @@ rm -f "$drill_env"
 
 ### 6.1 `readyz`（P1）
 
-- `found 0 running core_api containers`：栈没起来。`docker compose ps` 看容器状态，`docker logs` 看最近的启动输出；
+- `found 0 running core_api containers`：栈没起来，或检出 `.env` 的 `CORE_ENV` 不对（系统日志里另有一行 `CORE_ENV in … must be exactly one line …`，
+  按 `.env.example` 改成恰好一行 `CORE_ENV=production`）。`CORE_API_IMAGE=unused docker compose -p "$CORE_COMPOSE_PROJECT" ps -a` 看容器状态，`docker logs` 看最近的启动输出；
   部署正在换容器时首轮会失败、复核通常已恢复，复核后仍红说明部署失败或回滚没起来，看部署任务的输出。
 - `found 2 …`：同一服务有两个运行中的容器（不含部署跑迁移的一次性容器），先查是谁起的，留下当前版本的那个。
 - `timed out finding the core_api container`、`docker ps failed`：Docker 守护进程不响应，先看 `systemctl status docker`。

@@ -104,16 +104,21 @@ jobs:
           alembic upgrade head
           alembic check
 
+      # -x：跟进脚本 source 的 deploy/instance.sh。
       - name: Deploy scripts lint
-        run: shellcheck deploy/deploy.sh deploy/healthcheck.sh
+        run: shellcheck -x deploy/instance.sh deploy/deploy.sh deploy/healthcheck.sh deploy/monitor.sh
 
       # compose 文件可解析；这些值只为让必填变量有值，不是任何真实配置。
+      # 项目名与后三个变量取 deploy/instance.sh 给 Demo 的值。
       - name: Compose file resolves
         env:
           CORE_API_IMAGE: ci/acuven-stock-core-api:ci
           CORE_ENV: demo
           CORE_DATABASE_URL: mysql+pymysql://ci:ci@127.0.0.1:3306/ci
-        run: docker compose config --quiet
+          CORE_DATA_NETWORK: data_net
+          CORE_CALLER_NETWORK: stock_core_net
+          CORE_CALLER_ALIAS: core_api
+        run: docker compose -p acuven_stock_core config --quiet
 
       - name: Image builds
         run: docker build --build-arg GIT_SHA=${{ github.sha }} .
