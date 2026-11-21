@@ -168,18 +168,18 @@
 
 ### 1.15 运行告警（Kelvin，2026-11-21）
 
-登记「不变量自查的定时调用与告警」（OPS-04）之前提出；条文写进契约 0.17（§8.5，第 14 节第 94–96 条），Kelvin 2026-11-21 批准。
+登记「不变量自查的定时调用与告警」（OPS-04）之前提出；条文写进契约 0.17（§8.5，第 14 节第 94–96 条），Kelvin 2026-11-21 批准；Q-74 随后按契约 0.18（第 97 条）修订，Kelvin 2026-11-21 批准。
 
 | 编号 | 问题 | 答复 |
 | --- | --- | --- |
 | Q-72 | OPS-04 这次做多大范围 | **最小三项**（Kelvin 2026-11-21 定）：`/readyz`（进程与数据库）、不变量自查 `ok` 为 `false`、进程内定时任务是否还在正常运行。未选：只做不变量自查；OPS-04 全部七类（命令失败率要先有指标采集） |
 | Q-73 | 谁定时调、告警怎么送到人手里 | **服务器 cron 巡检**（Kelvin 2026-11-21 定）：照 `ai_billing_hub`，本仓库加巡检脚本，cron 每 5 分钟跑，全绿也推心跳，经 Healthchecks.io 推到 Telegram；运维令牌存服务器 `.env`。未选：Core 进程自己推心跳；只写进程日志 |
-| Q-74 | `ai_billing_hub` 的 Healthchecks 免费账号已用满 20 个检查，Core 的检查放哪 | **另开一个免费账号**（Kelvin 2026-11-21 定）。先选了“并进计费平台现有检查”，说明两个脚本往同一个检查推会互相刷掉失败、只能改由计费平台的巡检顺带查 Core 之后，改为另开账号。未选：升级付费档 |
+| Q-74 | `ai_billing_hub` 的 Healthchecks 免费账号已用满 20 个检查，Core 的检查放哪 | **放进现有账号，由计费平台合并告警维度腾出 3 个**（Kelvin 2026-11-21 定，契约 0.18）：`fx_fetch`＋`fx_stale` 合一，`usage_pricing_error`＋`usage_fx_rate_error`＋`usage_model_unknown` 合一。经过：先选“并进计费平台现有检查”，说明两个脚本往同一个检查推会互相刷掉失败后改为“另开一个免费账号”（契约 0.17）；之后发现 Healthchecks 把用多个账号绕过免费档上限视为滥用，改为本条。未选：Core 三个维度并成一个检查（三项互相遮挡）；升级付费档（每月 20 美元） |
 | Q-75 | 不变量自查多久跑一次 | **每 5 分钟**（Kelvin 2026-11-21 定），与巡检同一轮；用时到 30 秒量级时按 §4.4 另行设计。未选：每小时；每天一次 |
 
 ### 1.16 生产实例与 Inventory 接入（Kelvin，2026-11-21）
 
-Kelvin 2026-11-21 批准 Inventory 最小 V1 设计时，按建议答复了其中与 Core 有关的三项（该设计第 16 节的 V-02、V-12、V-03）；条文写进契约 0.18（第 14 节第 97–99 条），Kelvin 2026-11-21 批准。
+Kelvin 2026-11-21 批准 Inventory 最小 V1 设计时，按建议答复了其中与 Core 有关的三项（该设计第 16 节的 V-02、V-12、V-03）；条文写进契约 0.19（第 14 节第 98–100 条），Kelvin 2026-11-21 批准。
 
 | 编号 | 问题 | 答复 |
 | --- | --- | --- |
@@ -205,5 +205,5 @@ Kelvin 2026-11-21 批准 Inventory 最小 V1 设计时，按建议答复了其�
 | `acuven_hub/DECISIONS.md` C-13 | “V1 只验收 Acuven 自用网店的单租户”改为 **V1 先接公开 Demo（独立 Demo Core 实例）验收**；真实网店何时接、怎么部署待定（Q-24） | **已改**（同上）：C-13 标“已被取代（部分）”，第四节加“C-13 后续”待决定行 |
 | `acuven_hub/DECISIONS.md` I-04 | 设计批准后登记重估结果（Q-29） | 批准后 |
 | `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md` | 预留 30→15 分钟可配（Q-19）；故障收款加“按最后可售量封顶”（Q-03）；超卖事实不入账（Q-20）；`sale_cancelled` 映射到退款回库（Q-28） | Inventory 启动时（DEVPRI 阶段 5） |
-| `acuven_inventory/docs/V1_MINIMAL_DESIGN.md` 第 3.3、5.1 节 | 原写“V1 不用晚到支付待审结案”：Core 停机超过预留有效期时补交会走晚到确认，没货的单进 `late_payment_review`（契约 0.18 §5.5），Inventory 要能重试或结案 | **0.3 已批准，待合并**：Inventory 设计 0.3（kelvinpang90/acuven_inventory 的 PR #1），Kelvin 2026-11-21 批准 |
+| `acuven_inventory/docs/V1_MINIMAL_DESIGN.md` 第 3.3、5.1 节 | 原写“V1 不用晚到支付待审结案”：Core 停机超过预留有效期时补交会走晚到确认，没货的单进 `late_payment_review`（契约 0.19 §5.5），Inventory 要能重试或结案 | **0.3 已批准，待合并**：Inventory 设计 0.3（kelvinpang90/acuven_inventory 的 PR #1），Kelvin 2026-11-21 批准 |
 | `acuven-shop/docs/DESIGN.md` | Demo 接 Core 后：退款回库、当日库存调整改为盘点更正、每日重置改调 Core、迟到付款改为补扣/待办（Q-26）、故障收款封顶 | 网店接 Core 的设计任务（过网店设计闸门） |
