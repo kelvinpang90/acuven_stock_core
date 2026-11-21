@@ -179,7 +179,7 @@
 
 ### 1.16 生产实例与 Inventory 接入（Kelvin，2026-11-21）
 
-Kelvin 2026-11-21 批准 Inventory 最小 V1 设计时，按建议答复了其中与 Core 有关的三项（该设计第 16 节的 V-02、V-12、V-03）；条文写进契约 0.18（第 14 节第 97–99 条），**条文待 Kelvin 批准**。
+Kelvin 2026-11-21 批准 Inventory 最小 V1 设计时，按建议答复了其中与 Core 有关的三项（该设计第 16 节的 V-02、V-12、V-03）；条文写进契约 0.18（第 14 节第 97–99 条），Kelvin 2026-11-21 批准。
 
 | 编号 | 问题 | 答复 |
 | --- | --- | --- |
@@ -205,5 +205,5 @@ Kelvin 2026-11-21 批准 Inventory 最小 V1 设计时，按建议答复了其�
 | `acuven_hub/DECISIONS.md` C-13 | “V1 只验收 Acuven 自用网店的单租户”改为 **V1 先接公开 Demo（独立 Demo Core 实例）验收**；真实网店何时接、怎么部署待定（Q-24） | **已改**（同上）：C-13 标“已被取代（部分）”，第四节加“C-13 后续”待决定行 |
 | `acuven_hub/DECISIONS.md` I-04 | 设计批准后登记重估结果（Q-29） | 批准后 |
 | `acuven_inventory/docs/API_CONTRACT.md`、`STOCK_RULES.md` | 预留 30→15 分钟可配（Q-19）；故障收款加“按最后可售量封顶”（Q-03）；超卖事实不入账（Q-20）；`sale_cancelled` 映射到退款回库（Q-28） | Inventory 启动时（DEVPRI 阶段 5） |
-| `acuven_inventory/docs/V1_MINIMAL_DESIGN.md` 第 3.3、5.1 节 | 原写“V1 不用晚到支付待审结案”：Core 停机超过预留有效期时补交会走晚到确认，没货的单进 `late_payment_review`（契约 0.18 §5.5），Inventory 要能重试或结案 | **已提**：Inventory 设计 0.3 草案（kelvinpang90/acuven_inventory 的 PR #1），待 Kelvin 批准 |
+| `acuven_inventory/docs/V1_MINIMAL_DESIGN.md` 第 3.3、5.1 节 | 原写“V1 不用晚到支付待审结案”：Core 停机超过预留有效期时补交会走晚到确认，没货的单进 `late_payment_review`（契约 0.18 §5.5），Inventory 要能重试或结案 | **已改**：Inventory 设计 0.3（kelvinpang90/acuven_inventory 的 PR #1），Kelvin 2026-11-21 批准 |
 | `acuven-shop/docs/DESIGN.md` | Demo 接 Core 后：退款回库、当日库存调整改为盘点更正、每日重置改调 Core、迟到付款改为补扣/待办（Q-26）、故障收款封顶 | 网店接 Core 的设计任务（过网店设计闸门） |
