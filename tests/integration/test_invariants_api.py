@@ -1,4 +1,4 @@
-"""不变量自查：正常的账、四项检查、汇总、鉴权与参数（契约 §4.4，§10 第 4 条）。
+"""不变量自查：正常的账、五项检查、汇总、鉴权与参数（契约 §4.4，§10 第 4 条）。
 
 在真 MySQL 上跑；每个测试建自己的租户、池、销售入口与凭据，期初、收货与订单命令经接口建立，
 账才对得上；违反由测试直接改库造出（自己提交的连接）。自查用同租户另一个只有 ops.read、
@@ -15,6 +15,7 @@ from sqlalchemy import Engine, update
 
 from app.domain.requests import STOCK_OPERATOR
 from app.domain.service_auth import OPS_READ
+from app.models.catalog import Sku
 from app.models.inventory import IdempotencyRecord, LedgerEntry, StockBalance, StockDocument
 from app.models.orders import OrderDocument, OrderLine, Reservation
 from app.services.reservations import sweep_expired_reservations
@@ -152,6 +153,13 @@ def set_line(engine: Engine, reservation_id: str, line_ref: str, **values: objec
     )
     with engine.begin() as db:
         db.execute(statement.values(**values))
+
+
+def merge_sku(engine: Engine, caller: Caller, sku_id: str, into: str) -> None:
+    """绕过合并单直接把 SKU 设为已合并（库约束要求同时 inactive）。"""
+    statement = update(Sku).where(Sku.tenant_id == caller.tenant_id, Sku.sku_id == sku_id)
+    with engine.begin() as db:
+        db.execute(statement.values(status="inactive", merged_into_sku_id=into))
 
 
 def status_of(engine: Engine, caller: Caller, reservation_id: str) -> str:
@@ -371,6 +379,37 @@ def test_a_committed_reservation_with_an_uncommitted_line_is_reported(client, en
             "status": "committed",
             "line_refs": ["l2"],
         },
+    ]
+
+
+# --- merged_sku_lines ---
+
+
+def test_an_open_reservation_line_on_a_merged_sku_is_reported(client, engine):
+    caller, (held, unmerged, cancelled_sku, canonical) = opened(client, engine, 4)
+    held_order = placed(client, caller, [held, unmerged], [2, 1])
+    cancelled = placed(client, caller, [cancelled_sku], [1])
+    data_of(release(client, caller, cancelled["reservation_id"], {"reason": "cancelled"}), 200)
+    ops = ops_of(engine, caller)
+    assert report_of(client, ops)["ok"] is True
+
+    # released 预留的订单行合并时不改挂，指向已合并的 SKU 不报。
+    merge_sku(engine, caller, cancelled_sku, canonical)
+    assert report_of(client, ops)["ok"] is True
+
+    # active 预留的 l1 漏了改挂；余额行与订单行没动，前四项不报。
+    merge_sku(engine, caller, held, canonical)
+    data = report_of(client, ops)
+    assert data["ok"] is False
+    assert data["violation_count"] == 1
+    assert data["violations"] == [
+        {
+            "check": "merged_sku_lines",
+            "reservation_id": held_order["reservation_id"],
+            "order_ref": held_order["order_ref"],
+            "status": "active",
+            "line_refs": ["l1"],
+        }
     ]
 
 
