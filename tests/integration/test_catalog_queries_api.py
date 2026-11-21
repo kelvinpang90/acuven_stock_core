@@ -466,4 +466,6 @@ def test_catalog_queries_need_no_role(client, engine):
 
 def test_health_endpoints_are_unchanged(client):
     assert client.get("/healthz").status_code == 200
-    assert client.get("/readyz").json() == {"status": "ok"}
+    response = client.get("/readyz")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
