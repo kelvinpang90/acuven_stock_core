@@ -2680,7 +2680,7 @@ tasks:
       二，违反项形状同 order_commit_state：check、reservation_id、order_ref、status、按 line_ref 升序的 line_refs；汇总排序为第 5 项、按 reservation_id 升序，与其他项一起计总数、至多返回 100 项。
       三，它只靠 skus 表的 merged_into_sku_id 判定，不依赖合并单的表；现有接口与其余四项的结果不变。
       明确不做：自动修复；定时调用与告警（OPS-04，另行登记）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-057
     acceptance_criteria:
