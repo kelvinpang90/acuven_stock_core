@@ -2775,3 +2775,36 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-066
+    title: 巡检脚本改为契约 0.20：只给生产推两个检查，检查已红时重新通知
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.20 的 8.5（Q-79）与 docs/PRODUCTION_AND_RECOVERY.md 0.5 第 3 节，把 CORE-TASK-065 按 0.18 交付的巡检改为 0.20 的做法；判据、级别、各步限时、复核、正文内容与不写的内容、系统日志、不加 flock 都照 8.5，不变的部分不改。
+      一，两个检查：readyz 与 periodic 两个维度合用 readyz 那个检查，任一不合格即推失败，正文按维度逐行列出这一轮查出的全部问题；invariants 单独一个检查。.env 只读三个键 CORE_MONITOR_TOKEN、CORE_HEALTHCHECK_READYZ_URL、CORE_HEALTHCHECK_INVARIANTS_URL，CORE_HEALTHCHECK_PERIODIC_URL 不再读（出现了也忽略）；解析规则照 065 不变。
+      二，重新通知：每个检查在本机状态文件里记下上一轮成功推出的失败问题集合（维度加级别）。本轮合格就推成功，推成功后把该检查的记录清空；本轮不合格时，上一轮记录为空就只推失败；上一轮记录非空，而本轮出现了记录里没有的维度、或同一维度的级别更高，就先推成功、紧接着推失败；否则只推失败。
+      状态文件读不出或格式不对时，本轮只要有不合格就先推成功、再推失败。只有失败那一推送成功之后才更新记录；推送失败时记录不变。
+      状态文件默认放在运行账号家目录下的 .local/state/stock_core_monitor 目录里，文件名由检出根目录的 compose 项目名决定（现为 acuven_stock_core），目录不存在时以 0700 建，文件以 0600 写；可用环境变量 CORE_MONITOR_STATE_FILE 覆盖（测试与演练用）。状态文件里不写令牌、心跳地址与响应原文。
+      三，限时：每次推心跳仍 10 秒；要重新通知时每个检查多推一次，一轮最坏约 4 分 15 秒，短于 5 分钟的周期。
+      四，docs/OPS_MONITORING.md：改为只给生产实例建两个检查（stock_core production readyz、stock_core production invariants，与 infra_mysql backup 共用计费平台腾出的 3 个位置；infra_mysql backup 由 vps_infra 那边建），Demo 实例不装巡检、不签巡检用的令牌、不建检查；
+      写明装到生产要等 CORE-TASK-067 与 068（在那之前巡检只找得到 Demo 的容器）；写明若已照 065 的手册装过 Demo 的 cron 与三个检查，按什么顺序撤掉；写明检查只因 P2 红着时当天重启 core_api 清掉；去掉 CORE_HEALTHCHECK_PERIODIC_URL。deploy/monitor.cron 只在注释需要时改，cron 行本身不变。
+      明确不做：按 CORE_ENV 区分实例与找容器的方式（CORE-TASK-067）；部署工作流（068）；改应用代码；部署时自动装 cron；备份状态的监控（vps_infra）。
+    status: ready
+    depends_on:
+      - CORE-TASK-065
+    acceptance_criteria:
+      - 只改 deploy/monitor.sh、deploy/monitor.cron、docs/OPS_MONITORING.md 与 tests/integration/test_monitor_script.py；065 已有的场景按 0.20 改写后照常通过
+      - 测试沿用 065 的做法（假 docker、logger、timeout，本机回环上记录请求的假心跳服务，复核秒数 0，状态文件路径用 CORE_MONITOR_STATE_FILE 指到临时目录）；每个场景核对推到哪个检查、推到地址本身还是加 /fail、推送的先后与次数、请求体、退出码，并核对日志、请求体、状态文件与假 docker 收到的参数里没有令牌原文与心跳地址
+      - 合用检查的场景：全绿推两个成功；readyz 合格而 periodic 为 stale 时 readyz 那个检查推失败、正文写出任务名；两个维度同一轮都不合格时正文两行都在；复核时只剩一个不合格；配了 CORE_HEALTHCHECK_PERIODIC_URL 也不推它
+      - 重新通知的场景：上一轮无记录而本轮不合格只推失败；记录里已有同样的问题只推失败；出现新维度、或同一维度级别从 P2 升到 P1 时先推成功再推失败；本轮合格后记录清空；状态文件读不出或格式不对且本轮不合格时先成功后失败；失败那一推送没成时记录不变、下一轮仍会重新通知
+      - 状态文件与目录的权限为 0600 与 0700，默认路径在运行账号家目录下且与当前目录无关；测试不往真实家目录写
+      - 测试对 deploy/monitor.sh 跑 shellcheck 并要求零退出（CI 上没有 shellcheck 时测试失败而不是跳过）；运行手册与 cron 文件里没有主机名、地址与本项目在服务器上的检出目录
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；脚本测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - deploy/monitor.sh
+      - deploy/monitor.cron
+      - docs/OPS_MONITORING.md
+      - tests/integration/test_monitor_script.py
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
