@@ -15,7 +15,7 @@
 | [docs/TEMPLATE_BOOTSTRAP_PLAN.md](docs/TEMPLATE_BOOTSTRAP_PLAN.md) | 从项目模板起步的方案（2026-11-10 已按它起步，2026-11-11 已推送并部署，登记待做） |
 | [docs/ESTIMATE_BREAKDOWN.md](docs/ESTIMATE_BREAKDOWN.md) | 工期重估（I-04）用的工作拆分，不是排期 |
 | [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | 设计问题与 Kelvin 的答复（Q-24 暂缓） |
-| [docs/PRODUCTION_AND_RECOVERY.md](docs/PRODUCTION_AND_RECOVERY.md) | 生产实例部署与 W7a 备份恢复的设计（2026-11-21 草案，待批准）：同机第二实例、网络隔离、手工升级、binlog 每 4 分钟传 R2、时间点恢复、整机恢复与演练 |
+| [docs/PRODUCTION_AND_RECOVERY.md](docs/PRODUCTION_AND_RECOVERY.md) | 生产实例部署与 W7a 备份恢复的设计（0.4，Kelvin 2026-11-21 批准）：同机第二实例、网络隔离、手工升级、binlog 每 4 分钟传 R2、时间点恢复、整机恢复与演练 |
 
 开发任务清单与 OpenClaw 计划见 [docs/TODO.md](docs/TODO.md)；项目规则见 [CLAUDE.md](CLAUDE.md)（与 `AGENTS.md` 同一内容）。
 
