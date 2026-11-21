@@ -32,9 +32,6 @@
 ### 已阻塞
 
 ### 后续计划
-- 待登记：vps_infra 每 4 分钟把 binlog 传到 R2，每晚备份写成功标记，由上传脚本推 infra_mysql backup 检查
-- 待登记：vps_infra 每晚加一份时间点恢复用的单快照全量导出，补时间点恢复与误操作恢复的说明
-- 待登记：vps_infra 建生产 Core 专用数据网络，钉住 binlog 格式，R2 防误删，把 Core 生产实例加进部署串行化名单
 <!-- openclaw:planning-v1:end -->
 
 ---
