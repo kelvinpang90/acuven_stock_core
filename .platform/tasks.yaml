@@ -2754,7 +2754,7 @@ tasks:
       装好后先确认三个检查在 5 分钟内都收到了由 cron 触发的心跳，再做错令牌演练（覆盖 .env 路径，临时 .env 只给运行账号可读、演练完删除，会记 2 条 invalid_credential 是预期的；预期 invariants 变红、Telegram 收到、改回后恢复，不为演练停容器或改库）；
       三个维度变红时怎么查，以及只有安全事件清理 stale 时先查原因、再用重启或下次部署清掉。可以写系统标准目录，不写本项目在服务器上的检出目录、账号名、主机名与地址。
       明确不做：改应用代码（就绪检查的 periodic 由 CORE-TASK-064 提供）；部署时自动装 cron；命令失败率、积压、备份状态的监控；第二个租户的自查。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-064
     acceptance_criteria:
