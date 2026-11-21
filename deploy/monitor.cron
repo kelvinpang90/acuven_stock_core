@@ -1,4 +1,4 @@
-# 运行告警巡检（契约 8.5）：每 5 分钟跑一次 deploy/monitor.sh。装法见 docs/OPS_MONITORING.md，部署不自动装。
-# 装之前把 <CHECKOUT_DIR> 换成服务器上本仓库检出的绝对路径，<RUN_AS_USER> 换成运行巡检的账号（能读 .env、能用 docker）。
+# 运行告警巡检（契约 0.20 §8.5）：每 5 分钟跑一次 deploy/monitor.sh。只装在生产实例的检出上，Demo 实例不装。装法见 docs/OPS_MONITORING.md，部署不自动装。
+# 装之前把 <CHECKOUT_DIR> 换成服务器上生产实例检出的绝对路径，<RUN_AS_USER> 换成运行巡检的账号（能读 .env、能用 docker）。
 # 用 bash 显式调用，不依赖脚本的执行权限；不加互斥锁：巡检只读，重叠无害，一次卡死却会把之后每一轮都挡在外面。
 */5 * * * * <RUN_AS_USER> bash <CHECKOUT_DIR>/deploy/monitor.sh
