@@ -1,13 +1,14 @@
-"""deploy/monitor.sh 的场景测试（契约 8.5，CORE-TASK-065）。
+"""deploy/monitor.sh 的场景测试（契约 0.20 §8.5，CORE-TASK-065、066）。
 
-用 bash 跑脚本；PATH 最前面放假的 docker、timeout 与 logger，都把收到的参数记进状态目录：
+用 bash 跑脚本；PATH 最前面放假的 docker、timeout 与 logger，都把收到的参数记进假工具的目录：
 - 假 docker 的 ps 按场景列出容器；exec 把交给容器里 Python 的代码换成本机 Python 跑，
   只带 -e 按名字传入的变量，容器内回环的地址换成本机回环上的假 Core
   （就绪检查与不变量自查按场景回应，自查照真实接口按令牌鉴权）；
 - 假 timeout 按场景让某一步超时（退出码 124，不真等），其余照常执行那条命令，并记下每一步的限时；
 - 假 logger 只记参数。
-心跳服务也是本机回环上记录请求的假服务；复核秒数设为 0。每次运行都核对输出、日志、请求体与
-假 docker、假 timeout 收到的参数里没有令牌与心跳地址。
+心跳服务也是本机回环上记录请求的假服务（可按路径回错）；复核秒数设为 0。状态文件经
+CORE_MONITOR_STATE_FILE 指到临时目录，默认先写成两个检查的记录都为空。每次运行都核对输出、日志、
+请求体、状态文件与假 docker、假 timeout 收到的参数里没有令牌与心跳地址。
 """
 
 import json
@@ -15,6 +16,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -35,16 +37,24 @@ RUNBOOK = ROOT / "docs" / "OPS_MONITORING.md"
 
 TOKEN = f"csk_monitor_{uuid4().hex}"
 WRONG_TOKEN = f"csk_wrong_{uuid4().hex}"
-DIMENSIONS = ("readyz", "periodic", "invariants")
+CHECKS = ("readyz", "invariants")
 URL_KEYS = {
     "readyz": "CORE_HEALTHCHECK_READYZ_URL",
-    "periodic": "CORE_HEALTHCHECK_PERIODIC_URL",
     "invariants": "CORE_HEALTHCHECK_INVARIANTS_URL",
 }
+PERIODIC_KEY = "CORE_HEALTHCHECK_PERIODIC_URL"
 TASKS = ("reservation-expiry", "security-event-purge")
 CONTAINER = "c0ffee5eed01"
 LOG_TAG = "stock_core_monitor"
 OK_BODY = "ok\n"
+STATE_HEADER = "stock_core_monitor state 1"
+NOT_WRITTEN = "state file could not be written"
+
+
+def state(readyz: str = "none", invariants: str = "none") -> str:
+    """状态文件的内容：每个检查的记录为 none（空）、unknown（未知）或逗号分隔的维度:级别。"""
+    return f"{STATE_HEADER}\nreadyz {readyz}\ninvariants {invariants}\n"
+
 
 FAKE_DOCKER = r"""
 import json
@@ -237,7 +247,8 @@ class Result:
     output: str
     logs: list[str]
     calls: list[dict]
-    pushes: dict[str, tuple[str, str]]
+    pushes: dict[str, list[tuple[str, str]]]
+    state: str | None
 
     def docker(self, command: str) -> list[list[str]]:
         calls = [call["argv"] for call in self.calls if call["tool"] == "docker"]
@@ -248,15 +259,31 @@ class Result:
 
 
 class Monitor:
-    def __init__(self, tmp_path: Path, core: FakeCore, core_url: str, heartbeat_url: str, pings):
+    def __init__(
+        self,
+        tmp_path: Path,
+        core: FakeCore,
+        core_url: str,
+        heartbeat_url: str,
+        pings: list,
+        rejected: set[str],
+    ):
         self.core = core
         self.core_url = core_url
+        self.heartbeat_url = heartbeat_url
         self.pings = pings
+        self.rejected = rejected
         self.bin = tmp_path / "bin"
-        self.state = tmp_path / "state"
+        self.fakes = tmp_path / "fakes"
         self.home = tmp_path / "home"
-        for directory in (self.bin, self.state, self.home):
+        for directory in (self.bin, self.fakes, self.home):
             directory.mkdir()
+        # 状态文件：默认经 CORE_MONITOR_STATE_FILE 指到这里，先写成两个检查的记录都为空。
+        self.state_file = tmp_path / "records" / "state"
+        self.state_file.parent.mkdir()
+        self.state_file.write_text(state())
+        self.state_override = True
+        self.extra_env: dict[str, str] = {}
         fakes = {"docker": FAKE_DOCKER, "timeout": FAKE_TIMEOUT, "logger": FAKE_LOGGER}
         for name, source in fakes.items():
             fake = self.bin / name
@@ -271,12 +298,19 @@ class Monitor:
         self.point_heartbeats_at(heartbeat_url)
 
     def point_heartbeats_at(self, base_url: str) -> None:
-        self.urls = {dimension: f"{base_url}/ping/{uuid4()}" for dimension in DIMENSIONS}
-        self.values |= {URL_KEYS[dimension]: url for dimension, url in self.urls.items()}
+        self.urls = {check: f"{base_url}/ping/{uuid4()}" for check in CHECKS}
+        self.values |= {URL_KEYS[check]: url for check, url in self.urls.items()}
+
+    def reject(self, check: str, kind: str) -> None:
+        """假心跳服务对这个检查的成功（ok）或失败（fail）那一推回 500。"""
+        base = urlparse(self.urls[check]).path
+        self.rejected.add(f"{base}/fail" if kind == "fail" else base)
 
     def secrets(self) -> list[str]:
-        found = [TOKEN, WRONG_TOKEN, *self.values.values(), *self.urls.values()]
-        found += [urlparse(url).path.rsplit("/", 1)[-1] for url in self.urls.values()]
+        urls = [*self.urls.values()]
+        urls += [value for value in self.values.values() if "://" in value]
+        found = [TOKEN, WRONG_TOKEN, *self.values.values(), *urls]
+        found += [urlparse(url).path.rsplit("/", 1)[-1] for url in urls]
         return [secret for secret in found if secret]
 
     def write_env(self, path: Path) -> None:
@@ -291,15 +325,18 @@ class Monitor:
             "timeouts": self.timeouts,
             "core_url": self.core_url,
         }
-        (self.state / "config.json").write_text(json.dumps(config))
-        (self.state / "calls.jsonl").write_text("")
+        (self.fakes / "config.json").write_text(json.dumps(config))
+        (self.fakes / "calls.jsonl").write_text("")
         self.pings.clear()
         env = {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(self.home),
-            "FAKE_STATE_DIR": str(self.state),
+            "FAKE_STATE_DIR": str(self.fakes),
             "CORE_MONITOR_RECHECK_SECONDS": "0",
+            **self.extra_env,
         }
+        if self.state_override:
+            env["CORE_MONITOR_STATE_FILE"] = str(self.state_file)
         if override:
             env["CORE_MONITOR_ENV_FILE"] = str(self.env_file)
             if self.env_present:
@@ -312,7 +349,7 @@ class Monitor:
             text=True,
             timeout=120,
         )
-        lines = (self.state / "calls.jsonl").read_text().splitlines()
+        lines = (self.fakes / "calls.jsonl").read_text().splitlines()
         calls = [json.loads(line) for line in lines]
         logs = []
         for call in calls:
@@ -325,27 +362,29 @@ class Monitor:
             logs,
             calls,
             self.pushes(),
+            self.state_file.read_text() if self.state_file.is_file() else None,
         )
         self.assert_clean(result)
         return result
 
-    def pushes(self) -> dict[str, tuple[str, str]]:
-        """每个维度推到地址本身（ok）还是加 /fail（fail），与请求体；同一维度只推一次。"""
-        found: dict[str, tuple[str, str]] = {}
+    def pushes(self) -> dict[str, list[tuple[str, str]]]:
+        """每个检查依次推到地址本身（ok）还是加 /fail（fail），与请求体；推到别的路径即失败。"""
+        found: dict[str, list[tuple[str, str]]] = {}
         for method, path, body in self.pings:
             assert method == "POST"
-            for dimension, url in self.urls.items():
+            for check, url in self.urls.items():
                 base = urlparse(url).path
                 if path in (base, f"{base}/fail"):
-                    assert dimension not in found, f"{dimension} pushed twice"
-                    found[dimension] = ("fail" if path.endswith("/fail") else "ok", body)
+                    kind = "fail" if path.endswith("/fail") else "ok"
+                    found.setdefault(check, []).append((kind, body))
                     break
             else:
                 pytest.fail(f"heartbeat to an unknown path {path}")
         return found
 
     def assert_clean(self, result: Result) -> None:
-        texts = [result.output, *result.logs, *(body for _, body in result.pushes.values())]
+        texts = [result.output, *result.logs, result.state or ""]
+        texts += [body for pushes in result.pushes.values() for _, body in pushes]
         texts += [json.dumps(call) for call in result.calls if call["tool"] != "logger"]
         for secret in self.secrets():
             for text in texts:
@@ -356,25 +395,32 @@ class Monitor:
 def monitor(tmp_path: Path) -> Iterator[Monitor]:
     core = FakeCore()
     pings: list[tuple[str, str, str]] = []
+    rejected: set[str] = set()
 
     def record(method: str, path: str, headers: dict, body: bytes) -> tuple[int, bytes]:
         pings.append((method, path, body.decode()))
-        return 200, b"OK"
+        return (500, b"error") if path in rejected else (200, b"OK")
 
     with serve(core.handle) as core_url, serve(record) as heartbeat_url:
-        yield Monitor(tmp_path, core, core_url, heartbeat_url, pings)
+        yield Monitor(tmp_path, core, core_url, heartbeat_url, pings, rejected)
 
 
-def assert_ok(result: Result, *dimensions: str) -> None:
-    for dimension in dimensions:
-        assert result.pushes[dimension] == ("ok", OK_BODY)
+def renotified(result: Result, check: str) -> bool:
+    return f"re-notifying {check}: pushing success, then failure" in result.logs
 
 
-def assert_fail(result: Result, dimension: str, *lines: str) -> None:
-    """推到 /fail，请求体正好是这几行，每行也写进了系统日志。"""
-    kind, body = result.pushes[dimension]
-    assert kind == "fail"
-    assert body.splitlines() == list(lines)
+def assert_ok(result: Result, *checks: str) -> None:
+    for check in checks:
+        assert result.pushes[check] == [("ok", OK_BODY)]
+
+
+def assert_fail(result: Result, check: str, *lines: str, renotify: bool = False) -> None:
+    """推到 /fail（重新通知时先推一次成功），请求体正好是这几行，每行也写进了系统日志。"""
+    pushes = result.pushes[check]
+    assert [kind for kind, _ in pushes] == (["ok", "fail"] if renotify else ["fail"])
+    assert pushes[0][1] == OK_BODY or not renotify
+    assert pushes[-1][1].splitlines() == list(lines)
+    assert renotified(result, check) == renotify
     for line in lines:
         assert line in result.logs
 
@@ -393,9 +439,10 @@ def rounds(result: Result) -> int:
 def test_all_green(monitor: Monitor) -> None:
     result = monitor.run()
     assert result.returncode == 0
-    assert_ok(result, *DIMENSIONS)
+    assert_ok(result, *CHECKS)
     assert result.logs == []
     assert rounds(result) == 1
+    assert result.state == state()
 
     (ps,) = result.docker("ps")
     for label in (
@@ -423,11 +470,11 @@ def test_container_count_is_not_one(monitor: Monitor, containers: list[str]) -> 
     assert result.returncode == 1
     count = len(containers)
     reason = f"not checked: found {count} running core_api containers, expected exactly 1"
-    assert_fail(result, "readyz", f"P1 readyz: {reason}")
-    assert_fail(result, "periodic", f"P2 periodic: {reason}")
+    assert_fail(result, "readyz", f"P1 readyz: {reason}", f"P2 periodic: {reason}")
     assert_fail(result, "invariants", f"P2 invariants: {reason}")
     assert rounds(result) == 2
     assert result.docker("exec") == []
+    assert result.state == state("readyz:P1,periodic:P2", "invariants:P2")
 
 
 def test_finding_the_container_times_out(monitor: Monitor) -> None:
@@ -435,19 +482,24 @@ def test_finding_the_container_times_out(monitor: Monitor) -> None:
     result = monitor.run()
     assert result.returncode == 1
     reason = "not checked: timed out finding the core_api container"
-    assert_fail(result, "readyz", f"P1 readyz: {reason}")
-    assert_fail(result, "periodic", f"P2 periodic: {reason}")
+    assert_fail(result, "readyz", f"P1 readyz: {reason}", f"P2 periodic: {reason}")
     assert_fail(result, "invariants", f"P2 invariants: {reason}")
+    assert result.state == state("readyz:P1,periodic:P2", "invariants:P2")
 
 
 def test_readyz_times_out(monitor: Monitor) -> None:
     monitor.timeouts = ["readyz"]
     result = monitor.run()
     assert result.returncode == 1
-    assert_fail(result, "readyz", "P1 readyz: not checked: timed out")
-    assert_fail(result, "periodic", "P2 periodic: not checked: timed out")
+    assert_fail(
+        result,
+        "readyz",
+        "P1 readyz: not checked: timed out",
+        "P2 periodic: not checked: timed out",
+    )
     assert_ok(result, "invariants")
     assert rounds(result) == 2
+    assert result.state == state("readyz:P1,periodic:P2")
 
 
 def test_readyz_503_still_reads_periodic(monitor: Monitor) -> None:
@@ -455,23 +507,51 @@ def test_readyz_503_still_reads_periodic(monitor: Monitor) -> None:
     result = monitor.run()
     assert result.returncode == 1
     assert_fail(result, "readyz", "P1 readyz: /readyz returned HTTP 503")
-    assert_ok(result, "periodic", "invariants")
+    assert_ok(result, "invariants")
+    assert result.state == state("readyz:P1")
 
 
 def test_readyz_without_periodic(monitor: Monitor) -> None:
     monitor.core.readyz = [readyz(periodic=False)]
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "invariants")
-    assert_fail(result, "periodic", "P2 periodic: /readyz body has no periodic")
+    assert_fail(result, "readyz", "P2 periodic: /readyz body has no periodic")
+    assert_ok(result, "invariants")
+    assert result.state == state("periodic:P2")
 
 
-def test_periodic_stale_names_the_task(monitor: Monitor) -> None:
+def test_periodic_stale_fails_the_readyz_check(monitor: Monitor) -> None:
     monitor.core.readyz = [readyz(stale=("security-event-purge",))]
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "invariants")
-    assert_fail(result, "periodic", "P2 periodic: stale tasks: security-event-purge")
+    assert_fail(result, "readyz", "P2 periodic: stale tasks: security-event-purge")
+    assert_ok(result, "invariants")
+    assert result.state == state("periodic:P2")
+
+
+def test_both_readyz_dimensions_fail_in_one_round(monitor: Monitor) -> None:
+    monitor.core.readyz = [readyz(503, stale=("reservation-expiry",))]
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_fail(
+        result,
+        "readyz",
+        "P1 readyz: /readyz returned HTTP 503",
+        "P2 periodic: stale tasks: reservation-expiry",
+    )
+    assert_ok(result, "invariants")
+    assert result.state == state("readyz:P1,periodic:P2")
+
+
+def test_recheck_leaves_only_one_dimension(monitor: Monitor) -> None:
+    stale = ("security-event-purge",)
+    monitor.core.readyz = [readyz(503, stale=stale), readyz(stale=stale)]
+    result = monitor.run()
+    assert result.returncode == 1
+    assert rounds(result) == 2
+    assert_fail(result, "readyz", "P2 periodic: stale tasks: security-event-purge")
+    assert "P1 readyz: /readyz returned HTTP 503" not in result.logs
+    assert result.state == state("periodic:P2")
 
 
 def test_invariant_violations(monitor: Monitor) -> None:
@@ -481,7 +561,7 @@ def test_invariant_violations(monitor: Monitor) -> None:
     monitor.core.invariants = [invariants(violations)]
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "periodic")
+    assert_ok(result, "readyz")
     assert_fail(
         result,
         "invariants",
@@ -495,6 +575,7 @@ def test_invariant_violations(monitor: Monitor) -> None:
         "P1 invariants: reserved_vs_orders pool_id=pool_004 sku_id=sku_004",
         "P1 invariants: reserved_vs_orders pool_id=pool_005 sku_id=sku_005",
     )
+    assert result.state == state(invariants="invariants:P1")
 
 
 def test_invariant_violations_show_reservation_ids_without_order_ref(monitor: Monitor) -> None:
@@ -536,7 +617,7 @@ def test_invariants_200_unreadable(monitor: Monitor, response: tuple) -> None:
     monitor.core.invariants = [response]
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "periodic")
+    assert_ok(result, "readyz")
     assert_fail(result, "invariants", "P2 invariants: not checked: response unreadable")
 
 
@@ -544,17 +625,18 @@ def test_invariants_401(monitor: Monitor) -> None:
     monitor.values["CORE_MONITOR_TOKEN"] = WRONG_TOKEN
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "periodic")
+    assert_ok(result, "readyz")
     assert_fail(result, "invariants", "P2 invariants: not checked: HTTP 401")
     # 首轮加复核：自查各请求一次。
     assert len(result.execs("/v1/ops/invariants")) == 2
+    assert result.state == state(invariants="invariants:P2")
 
 
 def test_invariants_503(monitor: Monitor) -> None:
     monitor.core.invariants = [error(503, "UNAVAILABLE")]
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "periodic")
+    assert_ok(result, "readyz")
     assert_fail(result, "invariants", "P2 invariants: not checked: HTTP 503")
 
 
@@ -562,7 +644,7 @@ def test_invariants_time_out(monitor: Monitor) -> None:
     monitor.timeouts = ["invariants"]
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "periodic")
+    assert_ok(result, "readyz")
     assert_fail(result, "invariants", "P2 invariants: not checked: timed out")
 
 
@@ -570,7 +652,7 @@ def test_no_monitor_token(monitor: Monitor) -> None:
     del monitor.values["CORE_MONITOR_TOKEN"]
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "periodic")
+    assert_ok(result, "readyz")
     assert_fail(
         result, "invariants", "P2 invariants: not checked: CORE_MONITOR_TOKEN is not configured"
     )
@@ -582,20 +664,27 @@ def test_recheck_clears_a_first_round_failure(monitor: Monitor) -> None:
     monitor.core.invariants = [(200, b"not json"), invariants([])]
     result = monitor.run()
     assert result.returncode == 0
-    assert_ok(result, *DIMENSIONS)
+    assert_ok(result, *CHECKS)
     assert rounds(result) == 2
     assert problem_logs(result) == []
 
 
-def test_missing_heartbeat_url_notifies_nobody(monitor: Monitor) -> None:
-    del monitor.values["CORE_HEALTHCHECK_PERIODIC_URL"]
+@pytest.mark.parametrize("missing", CHECKS)
+def test_missing_heartbeat_url_notifies_nobody(monitor: Monitor, missing: str) -> None:
+    del monitor.values[URL_KEYS[missing]]
+    monitor.core.readyz = [readyz(stale=("security-event-purge",))]
     result = monitor.run()
     assert result.returncode == 1
-    assert_ok(result, "readyz", "invariants")
-    assert "periodic" not in result.pushes
+    assert missing not in result.pushes
+    (other,) = [check for check in CHECKS if check != missing]
+    assert other in result.pushes
     (line,) = [line for line in result.logs if "will not notify anyone" in line]
-    assert line.startswith("CORE_HEALTHCHECK_PERIODIC_URL ")
+    assert line.startswith(f"{URL_KEYS[missing]} ")
     assert "http" not in line
+    # 没推的检查不改记录。
+    expected = {"readyz": "periodic:P2", "invariants": "none"}
+    expected[missing] = "none"
+    assert result.state == state(**expected)
 
 
 @pytest.mark.parametrize("containers", [[CONTAINER], []], ids=["green", "red"])
@@ -605,10 +694,11 @@ def test_unreachable_heartbeat_service_only_logs(monitor: Monitor, containers: l
     result = monitor.run()
     assert result.returncode == (0 if containers else 1)
     assert result.pushes == {}
-    for dimension in DIMENSIONS:
-        prefix = f"heartbeat for {dimension} not delivered"
+    for check in CHECKS:
+        prefix = f"heartbeat for {check} not delivered"
         assert any(line.startswith(prefix) for line in result.logs)
     assert len(problem_logs(result)) == (0 if containers else 3)
+    assert result.state == state()
 
 
 def test_env_file_missing(monitor: Monitor) -> None:
@@ -620,6 +710,7 @@ def test_env_file_missing(monitor: Monitor) -> None:
     assert "P2 invariants: not checked: CORE_MONITOR_TOKEN is not configured" in result.logs
     for key in URL_KEYS.values():
         assert any(line.startswith(f"{key} is not configured") for line in result.logs)
+    assert result.state == state()
 
 
 def test_default_env_is_the_checkout_root(monitor: Monitor, tmp_path: Path) -> None:
@@ -634,31 +725,319 @@ def test_default_env_is_the_checkout_root(monitor: Monitor, tmp_path: Path) -> N
     (checkout / "deploy" / ".env").write_text(decoy)
     result = monitor.run(script=script, cwd=monitor.home, override=False)
     assert result.returncode == 0
-    assert_ok(result, *DIMENSIONS)
+    assert_ok(result, *CHECKS)
 
 
 def test_env_values_with_quotes_whitespace_and_repeats(monitor: Monitor) -> None:
-    urls = [monitor.values[URL_KEYS[dimension]] for dimension in DIMENSIONS]
+    urls = [monitor.values[URL_KEYS[check]] for check in CHECKS]
     monitor.env_text = "\n".join(
         [
             "# 巡检",
             f"CORE_MONITOR_TOKEN={WRONG_TOKEN}",
-            "CORE_ENV=demo",
+            "CORE_ENV=production",
             f'CORE_MONITOR_TOKEN="{TOKEN}"  ',
-            f"CORE_HEALTHCHECK_READYZ_URL='{urls[0]}'",
-            f'CORE_HEALTHCHECK_PERIODIC_URL=  "{urls[1]}"',
-            f"CORE_HEALTHCHECK_INVARIANTS_URL={urls[2]}\r",
+            f"CORE_HEALTHCHECK_READYZ_URL=  '{urls[0]}'",
+            f"CORE_HEALTHCHECK_INVARIANTS_URL={urls[1]}\r",
         ]
     )
     result = monitor.run()
     assert result.returncode == 0
-    assert_ok(result, *DIMENSIONS)
+    assert_ok(result, *CHECKS)
 
 
 def test_env_trailing_comment_is_part_of_the_value(monitor: Monitor) -> None:
     monitor.values["CORE_MONITOR_TOKEN"] = f"{TOKEN} # ops token"
     result = monitor.run()
     assert_fail(result, "invariants", "P2 invariants: not checked: HTTP 401")
+
+
+@pytest.mark.parametrize("stale", [(), ("security-event-purge",)], ids=["green", "stale"])
+def test_periodic_url_in_env_is_not_read(monitor: Monitor, stale: tuple[str, ...]) -> None:
+    # 0.20 取消的键留在 .env 里：不往它推（推到别的路径时 pushes() 即失败）。
+    monitor.values[PERIODIC_KEY] = f"{monitor.heartbeat_url}/ping/{uuid4()}"
+    monitor.core.readyz = [readyz(stale=stale)]
+    result = monitor.run()
+    assert result.returncode == (1 if stale else 0)
+    assert set(result.pushes) == set(CHECKS)
+    if stale:
+        assert_fail(result, "readyz", "P2 periodic: stale tasks: security-event-purge")
+    else:
+        assert_ok(result, "readyz")
+    assert_ok(result, "invariants")
+    assert not any(PERIODIC_KEY in line for line in result.logs)
+
+
+# 重新通知
+
+
+def test_empty_record_pushes_only_the_failure(monitor: Monitor) -> None:
+    monitor.core.readyz = [readyz(503)]
+    monitor.values["CORE_MONITOR_TOKEN"] = WRONG_TOKEN
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_fail(result, "readyz", "P1 readyz: /readyz returned HTTP 503")
+    assert_fail(result, "invariants", "P2 invariants: not checked: HTTP 401")
+    assert result.state == state("readyz:P1", "invariants:P2")
+
+
+def test_new_dimension_renotifies(monitor: Monitor) -> None:
+    # 安全事件清理 stale（P2）红着时 core_api 又出了 P1。
+    monitor.state_file.write_text(state("periodic:P2"))
+    monitor.core.readyz = [readyz(503, stale=("security-event-purge",))]
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_fail(
+        result,
+        "readyz",
+        "P1 readyz: /readyz returned HTTP 503",
+        "P2 periodic: stale tasks: security-event-purge",
+        renotify=True,
+    )
+    assert_ok(result, "invariants")
+    assert result.state == state("readyz:P1,periodic:P2")
+
+
+def test_higher_level_renotifies(monitor: Monitor) -> None:
+    monitor.state_file.write_text(state(invariants="invariants:P2"))
+    monitor.core.invariants = [invariants([balance_violation("ledger_totals", 1)])]
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_ok(result, "readyz")
+    assert_fail(
+        result,
+        "invariants",
+        "P1 invariants: violation_count=1",
+        "P1 invariants: check ledger_totals: 1",
+        "P1 invariants: ledger_totals pool_id=pool_001 sku_id=sku_001",
+        renotify=True,
+    )
+    assert result.state == state(invariants="invariants:P1")
+
+
+def test_same_problems_persist_without_renotifying(monitor: Monitor) -> None:
+    monitor.state_file.write_text(state("periodic:P2", "invariants:P2"))
+    monitor.core.readyz = [readyz(stale=("reservation-expiry",))]
+    monitor.values["CORE_MONITOR_TOKEN"] = WRONG_TOKEN
+    for _ in range(2):
+        result = monitor.run()
+        assert result.returncode == 1
+        assert_fail(result, "readyz", "P2 periodic: stale tasks: reservation-expiry")
+        assert_fail(result, "invariants", "P2 invariants: not checked: HTTP 401")
+        assert result.state == state("periodic:P2", "invariants:P2")
+
+
+def test_fewer_problems_push_only_the_failure(monitor: Monitor) -> None:
+    monitor.state_file.write_text(state("readyz:P1,periodic:P2", "invariants:P1"))
+    monitor.core.readyz = [readyz(stale=("security-event-purge",))]
+    monitor.values["CORE_MONITOR_TOKEN"] = WRONG_TOKEN
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_fail(result, "readyz", "P2 periodic: stale tasks: security-event-purge")
+    # 级别变低也不重新通知。
+    assert_fail(result, "invariants", "P2 invariants: not checked: HTTP 401")
+    assert result.state == state("periodic:P2", "invariants:P2")
+
+
+def test_all_green_clears_the_records(monitor: Monitor) -> None:
+    monitor.state_file.write_text(state("readyz:P1,periodic:P2", "invariants:P1"))
+    result = monitor.run()
+    assert result.returncode == 0
+    assert_ok(result, *CHECKS)
+    assert result.state == state()
+
+
+def test_renotify_across_rounds(monitor: Monitor) -> None:
+    stale = ("security-event-purge",)
+    stale_line = "P2 periodic: stale tasks: security-event-purge"
+
+    monitor.core.readyz = [readyz(stale=stale)]
+    result = monitor.run()
+    assert_fail(result, "readyz", stale_line)
+    assert result.state == state("periodic:P2")
+
+    monitor.core.readyz = [readyz(503, stale=stale)]
+    result = monitor.run()
+    assert_fail(result, "readyz", "P1 readyz: /readyz returned HTTP 503", stale_line, renotify=True)
+    assert result.state == state("readyz:P1,periodic:P2")
+
+    result = monitor.run()
+    assert_fail(result, "readyz", "P1 readyz: /readyz returned HTTP 503", stale_line)
+
+    monitor.core.readyz = [readyz()]
+    result = monitor.run()
+    assert result.returncode == 0
+    assert_ok(result, *CHECKS)
+    assert result.state == state()
+
+
+# 状态文件
+
+
+def test_state_file_missing(monitor: Monitor) -> None:
+    monitor.state_file.unlink()
+    monitor.core.readyz = [readyz(stale=("reservation-expiry",))]
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_fail(result, "readyz", "P2 periodic: stale tasks: reservation-expiry", renotify=True)
+    assert_ok(result, "invariants")
+    assert result.state == state("periodic:P2")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "garbage\n",
+        "\x00\xff\n",
+        "stock_core_monitor state 2\nreadyz none\ninvariants none\n",
+        f"{STATE_HEADER}\nreadyz none\ninvariants none\nperiodic none\n",
+        f"{STATE_HEADER}\n\nreadyz none\ninvariants none\n",
+    ],
+    ids=["empty", "garbage", "binary", "other-version", "unknown-line", "blank-line"],
+)
+def test_state_file_corrupt(monitor: Monitor, text: str) -> None:
+    monitor.state_file.write_text(text, encoding="latin-1")
+    monitor.core.readyz = [readyz(stale=("reservation-expiry",))]
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_fail(result, "readyz", "P2 periodic: stale tasks: reservation-expiry", renotify=True)
+    assert_ok(result, "invariants")
+    assert result.state == state("periodic:P2")
+
+
+@pytest.mark.parametrize(
+    "readyz_line",
+    [
+        "readyz readyz:P3",
+        "readyz invariants:P2",
+        "readyz periodic:P2,periodic:P2",
+        "readyz periodic:P2,",
+        "readyz unknown",
+        "readyz none\nreadyz none",
+        None,
+    ],
+    ids=["bad-level", "other-check", "repeated", "trailing-comma", "unknown", "twice", "missing"],
+)
+def test_one_entry_unreadable(monitor: Monitor, readyz_line: str | None) -> None:
+    lines = [STATE_HEADER, *([readyz_line] if readyz_line else []), "invariants none"]
+    monitor.state_file.write_text("\n".join(lines) + "\n")
+    monitor.core.readyz = [readyz(stale=("reservation-expiry",))]
+    monitor.values["CORE_MONITOR_TOKEN"] = WRONG_TOKEN
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_fail(result, "readyz", "P2 periodic: stale tasks: reservation-expiry", renotify=True)
+    assert_fail(result, "invariants", "P2 invariants: not checked: HTTP 401")
+    assert result.state == state("periodic:P2", "invariants:P2")
+
+
+@pytest.mark.parametrize("failure", ["rejected", "unreachable"])
+def test_undelivered_failure_keeps_the_record(monitor: Monitor, failure: str) -> None:
+    monitor.state_file.write_text(state("periodic:P2"))
+    monitor.core.readyz = [readyz(503, stale=("security-event-purge",))]
+    lines = (
+        "P1 readyz: /readyz returned HTTP 503",
+        "P2 periodic: stale tasks: security-event-purge",
+    )
+    if failure == "rejected":
+        monitor.reject("readyz", "fail")
+    else:
+        monitor.point_heartbeats_at(f"http://127.0.0.1:{unused_port()}")
+    result = monitor.run()
+    assert result.returncode == 1
+    if failure == "rejected":
+        assert_fail(result, "readyz", *lines, renotify=True)
+        assert_ok(result, "invariants")
+    else:
+        assert result.pushes == {}
+    assert any(
+        line.startswith("heartbeat for readyz not delivered (failure") for line in result.logs
+    )
+    assert result.state == state("periodic:P2")
+
+    # 下一轮送得到：照样重新通知，送到后才更新记录。
+    monitor.rejected.clear()
+    monitor.point_heartbeats_at(monitor.heartbeat_url)
+    result = monitor.run()
+    assert_fail(result, "readyz", *lines, renotify=True)
+    assert result.state == state("readyz:P1,periodic:P2")
+
+
+def test_undelivered_success_keeps_the_record(monitor: Monitor) -> None:
+    monitor.state_file.write_text(state(invariants="invariants:P2"))
+    monitor.reject("invariants", "ok")
+    result = monitor.run()
+    assert result.returncode == 0
+    assert result.pushes["invariants"] == [("ok", OK_BODY)]
+    assert result.state == state(invariants="invariants:P2")
+
+
+@pytest.mark.parametrize("containers", [[CONTAINER], []], ids=["green", "red"])
+def test_state_file_not_writable(monitor: Monitor, tmp_path: Path, containers: list[str]) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory\n")
+    monitor.state_file = blocker / "state"
+    monitor.containers = containers
+    result = monitor.run()
+    assert result.returncode == (0 if containers else 1)
+    # 读不出，所以不合格的检查先成功后失败；写不进去只在最后记一行。
+    if containers:
+        assert_ok(result, *CHECKS)
+        assert len(result.logs) == 1
+    else:
+        reason = "not checked: found 0 running core_api containers, expected exactly 1"
+        assert_fail(
+            result, "readyz", f"P1 readyz: {reason}", f"P2 periodic: {reason}", renotify=True
+        )
+        assert_fail(result, "invariants", f"P2 invariants: {reason}", renotify=True)
+    (line,) = [line for line in result.logs if line.startswith(NOT_WRITTEN)]
+    assert line == result.logs[-1]
+    assert result.state is None
+
+
+def test_corrupt_state_and_one_failure_delivered(monitor: Monitor) -> None:
+    monitor.state_file.write_text("garbage\n")
+    monitor.core.readyz = [readyz(stale=("reservation-expiry",))]
+    monitor.values["CORE_MONITOR_TOKEN"] = WRONG_TOKEN
+    monitor.reject("invariants", "fail")
+    stale_line = "P2 periodic: stale tasks: reservation-expiry"
+    token_line = "P2 invariants: not checked: HTTP 401"
+    result = monitor.run()
+    assert result.returncode == 1
+    assert_fail(result, "readyz", stale_line, renotify=True)
+    assert_fail(result, "invariants", token_line, renotify=True)
+    assert result.state == state("periodic:P2", "unknown")
+
+    # 记为未知的检查下一轮照样按读不出处理。
+    monitor.rejected.clear()
+    result = monitor.run()
+    assert_fail(result, "readyz", stale_line)
+    assert_fail(result, "invariants", token_line, renotify=True)
+    assert result.state == state("periodic:P2", "invariants:P2")
+
+
+@pytest.mark.parametrize("xdg", [True, False], ids=["xdg-state-home", "home"])
+def test_default_state_location(monitor: Monitor, tmp_path: Path, xdg: bool) -> None:
+    monitor.state_override = False
+    if xdg:
+        monitor.extra_env["XDG_STATE_HOME"] = str(tmp_path / "xdg")
+        base = tmp_path / "xdg"
+    else:
+        base = monitor.home / ".local" / "state"
+    monitor.state_file = base / "stock_core_monitor" / "state"
+    monitor.core.readyz = [readyz(stale=("reservation-expiry",))]
+    result = monitor.run()
+    assert result.returncode == 1
+    # 第一次跑时还没有状态文件：先成功后失败。
+    assert_fail(result, "readyz", "P2 periodic: stale tasks: reservation-expiry", renotify=True)
+    assert result.state == state("periodic:P2")
+    directory = monitor.state_file.parent
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(monitor.state_file.stat().st_mode) == 0o600
+    assert sorted(path.name for path in directory.iterdir()) == ["state"]
+    assert not (ROOT / "stock_core_monitor").exists()
+
+    result = monitor.run()
+    assert_fail(result, "readyz", "P2 periodic: stale tasks: reservation-expiry")
 
 
 # 静态检查
@@ -681,6 +1060,19 @@ def test_cron_file() -> None:
     assert entries == [
         ["*/5", "*", "*", "*", "*", "<RUN_AS_USER>", "bash", "<CHECKOUT_DIR>/deploy/monitor.sh"]
     ]
+    assert "只装在生产实例的检出上" in text
+
+
+def test_runbook_names_two_production_checks_and_three_keys() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert set(re.findall(r"stock_core production (\w+)", text)) == {"readyz", "invariants"}
+    assert not re.search(r"stock_core demo \w", text)
+    assert set(re.findall(r"CORE_HEALTHCHECK_\w+", text)) == set(URL_KEYS.values())
+    env_section = text.split("## 3.", 1)[1].split("## 4.", 1)[0]
+    env_lines = re.findall(r"^(CORE_\w+)=", env_section, re.MULTILINE)
+    assert env_lines == ["CORE_MONITOR_TOKEN", *URL_KEYS.values()]
+    assert "CORE_MONITOR_STATE_FILE" in text
+    assert "CORE-TASK-067" in text and "068" in text
 
 
 @pytest.mark.parametrize("path", [CRON, RUNBOOK], ids=["cron", "runbook"])
