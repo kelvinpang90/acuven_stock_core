@@ -4,7 +4,7 @@
 
 服务范围：统一 SKU、条码、基本商品名称与参考价；记录库存地点、预留、出入库与可追溯流水。`acuven_inventory` 另负责跨销售入口的库存分配、外部平台同步与对账。
 
-项目名确定为 **Acuven Stock Core**，部署边界确定为**独立常驻服务及独立持久化库**。V1 先接公开网店 Demo（独立的 Demo Core 实例），单一库存池；真实网店何时接入待定，Inventory、ERP、POS 后续接入。恢复目标：RPO≤5 分钟、RTO≤4 小时（2026-11-10 由 RPO=0 放宽）。不同套餐的装配方式见 [部署包装讨论](../acuven_hub/STOCK_CORE_DEPLOYMENT_PACKAGING_2026-10-08.md)；原方案比较见 [商品与库存关系](../acuven_hub/REVISED_PRODUCT_STOCK_ARCHITECTURE_2026-10-07.md)及[开发优先顺序](../acuven_hub/DEVELOPMENT_PRIORITY_2026-10-08.md)。
+项目名确定为 **Acuven Stock Core**，部署边界确定为**独立常驻服务及独立持久化库**。V1 先接公开网店 Demo（独立的 Demo Core 实例），单一库存池；生产实例先给 Inventory 用，由它代表 Acuven 自营的 Shopee 与 TikTok Shop 两个店（契约 0.18 草案，待批准）；真实网店何时接入待定，Inventory、ERP、POS 后续接入。恢复目标：RPO≤5 分钟、RTO≤4 小时（2026-11-10 由 RPO=0 放宽）。不同套餐的装配方式见 [部署包装讨论](../acuven_hub/STOCK_CORE_DEPLOYMENT_PACKAGING_2026-10-08.md)；原方案比较见 [商品与库存关系](../acuven_hub/REVISED_PRODUCT_STOCK_ARCHITECTURE_2026-10-07.md)及[开发优先顺序](../acuven_hub/DEVELOPMENT_PRIORITY_2026-10-08.md)。
 
 ## 阶段 1 设计文档（2026-11-10，契约已由 Kelvin 批准）
 
