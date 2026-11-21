@@ -189,11 +189,11 @@ Kelvin 2026-11-21 批准 Inventory 最小 V1 设计时，按建议答复了其�
 
 ### 1.17 心跳检查的范围（Kelvin，2026-11-21）
 
-给生产实例与 W7a 做设计时提出（[PRODUCTION_AND_RECOVERY.md](PRODUCTION_AND_RECOVERY.md) 的 P-03）；条文写进契约 0.20（第 14 节第 101–102 条），**条文待 Kelvin 批准**。
+给生产实例与 W7a 做设计时提出（[PRODUCTION_AND_RECOVERY.md](PRODUCTION_AND_RECOVERY.md) 的 P-03）；条文写进契约 0.20（第 14 节第 101–102 条），Kelvin 2026-11-21 批准。
 
 | 编号 | 问题 | 答复 |
 | --- | --- | --- |
-| Q-79 | 生产实例 3 个、binlog 传输 1 个、每晚备份 1 个，共要 5 个心跳检查，免费档只剩 3 个 | **继续用免费档，只用这 3 个**（Kelvin 2026-11-21 定）：生产 `readyz`（并入 `periodic`）、生产 `invariants`、`infra_mysql backup`（binlog 与每晚备份，同一个脚本推）；Demo 实例不推心跳。合用的检查加“重新通知”，免得 P2 长时间红着遮住 P1（审查时补上，读不出状态文件时也重新通知；条文随 0.20 待批准）。未选：升级付费档 |
+| Q-79 | 生产实例 3 个、binlog 传输 1 个、每晚备份 1 个，共要 5 个心跳检查，免费档只剩 3 个 | **继续用免费档，只用这 3 个**（Kelvin 2026-11-21 定）：生产 `readyz`（并入 `periodic`）、生产 `invariants`、`infra_mysql backup`（binlog 与每晚备份，同一个脚本推）；Demo 实例不推心跳。合用的检查加“重新通知”，免得 P2 长时间红着遮住 P1（审查时补上，读不出状态文件时也重新通知；条文随 0.20 批准）。未选：升级付费档 |
 
 ## 二、仍未定
 
