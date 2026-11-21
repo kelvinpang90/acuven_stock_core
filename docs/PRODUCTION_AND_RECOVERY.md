@@ -75,7 +75,7 @@ Demo 实例不变（它本来就是演示数据）。
      - 放在哪：检出目录之外的固定目录，权限 600，脚本只保留最近 5 份；
      - 失败怎么办：以失败结束，什么也不改（D3）。
      这是有意的耦合：依赖 infra_mysql 的容器名与环境变量名，与 `vps_infra/backup/` 同一做法，部署用户本来就有 docker 权限，没有新增权限；
-   - 超时预算：生产库很小，备份按 1 分钟上限算。`deploy.yml` 的 `command_timeout` 与 job 超时随之重算，写进 067。
+   - 超时预算：生产库很小，备份按 1 分钟上限算。`deploy.yml` 的 `command_timeout` 与 job 超时随之重算，写进 068。
 4. **`deploy/healthcheck.sh` 与 `deploy/monitor.sh`**（后者由 CORE-TASK-065 新建、066 改为契约 0.20）：都 `source deploy/instance.sh`，经它找本实例的容器；找不到或不止一个就算没查成。
 5. **`.github/workflows/deploy.yml`**：
    - **输入**：手工触发多一个输入 `instance`（`type: choice`，`demo` / `production`，默认 `demo`）。推送触发的部署只部署 Demo，D1–D5 与 `on:` 的形状约束不变；
@@ -210,7 +210,7 @@ Demo 实例不变（它本来就是演示数据）。
 
 | 拟编号 | 标题（草拟） | 内容 | 依赖 | 预审 |
 | --- | --- | --- | --- | --- |
-| CORE-TASK-066 | 巡检脚本改为契约 0.20：只给生产推两个检查并加重新通知 | 改 CORE-TASK-065 已合并的 `deploy/monitor.sh`、`deploy/monitor.cron`、`docs/OPS_MONITORING.md` 与 `tests/integration/test_monitor_script.py`：`readyz` 并入 `periodic`、去掉 `CORE_HEALTHCHECK_PERIODIC_URL`、重新通知与状态文件（默认位置与全绿时是否清空在登记时定）、Demo 不装；验收照契约 0.20 §8.5 | CORE-TASK-065（已完成） | 要跑：改告警的判定与状态，按保守处理 |
+| CORE-TASK-066 | 巡检脚本改为契约 0.20：只给生产推两个检查并加重新通知 | 改 CORE-TASK-065 已合并的 `deploy/monitor.sh`、`deploy/monitor.cron`、`docs/OPS_MONITORING.md` 与 `tests/integration/test_monitor_script.py`：`readyz` 并入 `periodic`、去掉 `CORE_HEALTHCHECK_PERIODIC_URL`、重新通知与状态文件（默认位置与全绿时是否清空在登记时定）、Demo 不装；验收照契约 0.20 §8.5 | CORE-TASK-065（已完成） | 要跑：改告警的判定与状态，按保守处理。登记时注明：装到生产要等 067、068（之前巡检只找得到 Demo 的容器） |
 | CORE-TASK-067 | 部署与巡检脚本按 CORE_ENV 区分实例，生产迁移前先备份本库 | 第 1.2 节第 1–4 条。改 `monitor.sh` 时同步它的测试。给 `deploy.sh`、`healthcheck.sh` 补假 docker 的场景测试：`CORE_ENV` 缺失或写错就失败、只找本实例的容器、不经实例片段的 compose 调用报错、生产迁移前备份失败则什么也不改 | 066 | 要跑：改部署脚本与数据安全相关的步骤，CLAUDE.md 没列这一类，按保守处理 |
 | CORE-TASK-068 | 部署工作流手工触发时可选生产实例 | 第 1.2 节第 5 条，含超时预算重算 | 067 | 要跑：同上，改部署工作流 |
 | CORE-TASK-069 | 新增生产实例运行手册：上线、升级界线、整机恢复与演练 | 第 1.2 节第 6 条、第 1.3、1.4 节、第 2.4、2.5 节 | 067、068 | 不适用：只改文档 |
