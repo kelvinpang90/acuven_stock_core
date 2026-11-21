@@ -26,11 +26,17 @@
 
 <!-- openclaw:planning-v1:begin -->
 ### 当前计划
+1. `CORE-TASK-066` 巡检脚本改为契约 0.20：只给生产推两个检查，检查已红时出现新问题就重新通知
+2. `CORE-TASK-067` 部署与巡检脚本按 CORE_ENV 区分实例，生产迁移前先备份本库
+3. `CORE-TASK-068` 部署工作流手工触发时可选生产实例
+4. `CORE-TASK-069` 新增生产实例运行手册：首次上线、升级与回滚界线、整机恢复与演练
 
 ### 已阻塞
 
 ### 后续计划
-- 待登记：binlog 异地传输、每日全量备份与整机恢复演练（涉及 vps_infra）
+- 待登记：vps_infra 每 4 分钟把 binlog 传到 R2，每晚备份写成功标记，由上传脚本推 infra_mysql backup 检查
+- 待登记：vps_infra 每晚加一份时间点恢复用的单快照全量导出，补时间点恢复与误操作恢复的说明
+- 待登记：vps_infra 建生产 Core 专用数据网络，钉住 binlog 格式，R2 防误删，把 Core 生产实例加进部署串行化名单
 <!-- openclaw:planning-v1:end -->
 
 ---

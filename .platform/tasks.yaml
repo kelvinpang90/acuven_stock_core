@@ -2775,3 +2775,147 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+
+  - id: CORE-TASK-066
+    title: 巡检脚本改为契约 0.20：只给生产推两个检查，检查已红时出现新问题就重新通知
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.20 的 8.5 与设计 docs/PRODUCTION_AND_RECOVERY.md 0.5 的第 2.6、3 节，把 CORE-TASK-065 按 0.18 交付的巡检改成两个检查并加重新通知。判据、级别、各步限时、45 秒复核、没查成的原因、通知正文的内容与不写的内容、系统日志、推心跳失败只记日志、不加 flock，都照 065 现有的做法不变。
+      一，两个检查：readyz 与 periodic 两个维度合用 readyz 那个检查，任一不合格即推失败，正文照旧一行一个问题、以级别开头，两个维度的问题都写；invariants 单独一个检查。
+      二，配置：从 .env 只读三个键 CORE_MONITOR_TOKEN、CORE_HEALTHCHECK_READYZ_URL、CORE_HEALTHCHECK_INVARIANTS_URL，按 065 的按行规则解析；不再读 CORE_HEALTHCHECK_PERIODIC_URL（0.20 取消，.env 里留着也不读）。
+      三，重新通知与状态文件：状态文件按检查分别记上一次推送成功的失败里带的问题（维度加级别，P1 高于 P2）。默认位置在检出目录之外：运行账号的 XDG 状态目录（XDG_STATE_HOME，未设时为家目录下的 .local/state）里的 stock_core_monitor/state，可用环境变量 CORE_MONITOR_STATE_FILE 覆盖；目录不存在时建成只有运行账号可读写，写入先写同目录的临时文件再改名。
+      每个检查每轮：合格时推成功，推送成功后把这个检查的记录清空（全绿即清空）；不合格且记录为空时推失败；不合格且记录不空、而本轮有记录里没有的维度或某个维度的级别比记录里高时，先推一次成功、紧接着推失败；不合格且问题与记录相同或更少时只推失败、不重复通知。
+      状态文件不存在、读不出或内容不合格式时，本轮只要这个检查不合格就先推成功、再推失败。只有失败那一推送成功之后才把记录更新为本轮的问题；任何一推没推成就不改这个检查的记录。状态文件不存在、读不出、整份不合格式，或只有某个检查的那一项不合格式，都按这个检查读不出处理：本轮这个检查没推成时，在重写的文件里把它记为未知，下一轮对它照样按读不出处理（不合格就先成功后失败），不记为空。状态文件写不进去只记一行日志，不改变本轮结论与退出码。
+      退出码：全部合格且两个心跳地址都配了为 0，否则为 1。限时照 8.5：每次推心跳 10 秒，重新通知时多推一次。
+      四，deploy/monitor.cron 照旧，注释改成只装在生产实例的检出上。docs/OPS_MONITORING.md 改为只对生产实例：在现有的心跳服务账号里建两个检查 stock_core production readyz、stock_core production invariants（周期 5 分钟、宽限 15 分钟，接 Telegram；第 3 个位置留给 vps_infra 的 infra_mysql backup，由那边建），.env 只写三个键，Demo 不装 cron、不签巡检令牌；
+      写明重新通知会多一条恢复通知、状态文件的默认位置与覆盖方法；只有 P2 红着时当天清掉（生产重启 core_api，不等下次部署）；演练改为两个检查；如果服务器上已照 065 的手册给 Demo 装了 cron 与三个检查，066 合并后撤掉 cron、删掉三个检查。
+      手册开头写明：装到生产要等 CORE-TASK-067、068 合并（在那之前巡检只找得到 Demo 的容器，生产实例也还不能部署）。可以写系统标准目录，不写本项目在服务器上的检出目录、账号名、主机名与地址。
+      明确不做：按 CORE_ENV 区分实例与经实例片段找容器（CORE-TASK-067）；改应用代码、部署脚本、工作流、CI；改 .env.example（由登记 PR 写）。
+    status: ready
+    depends_on:
+      - CORE-TASK-065
+    acceptance_criteria:
+      - 只改 deploy/monitor.sh、deploy/monitor.cron、docs/OPS_MONITORING.md 与 tests/integration/test_monitor_script.py；脚本仍通过测试里的 shellcheck；已有的测试照常通过
+      - 测试沿用 065 的做法（假 docker 与 logger、本机回环上记录请求的假心跳服务、复核秒数设为 0），状态文件用临时目录里的路径经 CORE_MONITOR_STATE_FILE 指定；每个场景核对推到哪个检查、依次推了成功还是失败、请求体、退出码与状态文件的内容，并核对日志、请求体与假 docker 收到的参数里没有令牌原文与心跳地址
+      - 065 已有的各个场景改成两个检查后照样通过，含就绪检查超时（readyz 那个检查推失败，正文里 readyz 为 P1、periodic 为没查成的 P2）与就绪检查 503；.env 里另有 CORE_HEALTHCHECK_PERIODIC_URL 时不往它推
+      - 场景覆盖：readyz 合格而 periodic 为 stale 时推 readyz 那个检查失败；两个维度同一轮都不合格时正文两行都在；复核时只剩一个不合格时正文只有剩下的那个
+      - 场景覆盖重新通知：记录为空时不合格只推一次失败；记录里只有 periodic 的 P2、本轮出现 readyz 的 P1 时先推成功、再推失败并更新记录；invariants 记录为 P2、本轮为 P1 时同样重新通知；同样的问题持续时只推失败、不推成功；问题变少时只推失败、记录更新为剩下的问题；全绿时推成功并清空记录
+      - 场景覆盖状态文件：不存在、内容损坏时本轮不合格的检查先成功后失败，合格的只推成功；失败那一推没推成（假心跳服务对它回错或连不上）时记录不变、下一轮照样重新通知；状态文件写不进去时只记日志，结论与退出码不变；状态文件损坏且本轮只有一个检查的失败推成功时，另一个检查记为未知、下一轮对它照样先成功后失败；没设覆盖时写到 XDG 状态目录下（测试里把 XDG_STATE_HOME 指到临时目录）
+      - 某个检查没配心跳地址时记一行不会通知任何人（只写键名）并以非 0 退出；运行手册与 cron 文件里没有主机名、地址与本项目在服务器上的检出目录，手册只写两个生产检查与三个键
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；脚本测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - deploy/monitor.sh
+      - deploy/monitor.cron
+      - docs/OPS_MONITORING.md
+      - tests/integration/test_monitor_script.py
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-067
+    title: 部署与巡检脚本按 CORE_ENV 区分实例，生产迁移前先备份本库
+    purpose: >-
+      按设计 docs/PRODUCTION_AND_RECOVERY.md 0.5 的第 1.1 节与第 1.2 节第 1 到 4 条，让同一台服务器上能跑 Demo 与生产两个实例，实例只由检出目录 .env 里的 CORE_ENV 决定。
+      一，新文件 deploy/instance.sh，被其他脚本 source，source 时只定义变量与函数，不因配置不对而退出调用方，由调用方决定怎么失败。按本文件所在检出的根目录找 .env（与当前目录无关），只读 CORE_ENV 一个键、不 source 整个文件：
+      恰好一行以 CORE_ENV= 开头，等号之后整行严格等于 demo 或 production（不去空格、不认引号与行尾注释）；没有这一行、多于一行或别的值一律失败。
+      由它给出两个实例的具体值：compose 项目名 acuven_stock_core 与 acuven_stock_core_production；调用方内部网络 stock_core_net 与 stock_core_production_net，Core 在上面的别名 core_api 与 stock_core_production；数据网络 data_net 与 infra_mysql_core_production_net。
+      另提供找本实例 core_api 容器的函数：按 compose 项目标签与服务标签找、排除一次性容器，再核对标签 com.docker.compose.project.working_dir 与本检出的根目录相同（两边都先 realpath）；函数按行输出找到的容器 ID，由调用方计数、不是恰好一个就算没找到；函数里的 docker 调用自带限时（找容器 10 秒），docker ps 失败与超时用不同的返回码区分，巡检据此写出没查成的原因（容器数不对、超时）。不另设 COMPOSE_PROJECT_NAME、网络名之类的 .env 键。
+      二，docker-compose.yml：去掉固定的 name，网络名与别名写成必填变量、不给默认值，由 instance.sh 导出；两个实例都恰好挂一条数据网络和一条调用方内部网络，生产不挂 data_net。用变量表达即可，不新增覆盖文件。不经 instance.sh 的 compose 调用因变量缺失直接报错。
+      三，deploy/deploy.sh：先 source instance.sh，失败即退出、什么也不碰；之后所有 compose 调用一律带 -p 本实例的项目名；调用方内部网络照旧不存在才建，用实例给的名字；生产的数据网络不存在就失败、什么也不改，不自己建；主机锁里写的持锁方带实例名（stock_core demo 或 stock_core production）；
+      清旧镜像仍按 acuven.project=stock_core 标签、只在成功路径换完容器之后跑。
+      四，生产实例在拉镜像之后、迁移之前备份本库：经 docker exec 进 infra_mysql 容器，用它环境变量里的 root 密码跑 mysqldump：密码在容器里的 shell 中经环境变量 MYSQL_PWD 传给 mysqldump，不用 -p，不出现在 docker 与 mysqldump 的命令行参数和日志里，参数 --single-transaction --no-tablespaces --set-gtid-purged=OFF --databases 加库名，不加 --source-data；
+      库名从 .env 的 CORE_DATABASE_URL 按与 CORE_ENV 相同的读法取出（先在第一个问号处截断，再取最后一个斜杠之后的部分），只接受字母、数字与下划线，否则失败；整次备份限时 60 秒。
+      导出先写到同目录的临时文件，末尾含 Dump completed 才改名为正式文件，否则删掉临时文件、以失败结束、什么也不改。正式文件名为 UTC 时间（年月日 T 时分秒 Z，例如 20261121T083000Z）加连字符加完整 SHA 加 .sql；只保留最近 5 份时只数符合这个文件名的文件，按文件名排序删最旧的，临时文件与别的文件不算也不删。备份目录在检出目录之外：部署账号的 XDG 状态目录（XDG_STATE_HOME，未设时为家目录下的 .local/state）里的 stock_core_production/pre_migration，可用环境变量 CORE_BACKUP_DIR 覆盖；目录权限 700、文件 600，只保留最近 5 份。Demo 不备份。
+      五，deploy/healthcheck.sh 与 deploy/monitor.sh 都 source instance.sh、经它找本实例的容器；monitor.sh 在实例片段报错时按找不到容器处理（readyz 没查成，原因为容器数不对），另写一行系统日志说明 CORE_ENV 不对。docs/OPS_MONITORING.md 与 README.md 里找容器的命令改为经 instance.sh 的函数（README 只改这一段与它的说明）；OPS_MONITORING.md 里用到 docker compose 的命令（例如查容器状态的 docker compose ps）改为带 instance.sh 给出的项目名与变量。
+      六，.github/workflows/ci.yml 只改两步：compose 文件可解析那一步补上 instance.sh 导出的变量（取 Demo 的值），shellcheck 那一步加上 deploy/instance.sh 与 deploy/monitor.sh 并能跟进 source。
+      明确不做：部署工作流（CORE-TASK-068）；生产运行手册（CORE-TASK-069）；改应用代码与迁移；建生产库、生产检出或网络（由人与 vps_infra 做）。
+      预计改动约 900 行（脚本约 250、测试约 600）；接近约 1500 行时把生产迁移前备份拆成单独的任务。
+    status: ready
+    depends_on:
+      - CORE-TASK-066
+    acceptance_criteria:
+      - 新增 deploy/instance.sh 与 tests/integration/test_deploy_scripts.py；只改 allowed_change_paths 里的其余文件，ci.yml 只改 compose 解析与 shellcheck 两步；已有的测试与 CI 各步照常通过
+      - 测试用 bash 跑脚本，在 PATH 里放假的 docker（记下收到的参数，按场景给出容器列表与输出，按标签过滤），.env 与检出目录放在临时目录里搭的假检出中，主机锁用 ACUVEN_DEPLOY_LOCK 指到临时文件
+      - instance.sh 的场景：demo 与 production 各给出上面的项目名、网络名与别名；CORE_ENV 缺失、写错、带引号、带空格、带行尾注释、出现两行时都失败；找容器时只认 working_dir 标签与本检出相同的那一个，别的检出的容器、一次性容器不算，有两个时算没找到
+      - deploy.sh 的场景：CORE_ENV 不对时以失败结束且没有任何 docker 调用；每个 compose 调用都带 -p 本实例的项目名；持锁方文字带实例名；生产的数据网络不存在时失败且没有拉镜像、迁移、换容器；Demo 不备份
+      - 生产备份的场景：备份在迁移之前；mysqldump 的参数如上、密码经 MYSQL_PWD 传、假 docker 收到的参数里没有密码与 -p；导出不以 Dump completed 结尾或 docker exec 失败时以失败结束、没有迁移与换容器、不留下临时文件；成功时文件权限 600、目录 700，已有 5 份时删掉最旧的一份；CORE_DATABASE_URL 的库名按先截问号再取最后一个斜杠取出（查询串里带斜杠时也取对），不合格时失败
+      - healthcheck.sh 与 monitor.sh 只找本实例检出的容器；monitor.sh 在 CORE_ENV 不对时推 readyz 那个检查失败（没查成、容器数不对）并以非 0 退出；现有巡检测试改为把 monitor.sh 与 instance.sh 一起拷进假检出、假 docker 给出 working_dir 标签，066 的巡检场景照样通过；healthcheck.sh 找不到容器的场景用假的 sleep，不真等
+      - 测试对 docker-compose.yml 跑 docker compose config：不设实例变量时报错；按 demo 与 production 的值各解析出上面的网络与别名，生产没有 data_net；测试对 deploy 目录下的四个脚本跑 shellcheck 并要求零退出（没有 shellcheck 或 docker 时测试失败而不是跳过）
+      - 改动只落在 allowed_change_paths；不改 .platform/、部署工作流；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；脚本测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - deploy/instance.sh
+      - deploy/deploy.sh
+      - deploy/healthcheck.sh
+      - deploy/monitor.sh
+      - docker-compose.yml
+      - docs/OPS_MONITORING.md
+      - README.md
+      - .github/workflows/ci.yml
+      - tests/integration/test_deploy_scripts.py
+      - tests/integration/test_monitor_script.py
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-068
+    title: 部署工作流手工触发时可选生产实例
+    purpose: >-
+      按设计 docs/PRODUCTION_AND_RECOVERY.md 0.5 的第 1.2 节第 5 条与第 3 条末项的超时预算，让生产实例由人手工触发同一个部署工作流升级：选生产、填 SHA。推送触发的部署只部署 Demo，D1 到 D5 与 on 的形状约束（文件里的注释）不变。
+      一，workflow_dispatch 加输入 instance（type choice，demo 与 production，默认 demo）；推送触发时按 demo。
+      二，目录：在 shell 里解析，demo 用 secret VPS_APP_DIR，production 用新 secret VPS_APP_DIR_PRODUCTION，为空就以失败结束；不用 a && b || c 这类会静默回落的表达式；部署与上线后健康检查两步用同一个解析出的目录（例如由一个解析步骤输出，或两步用同一段解析）。输入只经 env 进 shell，不直接拼进脚本。
+      三，拒绝旧 SHA：选了生产时，远端在 git fetch 之后、git checkout 之前，用 git merge-base --is-ancestor 核对 CORE-TASK-067 在 main 上的合并提交（实施时从 main 的历史查出，写成完整 40 位 SHA）是要部署的 SHA 的祖先；不是就以失败结束，不动检出。Demo 不做这项核对。
+      四，并发组按实例分开：deploy- 加 inputs.instance，没有时为 demo；cancel-in-progress 仍为 false。跨实例的串行交给主机部署锁。
+      五，超时：生产部署在迁移前多一次最多 60 秒的备份，SSH 的 command_timeout 与 deploy job 的 timeout-minutes 随之重算，注释写明算式；两个 job 的 timeout-minutes 合计仍不超过 30 分钟（D5）。
+      六，文件头生产实例等真实网店定了再加那句改为现在的说法：推送部署 Demo、生产由人手工触发。
+      明确不做：改部署脚本（CORE-TASK-067）；运行手册（CORE-TASK-069）；在 GitHub 上加 secret（由人做）；需要人工批准的 environment。
+    status: ready
+    depends_on:
+      - CORE-TASK-067
+    acceptance_criteria:
+      - 只改 .github/workflows/deploy.yml；on 下仍只有 push 与 workflow_dispatch，push 的 branches 与 paths-ignore 逐字不变，没有锚点、别名、合并键、重复键
+      - workflow_dispatch 有 ref 与 instance 两个输入，instance 为 choice、选项 demo 与 production、默认 demo；推送触发的运行按 demo 部署、用 VPS_APP_DIR
+      - 选 production 而 VPS_APP_DIR_PRODUCTION 为空时以失败结束；目录解析没有 a && b || c 形式的回落；部署与上线后健康检查用同一个解析出的目录；instance 与 ref 只经 env 进 shell
+      - 选 production 时远端脚本在 git fetch 之后、git checkout 之前用 git merge-base --is-ancestor 核对 CORE-TASK-067 的合并提交（完整 40 位 SHA，PR 正文写明怎么查出的），不满足即退出且不执行 checkout
+      - concurrency 的 group 按实例区分、cancel-in-progress 为 false；两个 job 的 timeout-minutes 合计不超过 30，command_timeout 与 job 超时的算式写在注释里且包含迁移前备份的 60 秒
+      - 文件里不写主机名、IP、域名、路径与密钥，连接信息仍只来自 secrets；没有 continue-on-error
+      - 改动只落在 allowed_change_paths；不改 .platform/、部署脚本；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；PR 的必需 CI 检查 unit 与 integration 通过
+    allowed_change_paths:
+      - .github/workflows/deploy.yml
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-069
+    title: 新增生产实例运行手册：首次上线、升级与回滚界线、整机恢复与演练
+    purpose: >-
+      按设计 docs/PRODUCTION_AND_RECOVERY.md 0.5 的第 1.2 节第 6 条，新建 docs/PRODUCTION_RUNBOOK.md，把第 1.3 节首次上线、第 1.4 节升级与回滚的界线、第 2.4 节整机恢复与误操作恢复、第 2.5 节演练写成可以照着做的步骤与命令，末尾留演练记录一节（日期、执行人、各步用时、丢失窗口、发现的问题）。
+      照设计写，不改设计内容：首次上线的六步（建生产库与账号、vps_infra 建专用数据网络、生产检出与 .env、手工触发部署选生产、经 instance.sh 找容器开通与签发、真实期初之前的四项核对）；
+      升级前列出两个 SHA 之间的迁移并按先加后删核对、没有 Demo 部署在跑时才触发、回滚只能回到上一个好的 SHA 且不早于实例片段进库的提交；
+      整机恢复的九步，含两个实例的库各把 catalog_changes 的自增起点调到最大 id 加 1000000（表为空按 0）且调完不能再重放 binlog、开放写入前先做一次全量导出、令牌丢了在原凭据下重新签发、用最后一次成功的生产手工部署的 SHA；误操作恢复在临时实例上用停止位置或停止时间、mysqlbinlog 设 TZ 为 UTC；
+      演练在另一台机器上做、用标记表量丢失窗口、演练机不改 DNS、不装 cron、不填心跳地址、外发凭据换假值、读 R2 用只读令牌；核对项照第 2.5 节。
+      巡检的装法仍在 docs/OPS_MONITORING.md，手册里只链过去；vps_infra 那边的步骤写成指向 vps_infra 的说明，不抄它的脚本。
+      命令里服务器上的目录、账号、主机名、库名与地址一律用占位符；密钥只写从密码管理器取回，不写值。
+      明确不做：改脚本、工作流、契约与设计；vps_infra 的改动。
+    status: ready
+    depends_on:
+      - CORE-TASK-067
+      - CORE-TASK-068
+    acceptance_criteria:
+      - 只新增 docs/PRODUCTION_RUNBOOK.md，不改别的文件
+      - 手册覆盖设计第 1.3 节的六步、第 1.4 节的三条界线、第 2.4 节的九步与误操作恢复、第 2.5 节的演练做法与核对项，并有演练记录一节；与设计有出入的地方以设计为准，不另立规则
+      - 找容器、开通与签发的命令经 deploy/instance.sh 的函数，不用 docker compose exec 或 run；生产部署写成手工触发部署工作流、选生产、填 SHA；巡检只链到 docs/OPS_MONITORING.md
+      - 整机恢复写明 catalog_changes 自增起点的调法与 SHOW CREATE TABLE 核对，以及调完之后不能再重放 binlog；令牌丢了在原凭据下重新签发、不换新凭据
+      - 手册里没有服务器上的真实目录、账号名、主机名、IP、域名、地址与任何密钥值，都用占位符
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；PR 的必需 CI 检查 unit 与 integration 通过
+    allowed_change_paths:
+      - docs/PRODUCTION_RUNBOOK.md
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
