@@ -2866,7 +2866,7 @@ tasks:
       按设计 docs/PRODUCTION_AND_RECOVERY.md 0.5 的第 1.2 节第 5 条与第 3 条末项的超时预算，让生产实例由人手工触发同一个部署工作流升级：选生产、填 SHA。推送触发的部署只部署 Demo，D1 到 D5 与 on 的形状约束（文件里的注释）不变。
       一，workflow_dispatch 加输入 instance（type choice，demo 与 production，默认 demo）；推送触发时按 demo。
       二，目录：在 shell 里解析，demo 用 secret VPS_APP_DIR，production 用新 secret VPS_APP_DIR_PRODUCTION，为空就以失败结束；不用 a && b || c 这类会静默回落的表达式；部署与上线后健康检查两步用同一个解析出的目录（例如由一个解析步骤输出，或两步用同一段解析）。输入只经 env 进 shell，不直接拼进脚本。
-      三，拒绝旧 SHA：选了生产时，远端在 git fetch 之后、git checkout 之前，用 git merge-base --is-ancestor 核对 CORE-TASK-067 在 main 上的合并提交（实施时从 main 的历史查出，写成完整 40 位 SHA）是要部署的 SHA 的祖先；不是就以失败结束，不动检出。Demo 不做这项核对。
+      三，拒绝旧 SHA：选了生产时，远端在 git fetch 之后、git checkout 之前，用 git merge-base --is-ancestor 核对 CORE-TASK-067 在 main 上的合并提交 ab482a47b91da88c7bd98205d5156a511f8f2e7e 是要部署的 SHA 的祖先（067 是 squash 合并，这是它在 main 上的那个提交；登记时用 git log 沿 main 的 first-parent 历史按 CORE-TASK-067 查出，Worker 沙箱里查不了 git，照写即可）；不是就以失败结束，不动检出。Demo 不做这项核对。
       四，并发组按实例分开：deploy- 加 inputs.instance，没有时为 demo；cancel-in-progress 仍为 false。跨实例的串行交给主机部署锁。
       五，超时：生产部署在迁移前多一次最多 60 秒的备份，SSH 的 command_timeout 与 deploy job 的 timeout-minutes 随之重算，注释写明算式；两个 job 的 timeout-minutes 合计仍不超过 30 分钟（D5）。
       六，文件头生产实例等真实网店定了再加那句改为现在的说法：推送部署 Demo、生产由人手工触发。
@@ -2878,7 +2878,7 @@ tasks:
       - 只改 .github/workflows/deploy.yml；on 下仍只有 push 与 workflow_dispatch，push 的 branches 与 paths-ignore 逐字不变，没有锚点、别名、合并键、重复键
       - workflow_dispatch 有 ref 与 instance 两个输入，instance 为 choice、选项 demo 与 production、默认 demo；推送触发的运行按 demo 部署、用 VPS_APP_DIR
       - 选 production 而 VPS_APP_DIR_PRODUCTION 为空时以失败结束；目录解析没有 a && b || c 形式的回落；部署与上线后健康检查用同一个解析出的目录；instance 与 ref 只经 env 进 shell
-      - 选 production 时远端脚本在 git fetch 之后、git checkout 之前用 git merge-base --is-ancestor 核对 CORE-TASK-067 的合并提交（完整 40 位 SHA，PR 正文写明怎么查出的），不满足即退出且不执行 checkout
+      - 选 production 时远端脚本在 git fetch 之后、git checkout 之前用 git merge-base --is-ancestor 核对 CORE-TASK-067 的合并提交 ab482a47b91da88c7bd98205d5156a511f8f2e7e（文件里逐字写这 40 位，PR 正文注明取自任务登记），不满足即退出且不执行 checkout
       - concurrency 的 group 按实例区分、cancel-in-progress 为 false；两个 job 的 timeout-minutes 合计不超过 30，command_timeout 与 job 超时的算式写在注释里且包含迁移前备份的 60 秒
       - 文件里不写主机名、IP、域名、路径与密钥，连接信息仍只来自 secrets；没有 continue-on-error
       - 改动只落在 allowed_change_paths；不改 .platform/、部署脚本；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；PR 的必需 CI 检查 unit 与 integration 通过
