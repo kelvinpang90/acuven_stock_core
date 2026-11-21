@@ -2,6 +2,7 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import NoReturn
 
 from fastapi import FastAPI
@@ -25,11 +26,13 @@ from app.api import (
     stock_imports,
     stock_queries,
 )
+from app.api.catalog import format_timestamp
 from app.api.errors import install_error_handlers
 from app.api.requests import RequestMiddleware
 from app.config import Settings
 from app.db import make_engine
 from app.domain.environment import DEMO, health_payload
+from app.domain.periodic import periodic_status
 from app.services.instance import instance_check_error
 from app.services.periodic import PeriodicTask
 from app.services.reservations import sweep_expired_reservations
@@ -57,6 +60,10 @@ def _close_expired_reservations(engine: Engine) -> None:
     sweep_expired_reservations(engine)
 
 
+def _optional_timestamp(value: datetime | None) -> str | None:
+    return None if value is None else format_timestamp(value)
+
+
 def _refuse_to_start(reason: str) -> NoReturn:
     """启动核对没过（契约 6.1）：标准错误写一行原因，进程以非 0 退出。
 
@@ -82,27 +89,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 有效期只在启动时读，进程日志记下当前值（契约 5.6）。
     _log.info("reservation ttl: %d seconds", settings.reservation_ttl_seconds)
 
+    def make_periodic_tasks() -> dict[str, PeriodicTask]:
+        return {
+            SECURITY_EVENT_PURGE: PeriodicTask(
+                SECURITY_EVENT_PURGE, lambda: _purge_security_events(engine)
+            ),
+            RESERVATION_EXPIRY: PeriodicTask(
+                RESERVATION_EXPIRY,
+                lambda: _close_expired_reservations(engine),
+                interval=RESERVATION_EXPIRY_INTERVAL,
+                first_delay=RESERVATION_EXPIRY_INTERVAL,
+            ),
+        }
+
+    # 任务在这里就建好：没进入 lifespan 时就绪检查照样列出它们（alive 为 false，契约 8.5）。
+    periodic_tasks = make_periodic_tasks()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # uvicorn 单进程运行：进入时启动定时清理与到期扫描，应用关闭时一并停止。
-        purge = PeriodicTask(SECURITY_EVENT_PURGE, lambda: _purge_security_events(engine))
-        expiry = PeriodicTask(
-            RESERVATION_EXPIRY,
-            lambda: _close_expired_reservations(engine),
-            interval=RESERVATION_EXPIRY_INTERVAL,
-            first_delay=RESERVATION_EXPIRY_INTERVAL,
-        )
-        purge.start()
-        app.state.security_event_purge = purge
+        purge = periodic_tasks[SECURITY_EVENT_PURGE]
+        expiry = periodic_tasks[RESERVATION_EXPIRY]
         try:
-            expiry.start()
-            app.state.reservation_expiry = expiry
+            purge.start()
+            app.state.security_event_purge = purge
             try:
-                yield
+                expiry.start()
+                app.state.reservation_expiry = expiry
+                try:
+                    yield
+                finally:
+                    expiry.stop()
             finally:
-                expiry.stop()
+                purge.stop()
         finally:
-            purge.stop()
+            # 线程只能启动一次：换上没启动的新任务，再次进入 lifespan 时启动它们。
+            periodic_tasks.update(make_periodic_tasks())
+
+    def periodic_payload() -> dict[str, object]:
+        """就绪检查正文的 periodic（契约 8.5）：判定只用单调时钟，不碰数据库。"""
+        states = sorted((task.state() for task in periodic_tasks.values()), key=lambda s: s.name)
+        return {
+            "status": periodic_status(state.stale for state in states),
+            "tasks": [
+                {
+                    "name": state.name,
+                    "alive": state.alive,
+                    "last_success_at": _optional_timestamp(state.last_success_at),
+                    "last_failure_at": _optional_timestamp(state.last_failure_at),
+                    "stale": state.stale,
+                }
+                for state in states
+            ],
+        }
 
     app = FastAPI(
         title="Acuven Stock Core",
@@ -144,12 +183,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/readyz")
     def readyz() -> JSONResponse:
-        """就绪检查：数据库能执行一条查询才算就绪。"""
+        """就绪检查：数据库能执行一条查询才算就绪；正文另带定时任务的状态，不影响状态码。"""
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
         except SQLAlchemyError:
-            return JSONResponse({"status": "unavailable", "reason": "database_unreachable"}, 503)
-        return JSONResponse({"status": "ok"})
+            body = {"status": "unavailable", "reason": "database_unreachable"}
+            return JSONResponse(body | {"periodic": periodic_payload()}, 503)
+        return JSONResponse({"status": "ok", "periodic": periodic_payload()})
 
     return app
