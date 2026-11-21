@@ -22,12 +22,13 @@
 ## 运维命令行（开通租户、地点、库存池与销售入口；服务凭据与令牌）
 
 Core 没有 HTTP 管理接口（契约第 10 节第 4 条），租户、地点、库存池与销售入口只能由运维在服务器上、在运行中的 Core 容器里用 `python -m app.cli` 建；服务凭据的签发、轮换与吊销也只走这里。
-命令用容器里已有的 `CORE_ENV` 与 `CORE_DATABASE_URL`（与服务同一个数据库账号）。写法同 [deploy/healthcheck.sh](deploy/healthcheck.sh)：按 compose 标签找到容器，再 `docker exec`：
+命令用容器里已有的 `CORE_ENV` 与 `CORE_DATABASE_URL`（与服务同一个数据库账号）。写法同 [deploy/healthcheck.sh](deploy/healthcheck.sh)：在要操作的那个实例的检出根目录里 `source` [deploy/instance.sh](deploy/instance.sh)，
+它按本检出 `.env` 的 `CORE_ENV` 认出实例（Demo 或生产），`core_find_api_containers` 只找本实例、本检出的 `core_api` 容器（排除一次性容器），再 `docker exec`。
+第一行打出的不是预期的实例、或第二行打出的不是恰好一个容器 ID 时停下，不要往下跑（`CORE_ENV` 不对、栈没起来，或有不止一个容器）：
 
 ```bash
-container="$(docker ps -q \
-    --filter label=com.docker.compose.project=acuven_stock_core \
-    --filter label=com.docker.compose.service=core_api)"
+. deploy/instance.sh; echo "${CORE_INSTANCE:-$CORE_INSTANCE_ERROR}"
+container="$(core_find_api_containers)"; echo "$container"
 docker exec "$container" python -m app.cli --help
 docker exec "$container" python -m app.cli tenant create --name "Demo Shop"
 docker exec "$container" python -m app.cli location create --tenant ten_… --name "Warehouse"
