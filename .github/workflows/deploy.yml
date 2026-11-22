@@ -1,17 +1,18 @@
 # 部署 —— OpenClaw 部署观察契约（ONBOARD-PROJECT.md 的 D1–D5）。
-# 目前部署的是 Demo Core 实例（服务器 .env 里 CORE_ENV=demo）；生产实例等真实网店定了再加。
+# 推送触发的部署只部署 Demo Core 实例（服务器 .env 里 CORE_ENV=demo）；生产实例由人手工触发本工作流升级：
+# instance 选 production、ref 填 SHA（docs/PRODUCTION_AND_RECOVERY.md 第 1.2 节第 5 条）。
 #
 # .platform/project.yaml 写了 `deploy_workflow: deploy.yml`，就是承诺本工作流满足：
 #   D1 触发：由 push 到默认分支触发，每次合并都产生一次以合并提交为 headSha 的 push 运行。
 #            例外：只改 .platform/tasks.yaml 与 docs/TODO.md 的提交（自动收尾）被 paths-ignore 排除，不部署。
-#            workflow_dispatch 保留给手工重部署 / 回滚，不计入观察。
+#            workflow_dispatch 保留给手工重部署 / 回滚与生产升级，不计入观察。
 #   D2 对象：部署的正是触发它的那个提交（DEPLOY_SHA）：镜像以它为标签构建，服务器上
 #            `git checkout --detach` 到它再跑它自己的 deploy/deploy.sh，不 `git pull` 分支最新。
 #   D3 结论：只有新版本已上线、且上线后健康检查报出 DEPLOY_SHA 才以 success 结束；迁移失败、
 #            不健康、回滚（无论回滚是否成功）、中断都以失败结束。没有 continue-on-error。
 #            Core 没有公网入口，健康检查经 SSH 在服务器上进容器取 /healthz（deploy/healthcheck.sh）。
 #   D4 并发：不取消进行中的部署（被取消的运行按失败处理）。
-#   D5 期限：两个 job 的 timeout-minutes 合计 27 分钟，30 分钟内给出结论；不用需要人工批准的 environment。
+#   D5 期限：两个 job 的 timeout-minutes 合计 28 分钟（build 10 + deploy 18），30 分钟内给出结论；不用需要人工批准的 environment。
 # OpenClaw 只读结论：不部署、不回滚、不重跑，也不登录生产。
 #
 # 本文件不写主机名、IP、域名、路径、密钥：连接信息与部署目录放 GitHub secrets。
@@ -36,13 +37,22 @@ on:
       ref:
         description: "要部署的完整 40 位 commit SHA（回滚时填上一个好的那个）"
         required: true
+      instance:
+        description: "部署到哪个实例：demo 或 production"
+        type: choice
+        options:
+          - demo
+          - production
+        default: demo
 
 permissions:
   contents: read
 
-# D4：不允许并发部署，也不取消正在跑的那个——取消到一半会把线上停在中间状态。
+# D4：同一实例不允许并发部署，也不取消正在跑的那个——取消到一半会把线上停在中间状态。
+# 并发组按实例分开（推送触发没有 inputs，按 demo）：共用一个组时，排队中的生产手工运行会被新的推送
+# 静默取消，或者反过来。跨实例的串行交给主机部署锁（deploy/deploy.sh）。
 concurrency:
-  group: deploy-production
+  group: deploy-${{ inputs.instance || 'demo' }}
   cancel-in-progress: false
 
 jobs:
@@ -104,11 +114,43 @@ jobs:
     name: deploy
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 17
+    # 18 = Deploy 步的 command_timeout 14 分钟 + 4 分钟（前置步骤、两次 SSH 建连与正常情况下的上线后健康检查）。
+    timeout-minutes: 18
     permissions:
       contents: read
       packages: read
     steps:
+      # 定下要部署的实例与它的检出目录，部署与上线后健康检查两步都只用这一步的输出。
+      # 推送触发没有 inputs，按 demo。输入与目录只经 env 进 shell；目录为空就失败，不回落到另一个实例。
+      - name: Resolve the instance directory
+        id: target
+        env:
+          INSTANCE: ${{ inputs.instance || 'demo' }}
+          DIR_DEMO: ${{ secrets.VPS_APP_DIR }}
+          DIR_PRODUCTION: ${{ secrets.VPS_APP_DIR_PRODUCTION }}
+        shell: bash
+        run: |
+          case "$INSTANCE" in
+            demo)
+              APP_DIR="$DIR_DEMO"
+              SECRET_NAME=VPS_APP_DIR
+              ;;
+            production)
+              APP_DIR="$DIR_PRODUCTION"
+              SECRET_NAME=VPS_APP_DIR_PRODUCTION
+              ;;
+            *)
+              echo "::error::instance must be demo or production"
+              exit 1
+              ;;
+          esac
+          if [ -z "$APP_DIR" ]; then
+            echo "::error::$SECRET_NAME is not set; refusing to deploy the $INSTANCE instance"
+            exit 1
+          fi
+          echo "instance=$INSTANCE" >> "$GITHUB_OUTPUT"
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+
       # 主机指纹没配就直接失败：ssh-action 的 fingerprint 留空时是静默跳过校验。
       - name: Require the host fingerprint
         env:
@@ -121,18 +163,23 @@ jobs:
 
       # 所有值经 envs 传给远端脚本，不拼进脚本文本。
       # 远端先检出 DEPLOY_SHA，再跑那个提交里的 deploy/deploy.sh（D2）；它失败即非零退出（D3）。
-      # command_timeout：ssh-action v1.0.3 默认 10 分钟。deploy.sh 最坏要等主机部署锁 5 分钟，再加部署与回滚
-      # 约 7 分钟（约 12 分钟），默认值会在部署中途切断 SSH；设为 13 分钟，留 1 分钟余量。
-      # 走到回滚时 deploy.sh 以非零退出，后面的上线后健康检查不运行。成功路径是等锁 5 分钟 + 拉取与迁移 +
-      # 等健康最多 3 分钟，再加健康检查：此时容器已健康，通常第一次就通过；healthcheck.sh 的上限是 30 次、
-      # 每次等 10 秒加取 healthz 最多 5 秒（约 7.5 分钟），只在异常时用满。那时 job 的 17 分钟可能先到，
+      # command_timeout：ssh-action v1.0.3 默认 10 分钟。deploy.sh 最坏要等主机部署锁 5 分钟，生产实例在迁移前
+      # 再做一次最多 1 分钟的本库备份（docs/PRODUCTION_AND_RECOVERY.md 第 1.2 节第 3 条），再加部署与回滚约 7 分钟：
+      # 5 + 1 + 7 = 13 分钟，默认值会在部署中途切断 SSH；设为 13 + 1 分钟余量 = 14 分钟。Demo 不做备份，同用这个上限。
+      # 走到回滚时 deploy.sh 以非零退出，后面的上线后健康检查不运行。成功路径是等锁 5 分钟 + 备份（仅生产）+
+      # 拉取与迁移 + 等健康最多 3 分钟，再加健康检查：此时容器已健康，通常第一次就通过；healthcheck.sh 的上限是
+      # 30 次、每次等 10 秒加取 healthz 最多 5 秒（约 7.5 分钟），只在异常时用满。那时 job 的 18 分钟可能先到，
       # 切断的是只读的健康检查，结论照样是失败，不会切断进行中的部署。
+      # 拒绝旧 SHA：选了生产时，在 git fetch 之后、git checkout 之前核对 CORE-TASK-067 在 main 上的合并提交
+      # （生产所需的部署脚本由它进库）是 DEPLOY_SHA 的祖先；不是就退出，不动检出——检出停在旧提交上的话，
+      # cron 的巡检会跑旧脚本。Demo 不做这项核对。
       - name: Deploy
         uses: appleboy/ssh-action@v1.0.3
         env:
           DEPLOY_SHA: ${{ needs.build.outputs.sha }}
           IMAGE_REPO: ${{ needs.build.outputs.image_repo }}
-          APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          DEPLOY_INSTANCE: ${{ steps.target.outputs.instance }}
+          APP_DIR: ${{ steps.target.outputs.app_dir }}
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -141,12 +188,19 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
           fingerprint: ${{ secrets.VPS_FINGERPRINT }}
-          command_timeout: 13m
-          envs: DEPLOY_SHA,IMAGE_REPO,APP_DIR,GHCR_USER,GHCR_TOKEN
+          command_timeout: 14m
+          envs: DEPLOY_SHA,IMAGE_REPO,DEPLOY_INSTANCE,APP_DIR,GHCR_USER,GHCR_TOKEN
           script: |
             set -euo pipefail
             cd "$APP_DIR"
             git fetch --quiet origin
+            if [ "$DEPLOY_INSTANCE" = production ]; then
+              PRODUCTION_BASE_SHA=ab482a47b91da88c7bd98205d5156a511f8f2e7e
+              if ! git merge-base --is-ancestor "$PRODUCTION_BASE_SHA" "$DEPLOY_SHA"; then
+                echo "::error::$DEPLOY_SHA does not contain CORE-TASK-067 ($PRODUCTION_BASE_SHA); refusing to deploy it to production"
+                exit 1
+              fi
+            fi
             git checkout --quiet --detach "$DEPLOY_SHA"
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             trap 'docker logout ghcr.io >/dev/null 2>&1' EXIT
@@ -158,7 +212,7 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         env:
           DEPLOY_SHA: ${{ needs.build.outputs.sha }}
-          APP_DIR: ${{ secrets.VPS_APP_DIR }}
+          APP_DIR: ${{ steps.target.outputs.app_dir }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
