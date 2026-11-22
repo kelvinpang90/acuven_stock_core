@@ -2871,7 +2871,7 @@ tasks:
       五，超时：生产部署在迁移前多一次最多 60 秒的备份，SSH 的 command_timeout 与 deploy job 的 timeout-minutes 随之重算，注释写明算式；两个 job 的 timeout-minutes 合计仍不超过 30 分钟（D5）。
       六，文件头生产实例等真实网店定了再加那句改为现在的说法：推送部署 Demo、生产由人手工触发。
       明确不做：改部署脚本（CORE-TASK-067）；运行手册（CORE-TASK-069）；在 GitHub 上加 secret（由人做）；需要人工批准的 environment。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-067
     acceptance_criteria:
