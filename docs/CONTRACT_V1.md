@@ -1,8 +1,8 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.22｜2026-11-23｜状态：**0.22：草案，待 Kelvin 批准**——第 14 节第 104–149 条：**深度融合**，Acuven Inventory 不作为模块并入，而是让 Core 自己多出平台渠道能力（`acuven_hub/DECISIONS.md` C-21）。
+> 版本：0.22｜2026-11-23｜状态：**0.22：草案，待 Kelvin 批准**——第 14 节第 104–160 条：**深度融合**，Acuven Inventory 不作为模块并入，而是让 Core 自己多出平台渠道能力（`acuven_hub/DECISIONS.md` C-21）。
 > 生产实例的两个平台店铺直接是 Core 的两个销售入口；配额、安全库存与平台已售未扣（pending）是 Core 的状态，随平台订单事件在 Core 的同一个事务里改；平台映射并入商品目录；一个后台、一套管理员登录；“谁做的”改用操作主体。
-> 改到的章节：§0、§1、§2.5、§2.6、§2.7、§2.8、新增 §2.9、§3（重写，新增 §3.1、§3.2）、§4.2、§4.4、§5.5、新增 §5.10、§6.1、§6.2、§7.1、§7.2、§8.1、§8.2、§8.5、新增 §8.6、§9.2、§10 第 1–5 条、§11.4、§12.1、§13；新增 §3.2；取舍见 Q-81～Q-101，均待确认。第 132–149 条是本稿（深度融合）第 1 轮独立审查之后补的。
+> 改到的章节：§0、§1、§2.5、§2.6、§2.7、§2.8、新增 §2.9、§3（重写，新增 §3.1、§3.2）、§4.2、§4.4、§5.5、新增 §5.10、§6.1、§6.2、§7.1、§7.2、§8.1、§8.2、§8.5、新增 §8.6、§9.2、§10 第 1–5 条、§11.4、§12.1、§13；新增 §3.2；取舍见 Q-81～Q-102，均待确认。第 132–149、150–160 条分别是本稿（深度融合）第 1、2 轮独立审查之后补的。
 > 0.22 早先（PR #189 第 1–3 轮审查时）是“Inventory 作为进程内模块、以内部凭据经进程内入口调 Core”的写法，**Kelvin 2026-11-23 否决**，本版整体替换了它（第 14 节 0.22 的说明）。下面 0.22 改动的条文都标“（0.22，待批准）”；没标的条文仍是 0.21 已批准的内容。
 > 0.21：**Kelvin 已批准**——第 14 节第 103 条（§10 第 2 条：生产实例的运维凭据改为巡检与 Inventory 每日对账各一个；取舍见 Q-80）于 2026-11-23 批准。
 > 0.20：**Kelvin 已批准**——第 14 节第 101–102 条（§8.5 心跳检查只给生产实例建两个、`periodic` 并入 `readyz` 的检查、Demo 不推心跳、备份状态由 `vps_infra` 的检查覆盖；取舍见 Q-79；含合用检查的“重新通知”）于 2026-11-21 批准。
@@ -552,7 +552,7 @@ V1 用拉取，不做推送（Q-08）。
 - **入口可售量**：`api` 入口照旧是 `available`（§5.6，不看 `S` 与配额）；`platform` 入口是 `Q[p]`，就是发布到平台的数。
 - **平台订单的预留不看 `S` 与配额**：平台订单进入待发货时，Core 照 §5.6 只判 `available` 够不够（§5.10）。件数在下单时已经从 `Q[p]` 挪到了 `pending[p]`，`F` 已经扣过它；再按配额拦一次就把同一件算了两次。
 - **存放**：
-  - `pool_allocations`：池 × SKU 一行。列有 `tenant_id`、`pool_id`、`sku_id`（复合外键 → `stock_balances`，所以先有余额行）、`safety_stock`（默认 2，检查 0–1,000,000）、`version`（每次改 `S` 或这个 SKU 的任一配额加一，含平台事件改的，供后台“改配额”比对，见下）、`updated_at`。
+  - `pool_allocations`：池 × SKU 一行。列有 `tenant_id`、`pool_id`、`sku_id`（复合外键 → `stock_balances`，所以先有余额行）、`safety_stock`（默认 2，检查 0–1,000,000）、`version`（只在管理员改配额或 `S` 时加一，平台事件改 `Q` 不加；防的是两个管理员互相覆盖，见下）、`updated_at`。
   - `channel_allocations`：平台入口 × SKU 一行。列有 `tenant_id`、`channel_id`、`pool_id`、`sku_id`、`quota`、`pending`（都默认 0，检查非负、不超过 1,000,000）、`updated_at`，以及 §3.2 的读回待核对与人工生效三组列；`(tenant_id, channel_id, sku_id)` 唯一；外键 → `sales_channels`、`stock_balances`。`pool_id` 与入口绑定的池相同，由服务层保证。
   - 平台订单行记下**从 `Q` 实际扣走的件数** `quota_taken` 与**已经加回的件数** `quota_returned`（§5.10 的存放），取消时最多加回两者之差（Q-97）。
   - 只有组合 2 的池（§3）有这两张表的行。要改的行还不存在时，照 §4.1 余额行的做法在开业务事务之前用短事务按 `(pool_id, sku_id)`、`(channel_id, sku_id)` 升序预建（取默认值），不在业务事务里对不存在的行加锁再插入。
@@ -576,7 +576,7 @@ V1 用拉取，不做推送（Q-08）。
 | 收货、盘点确认、不可售与报损、更正 | 不变（正差进 `F`，负差可能造成超额） | — | 对应的库存命令 |
 | 管理员改配额、改 `S` | 改为新值（见下） | — | — |
 
-- **最多加回扣走的**（Q-97）：一笔订单的件数在下单时只从 `Q` 扣走了 `quota_taken` 件（平台多卖时，多出的件不是从 `Q` 扣的，是从 `F` 吃的）。取消时只把这么多加回 `Q`，其余回到 `F`，由管理员手动分（原设计 V-04“增量进 `F`、手动分配”）。待处理中的订单被取消照原设计一件也不加回（它多半是超卖，`F` 往往已经不够）。
+- **最多加回扣走的**（Q-97）：一笔订单的件数在下单时只从 `Q` 扣走了 `quota_taken` 件（平台多卖时，多出的件不是从 `Q` 扣的，是从 `F` 吃的）。取消时只把这么多加回 `Q`，其余回到 `F`，由管理员手动分（原设计 V-04“增量进 `F`、手动分配”）。待处理中的订单被取消照原设计 0.3（Kelvin 2026-11-21 批准）一件也不加回：保守，宁可少分不多分；这种单若是超卖，`F` 多为负，恢复条件第 4 项本来也会拒绝加回。有行找不到平台商品的待处理单被取消时，找得到的那些行扣过 `Q`、件数进 `F`，平台通常会自己把显示量加回，预期会出现读回不符（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 4 节）。
 - **恢复条件**（原 Inventory 设计采用的 STOCK_RULES §3 第 1、2、4 条），在同一事务里、锁住配额行之后判定：
   1. 这个入口可以接收配额：自动模式下平台连接状态为 `active`；人工模式下这个入口没有逾期的人工核对（§3.2）；
   2. 这个 SKU 在这个入口上有生效的平台商品（§2.9，`FOR SHARE` 读）；
@@ -586,16 +586,17 @@ V1 用拉取，不做推送（Q-08）。
 - **平台卖出超过剩余配额（Q-97）**：平台显示的数来自上一次发布，平台可能在发布生效前多卖。`Q[p]` 只减到 0、不为负，多出来的件照样进 `pending[p]`，于是 `F` 变小，可能超额。不让 `Q` 为负，是因为它就是要发布的数，负数没有意义；差额由 `F` 体现，超额规则接手。
 
 **改配额与安全库存** `allocations.update`（后台，§8.6；`stock_admin`）
-- 正文：`pool_id`、`sku_id`、`expected_version`（`pool_allocations` 的版本，行还不存在时为 0）、可选的 `safety_stock`、可选的 `quotas`（`[{"channel_id": …, "quota": …}, …]`，每个入口最多出现一次，必须是这个池的 `platform` 入口）、`reason`（必填）。`safety_stock` 与 `quotas` 至少带一个。
+- 正文：`pool_id`、`sku_id`、`expected_version`（`pool_allocations` 的版本，行还不存在时为 0）、可选的 `safety_stock`、可选的 `quotas`（`[{"channel_id": …, "expected_quota": …, "quota": …}, …]`，每个入口最多出现一次，必须是这个池的 `platform` 入口；`expected_quota` 是页面上看到的这个入口当前的配额）、`reason`（必填）。`safety_stock` 与 `quotas` 至少带一个（Q-102）。
 - 事务以 READ COMMITTED 开启，按上面的锁序锁住池行、余额行与配额行，再 `FOR SHARE` 读这个 SKU 在各入口上的平台商品，然后依次判定：
   1. SKU 不存在 404；
-  2. 版本不符 409 `VERSION_CONFLICT`（`details.current_version`）；
+  2. 版本不符 409 `VERSION_CONFLICT`（`details.current_version`）：别的管理员改过 `S` 或配额；
+  2′. 要改的某个入口的当前配额不等于它的 `expected_quota`：409 `QUOTA_CHANGED`，`details.quotas` 列出这些入口的当前配额（平台事件在这期间改过它；没改的入口不冲突）；
   3. 要增加配额的入口上，这个 SKU 没有生效的平台商品：409 `NO_ACTIVE_LISTING`，`details` 带 `channel_id`（配额写不到平台上，只会白白占着 `F`）；
   4. 人工模式下有入口的人工核对逾期（§3.2），又要增加**别的**平台入口的配额：409 `MANUAL_CHECK_OVERDUE`，`details` 带逾期的 `channel_id`（原 Inventory 需求 4.1）；
   5. **有任何一个入口的配额增加**时，按新值算的 `F'` 必须 ≥ 0，否则 409 `ALLOCATION_EXCEEDS_UNALLOCATED`，`details` 带 `available`、`safety_stock`、`quota_total`、`pending_total` 与 `unallocated`（即 `F'`）。
   只减配额、只改 `S` 不做第 3–5 项判定（减配额总是让 `F` 变大；提高 `S` 造成的超额照上面的规则处理）。
 - 通过后写新值、`version` 加一、写一条 `allocation_changes`，与幂等记录同一事务提交。之后的发布见 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)。
-- 页面上看到的是旧版本时被拒（`VERSION_CONFLICT`），所以两个管理员不会互相覆盖；平台事件同时改了这个 SKU 的配额也会让版本加一，管理员重新读了再改。
+- 页面上看到的是旧版本时被拒（`VERSION_CONFLICT`），所以两个管理员不会互相覆盖；平台事件在这期间改了某个入口的 `Q`，只有改这个入口时才冲突（`QUOTA_CHANGED`）。两种冲突后台页面都自动重读、让管理员确认后再提交（新的提交键）。平台事件改 `Q` 不加 `version`，所以订单多的时候，管理员改 `S` 或改别的入口不会一直撞冲突。
 
 **例子一**（一个 SKU；账面五个量依次是 `stock_balance / reserved / unavailable / paid_pending_dispatch / available`；`S = 2`；恢复条件都满足）
 
@@ -640,14 +641,31 @@ V1 用拉取，不做推送（Q-08）。
 | `platform_write_pause` | 每个租户一行：`paused`、设上的主体、时间、原因，解除的主体、时间、原因 | 后台的设上与解除；恢复时运行手册的 SQL（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 5 节） |
 | `channel_allocations.review_hold`、`review_reason`、`review_since` | 读回不符或对账差异时，暂停这个“SKU × 入口”的发布与回写 | 发布与对账作业设上；后台解除 |
 | `channel_allocations.manual_confirmed_quota`、`manual_confirmed_at` | 人工模式下，管理员确认已在卖家后台设好的显示量；与 `quota` 不等时后台显示“待生效” | 后台的“确认已生效” |
-| `manual_checks` | 人工核对一次一行：`channel_id`、核对的起止时间（`checked_from`、`checked_until`）、是否发现差异、说明、操作主体列、`created_at` | 后台的“记人工核对” |
+| `manual_checks` | 人工核对一次一行：`channel_id`、核对的起止时间（`checked_from`、`checked_until`；检查约束 `checked_from < checked_until`；`checked_until` 不晚于数据库当前时间，由服务层在写入时判，MySQL 的检查约束不能用当前时间）、是否发现差异、说明、操作主体列、`created_at` | 后台的“记人工核对” |
 | `platform_order_lines.known_discrepancy`（布尔）与说明 | 提交到 Core 之后才发现录错、已用库存命令对回实物的订单行（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节） | 后台的“记已知差异” |
 | `platform_alerts` | 严重告警一条一行：类型、对象（入口、SKU、平台订单）、首次发出、最近一次通知、通知次数、确认的主体与时间、转成超时待办的时间 | 作业发出与重复通知；后台确认 |
 | `reconciliation_runs` | 每次对账一行：触发方式（定时或手动）、发起的主体、起止时间、差异数 | 对账作业；后台的“手动发起对账” |
-| `platform_ops_log` | 只追加：上面每一种后台写操作、平台作业对连接状态的改动、“继续销售或手动停售”的决定、待处理的结束；每行记动作、对象、前后值（JSON）、原因、`credential_id`、`actor_ref`、`actor_role`、`request_id`、`created_at` | 所有后台写操作与改连接状态的作业，与改动本身同一事务 |
+| `platform_publishes` | 每次写平台库存一行：入口、SKU、平台商品、目标值、平台确认的值、结果（已确认、明确失败、结果未知、不支持、平台控制）、时间（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 4 节） | 发布与读回作业 |
+| `platform_oauth_states` | 每次发起授权一行：`state` 的 SHA-256（唯一）、入口、平台、发起的管理员主体与会话、`created_at`、`expires_at`（10 分钟）、`used_at`；用过即作废，过期的由清理作业删 | 后台的“授权”；回调 |
+| `platform_ops_log` | 只追加：上面每一种后台写操作、平台作业对连接状态的改动、“继续销售或手动停售”的决定、两种“结束”；每行记 `action`、对象、前后值（JSON）、原因、`credential_id`、`actor_ref`、`actor_role`、`request_id`、`created_at`。`action` 的取值与前后值的键见下面 | 所有后台写操作与改连接状态的作业，与改动本身同一事务 |
 
 - **人工核对逾期的规则**（Q-99）：`mode` 为 `manual` 的入口，以数据库时间计，距它最近一次核对的 `checked_until` 超过 **12 小时**即为逾期（原设计“每天至少两次”）；切到人工模式之后还没核对过的，从切换时刻算起。逾期只在后台显示、不推送 Telegram；它让 `allocations.update` 拒绝增加**别的**入口的配额（§3.1 第 4 项），并让这个入口的取消加回不满足恢复条件（§3.1）。核对补上之后自动解除。
 - 连接的每次改动（授权、断开、切换模式、作业把状态改为 `auth_failed` 或 `revoked`）都在 `platform_ops_log` 留一条；`platform_connections` 只存当前状态。
+- **`platform_ops_log` 的取值与内容**（第 2 轮审查后补）：`action` 加检查约束，只取下表的值（加值要迁移重建约束）；前后值 `before`、`after` 各是一个 JSON 对象，只能有该动作白名单里的键，由服务层拼出、不直接存请求体；**不得**记令牌（明文或密文）、平台应用凭据、OAuth 的 `code` 与 `state`、顾客资料；`before`、`after` 序列化后各不超过 4 KiB（超过就是程序缺陷，整笔回滚）。
+
+  | `action` | 前后值的键 |
+  | --- | --- |
+  | `write_pause_set`、`write_pause_cleared` | `paused` |
+  | `review_hold_set`、`review_hold_cleared` | `channel_id`、`sku_id`、`review_hold`、`review_reason` |
+  | `manual_check_recorded` | `channel_id`、`checked_from`、`checked_until`、`found_discrepancy` |
+  | `manual_quota_confirmed` | `channel_id`、`sku_id`、`manual_confirmed_quota` |
+  | `known_discrepancy_marked` | `platform_order_row_id`、`platform_line_id`、`known_discrepancy` |
+  | `held_order_closed`（关闭平台已取消的待处理单） | `platform_order_row_id`、`stage` |
+  | `attention_cleared`（清除已确认单的待处理标记） | `platform_order_row_id`、`attention`、`attention_code` |
+  | `alert_acknowledged` | `alert_id`、`kind`、`acked_at` |
+  | `incident_decision` | `decision`（`continue_selling` / `stop_selling`）、`channel_id`（可空） |
+  | `reconciliation_started` | `run_id`、`trigger` |
+  | `connection_authorized`、`connection_disconnected`、`connection_mode_changed`、`connection_status_changed` | `channel_id`、`status`、`mode`、`capabilities`（只是能力的名字与可用与否，不含令牌） |
 - 这些操作都不改账面量与流水；改 `Q` 的只有 §3.1 的事件、改配额与人工确认（确认只记 `manual_confirmed_*`，不改 `quota`）。
 
 ---
@@ -1289,7 +1307,11 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 
 - **不合格的平台 ID 一律按它本身确定性地变换**，不用 Core 自己生成的 ID（那会是每个事件一个，webhook 与补拉就会派生出两个引用、重复扣数）：平台订单号、店铺 ID、包裹 ID、退款 ID 或退货 ID 含 `[A-Za-z0-9._:-]` 以外的字符，或拼出来的引用超过 112 个字符（`order_ref`，给后缀留位）或 128 个字符（其余），就把这一段换成 `h` 加它 UTF-8 的 SHA-256 小写十六进制的前 32 位。同一个平台 ID 不论从哪个来源到达，得到的引用都相同。
 - **平台给不出稳定的包裹、退款、退货 ID 时**：自动来源按“订单、动作、平台行、件数、平台时间”判断是不是同一个动作，判断不了就进待处理，不报 Core 的命令。
-- **人工登记必须填平台的包裹、退款、退货 ID**（卖家后台的订单详情里有）。卖家后台确实没有时，管理员勾选“平台没有给 ID”，Core 用 `m` 加这个订单同一种单据已生效的张数加一（`m1`、`m2`…）作这一段；这只在人工模式下出现。切到自动模式时以最后一次人工核对的时间为接管点，接管点之前的平台事件不再处理（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节），所以 `m<n>` 与平台 ID 派生的引用不会指同一件事两次；接管点之后同一个包裹又被人工登记一次就会重复，后台在登记页面对已有自动事件的订单禁用人工登记。
+- **人工登记必须填平台的包裹、退款、退货 ID**（卖家后台的订单详情里有）。卖家后台确实没有时，管理员勾选“平台没有给 ID”，Core 用 `m` 加这个订单同一种单据已生效的张数加一（`m1`、`m2`…）作这一段；这只在人工模式下出现。
+  不让 `m<n>` 与平台 ID 派生的引用指同一件事两次，靠三条（第 2 轮审查后写死）：
+  1. 连接的 `mode` 为 `manual` 时（授权往往早于切到自动），webhook 验签之后只应答、**不写收件箱**，补拉作业不对这个入口运行；所以人工模式下收件箱里只有人工事件；
+  2. 切到自动模式时以最后一次人工核对的 `checked_until` 为接管点，平台时间早于接管点的自动事件不处理（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节）；
+  3. 已有自动来源事件的订单，服务端拒绝人工登记（下面“后台的人工操作”的 `auto_events_exist`）；人工模式下同一订单重复登记“没有 ID”的同类单据时，按订单、动作、平台行、件数、时间提示可能重复（`POSSIBLE_DUPLICATE`）。
 
 **派生的命令正文与请求摘要**（Q-100）
 
@@ -1303,13 +1325,15 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 | `refund_restocks.create` | `order_ref` | `{"refund_ref", "lines": [{"line_ref", "quantity"}]}`：件数取平台这次取消的件数（payload），**不取 Core 当前的余量**；超出余量时 Core 回 409 `QUANTITY_EXCEEDS_OUTSTANDING`，按第 6 步处理 |
 | `return_receipts.create` | `order_ref` | `{"return_ref", "lines": [{"line_ref", "sellable_quantity", "unsellable_quantity"}]}`：取管理员登记的件数 |
 
+- **派生正文照样经过对应 `/v1` 请求模型的校验**（行数 1–100、件数 1–1,000,000 的整数、`line_ref` 不重复等，§8.1 第 7 步）。派生之前先整理：同一个包裹、同一次取消或退货里映射到同一 Core 行的多条平台行合并求和；件数为 0 的行不列；整理之后一行都不剩的动作不调 Core、记 `ignored`。校验不过（例如一单超过 100 个 SKU、件数超出上限）不调 Core：扣数之前设 `held`，已确认之后写 `attention`，`attention_code` 为 `INVALID_REQUEST`，并告警。
 - 三个付款后命令都**不带** `reason_code`、`note`、`occurred_at`：`occurred_at` 由 Core 取数据库时间（§6.2 第 6 条），平台时间留在收件箱的 payload 里。理由：webhook 用事件时间、补拉用状态时间，两者不同，带进正文就会让同一个动作摘要不同、报 `BUSINESS_REF_CONFLICT`。
-- `ready_at` 在第一次处理 `ready_to_ship` 时从那个事件的 payload 取、之后不改；`ready_to_ship` 只会生效一次（第 4 步的“落后于阶段”），所以确认销售的摘要不会因来源不同而变。
+- `ready_at` 在第一次处理 `ready_to_ship` 时从那个事件的 payload 取（没有平台时间时用它的 `received_at`）、之后不改；它写在保存点之外，预留被拒、订单进 `held` 时也保留，之后重试的确认销售照样用它；`ready_to_ship` 只会生效一次（第 4 步的“落后于阶段”），所以确认销售的摘要不会因来源不同而变。
 
 **处理顺序与一个事件的处理**（由平台事件作业逐个订单处理；后台的人工操作见下）
 1. **按订单的命名锁**：在没有打开事务的连接上 `GET_LOCK(订单锁名, 5)`。锁名是数据库名、字面量 `platform_order`、`tenant_id`、`channel_id`、`platform_order_id` 五项以换行符连接后 UTF-8 编码的 SHA-256 小写十六进制。
    取不到（返回 0）或出错：作业跳过这个订单，下一轮再处理。同一个订单的事件因此串行处理；不同订单并行，靠下面的锁序避免死锁。锁持到这个订单这一轮的事件都处理完。
-2. **排序**：取这个订单全部未处理的事件，按上表的先后、再按 `received_at` 排序，一个一个处理，**每个事件一笔事务**。缺的前序动作已经在收件箱里时，它排在前面，先被处理。
+2. **排序**：取这个订单全部未处理的事件，**先按 payload 里的平台时间**（平台记录的发生时间；payload 没有平台时间时用 `received_at`）、平台时间相同的再按上表的先后、再按 `received_at` 排序，一个一个处理，**每个事件一笔事务**。
+   按平台时间而不是按状态链排，是为了不颠倒真实的先后：例如先“付款前取消某一行”、后“进入待发货”，按状态链会先做待发货，预留把已取消的件也算进去，之后的取消只能走退款回库、又没有退款 ID。状态链只用来排同一时刻的先后，以及发现缺了前序动作（第 4 步）；缺的前序动作已经在收件箱里时，它的平台时间更早，自然排在前面。
 3. **开事务之前**（同 §7.1 执行顺序，不在打开事务或持有行锁时带等待地取锁）：解析这个事件涉及的订单行的 SKU（已定下的取定下的，没定的按当前生效的平台商品，普通读），照 §4.1 预建余额行、照 §3.1 预建配额行；照 §5.6 先关这些 SKU 上已到期的预留（生产的池里平时没有 `active` 的预留，这一步通常什么也不做）；把会话的隔离级别设为 READ COMMITTED。
 4. **开事务，按锁序加锁**：收件箱行（`FOR UPDATE`）→ 平台订单行（`FOR UPDATE`；还没有就插入）→ Core 的预留行（已有时，`FOR UPDATE`）→ Core 的订单行（交运、已确认后的取消、退货验收改累计量，`FOR UPDATE`，同 §5.8 与 `app/services/fulfilment.py`；其余 `FOR SHARE`）→ 池行（`FOR SHARE`）→ 余额行（`FOR UPDATE`，§8.1 升序）→ 配额行（§3.1）→ 平台商品行（`FOR SHARE`）→ SKU 行 → 商品行（后两层由命令体按 §5.6 自己锁）。
    - 收件箱行的 `applied_at` 已有值：处理过了（去重），提交空事务，下一个。**这就是平台事件的幂等**：去重记录与它带来的全部变化在同一个事务里提交，不另写幂等记录。
@@ -1320,15 +1344,26 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 6. **Core 的命令以业务拒绝结束**：`ROLLBACK TO SAVEPOINT` 撤销命令的全部写入，再执行命令登记的“被拒也要保留的写入”（§7.1；本节用到的命令里没有，留着通用）；之后按订单所处的阶段：
    - **扣数之前**（`ready_to_ship` 被拒，例如预留 409 `INSUFFICIENT_STOCK`、`SKU_INACTIVE`、`SKU_SELLING_PAUSED`、`SKU_NOT_FOUND`、`SKU_MERGED`、`POOL_NOT_LIVE`）：订单设为 `held`、写明原因与错误码，件数留在 `pending`，`result` 记 `held`。不走故障补交（§5.5）。后台在补货或解除停用之后“重试”，或平台取消后照 §3.1 结束。
    - **已确认之后**（交运、已确认后的取消、退货验收被拒，例如 409 `QUANTITY_EXCEEDS_OUTSTANDING`、`STATE_CONFLICT`、`BUSINESS_REF_CONFLICT`，见 §5.8）：阶段**不变**，`pending` 本来就是 0、也不动；只写 `attention` 与 `attention_code`，`result` 记 `attention`，发严重告警。
-     后台的处理：对照卖家后台查明原因；平台数据有误、改正后可以再报的，管理员用“重试”提交一条改正后的人工事件（新的提交键）；实物与账已经对不上的，照 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节第 4 条用库存命令对回实物、在这一行记“已知差异”；都处理完，管理员“结束待处理”（清空 `attention`，记在 `platform_ops_log`，§3.2）。
+     后台的处理：对照卖家后台查明原因；平台数据有误、改正后可以再报的，管理员用“重试”提交一条改正后的人工事件（新的提交键）；实物与账已经对不上的，照 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节第 4 条用库存命令对回实物、在这一行记“已知差异”；都处理完，管理员“清除待处理标记”（清空 `attention`，`platform_ops_log` 记 `attention_cleared`，§3.2）。
    - `IDEMPOTENCY_CONFLICT` 不会出现（这条路不用幂等记录）；`BUSINESS_REF_CONFLICT`、`ORDER_REFERENCE_CONFLICT`、`RESERVATION_MISMATCH` 说明引用派生或状态记录有缺陷，照上面按阶段处理，另在告警里标为缺陷。
 7. 写收件箱行的 `applied_at` 与 `result`，提交；最后写本次登记的安全事件（§7.2）。这个订单这一轮的事件都处理完之后，在同一连接上 `RELEASE_ALL_LOCKS()`、把隔离级别复原（§7.1 执行顺序第 5 步、§5.6），出错就作废这个连接。
 8. **出错**：数据库错误或程序异常时整笔回滚，收件箱行仍是未处理，这个订单这一轮停下，下一轮再处理；不会留下一半。同一个事件连续处理失败超过 15 分钟告警。
 
-**后台的人工操作**（人工登记、待处理重试、映射补上后继续处理、退货验收、待处理单结束，§8.6 第 2 条；Q-100）
+**后台的人工操作**（人工登记、待处理重试、映射补上后继续处理、退货验收、关闭平台已取消的待处理单，§8.6 第 2 条；Q-100）
 - 在后台执行器里做，但不写幂等记录：先取按订单的锁（5 秒，取不到 503 `UNAVAILABLE`，**什么也没写**，同键重试即可）；再在**同一个事务里**写收件箱行（`source` 为 `manual`，`manual_key` 为这次提交的幂等键，`request_hash` 为正文摘要）并按上面第 3–7 步处理它，写入与处理一起提交或一起回滚，不会出现“管理员看到失败、事件却被作业执行了”。
 - 同一个提交键再交：`(tenant_id, credential_id, manual_key)` 已有一行——摘要相同，不再处理，200 返回这个事件的 `result` 与平台订单的当前表示（响应头 `Idempotency-Replayed: true`）；摘要不同，409 `IDEMPOTENCY_CONFLICT`，记 `idempotency_conflict` 安全事件，什么也不改。
-- 人工事件的处理结果照样分 `applied`、`ignored`、`held`、`attention`，后台照实显示。
+- 人工事件的处理结果照样分 `applied`、`ignored`、`held`、`attention`，后台照实显示：它们是确定的结果，与收件箱行一起提交，响应 200 带 `result` 与（被拒时）Core 的错误码。
+- **人工路径上不走“留给下一轮”**（第 2 轮审查后写死）：人工事件与它的处理同一个事务，回滚就连人工事件一起没了，所以第 3–8 步里会“回滚、留给下一轮”的情形，在人工路径上都改为直接回答、什么也不写，管理员看得到：
+
+  | 情形 | 回答 | 写了什么 |
+  | --- | --- | --- |
+  | 订单锁 5 秒内取不到 | 503 `UNAVAILABLE` | 什么也没写，同键重试 |
+  | 登记的动作要求的平台订单不存在（`created` 以外的动作） | 404 `PLATFORM_ORDER_NOT_FOUND` | 什么也没写；先登记 `created` |
+  | 越过订单当前的阶段（例如还没登记 `ready_to_ship` 就登记交运） | 409 `STATE_CONFLICT`，`details` 为 `{"reason": "missing_prior_action", "missing": "<缺的动作>"}` | 什么也没写；人工模式没有适配器可补拉，由管理员先登记前序动作 |
+  | 已有自动来源（`webhook`、`pull`）事件的订单 | 409 `STATE_CONFLICT`，`details` 为 `{"reason": "auto_events_exist"}` | 什么也没写；服务端检查，不靠页面 |
+  | 勾选了“平台没有给 ID”，而这个订单已有同一动作、同一平台行、同样件数的 `m<n>` 单据，且平台时间相差在 24 小时内 | 409 `POSSIBLE_DUPLICATE`，`details` 列出那张单据 | 什么也没写；管理员核对后带 `confirm_possible_duplicate: true` 再交（新的提交键） |
+  | 重新解析 SKU 两次都与预建时不同、或命令两次要求整个重做 | 503 `UNAVAILABLE` | 什么也没写，同键重试 |
+  | 数据库错误、程序异常 | 500 `INTERNAL_ERROR` | 整笔回滚，结果确定未生效（与收件箱行一起），同键重试 |
 
 **命令体共用**（Q-84）
 - 现状：每个 `/v1` 写接口 = HTTP 的检查（§8.1 第 1–9 步）＋幂等执行器（第 10 步：命名锁、目录写锁、余额行预建、开事务前的关单、隔离级别、事务、幂等记录、释放锁、写安全事件）＋**命令体**。命令体已经是“在给定连接、已开的事务里运行”的函数：自己不开、不提交、不回滚事务。
@@ -1346,9 +1381,10 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 - 执行器为命令体提供的几样东西，平台事件执行器的对应做法：
   - 余额行预建、开事务前的关单、READ COMMITTED：照第 3 步在开事务前做齐；
   - 目录写锁：本节调的订单命令都不写目录，用不到；
-  - 命令要求“回滚后整个重做”（§5.7 通用的重新判定、§2.8）：回滚整笔事务，从第 3 步重做一次；再要求重做就整笔回滚，事件留给下一轮；
-  - 命令体里“先回滚、另开事务重新判定”的步骤（§5.6 预留的并发重报）：改为回滚到保存点、在同一事务里重新判定。READ COMMITTED 下普通读看得到最新提交；同一订单有按订单的锁，不会有并发的另一笔。这要把这一步从“回滚＋新事务”改成“由执行器提供的回到某个点再判”，HTTP 执行器照旧用新事务实现，平台事件执行器用保存点实现（改造见 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 14 节）；
-  - 写业务引用撞上唯一约束（§7.1 第 2 条最后一段）：在按订单的锁之下不会发生；万一发生，按“回滚后整个重做”处理；
+  - 命令抛 `RedoCommand`，要求“回滚后整个重做”（§5.7 通用的重新判定，确认销售走这条；§2.8）：回滚整笔事务，从第 3 步重做一次；再要求重做就整笔回滚，事件留给下一轮（人工操作见上面，503）；
+  - 命令抛 `BusinessRefTaken(rejudge)`（预留、发货、退款回库、退货验收在撞上业务引用的唯一约束、或业务拒绝之后再查到已有引用时抛，§5.6、§5.8、§7.1 第 2 条最后一段）：平台事件执行器捕获它，回滚到保存点，丢弃这次登记的安全事件与被拒仍保留的写入（同 HTTP 执行器），在同一事务里调 `rejudge`。
+    命令体不用改：现在回滚、开新事务、调 `rejudge` 的是 HTTP 执行器（`app/services/idempotency.py`），命令体本来就不开、不回滚事务，平台事件执行器换成用保存点做同一件事。READ COMMITTED 下 `rejudge` 的普通读看得到最新提交。
+    有按订单的锁，平台路径上本不该发生这种并发，所以不论 `rejudge` 的结果是什么，都按缺陷处理：扣数之前设 `held`，已确认之后写 `attention`，告警里标为缺陷；`rejudge` 的结果本身照常用来判断这个动作有没有生效（例如“已经生效过”就不再改配额）；
   - 安全事件：照 §7.2 在事务结束之后写。
 - 保存点回滚只撤销写入，InnoDB 不释放保存点之后取得的行锁，它们留到事务结束；事务只涉及一个订单、一个事件，很快结束，锁序照第 4 步，所以不会因此死锁。
 
@@ -1874,7 +1910,7 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 | 400/422 | `INVALID_REQUEST` | 修正请求；不重试 |
 | 401 / 403 | `UNAUTHORIZED` / `FORBIDDEN` | 凭据或权限问题；不重试，告警 |
 | 405 | `METHOD_NOT_ALLOWED` | 调用方 bug；不重试 |
-| 404 | `NOT_FOUND`（`PRODUCT_NOT_FOUND`、`SKU_NOT_FOUND`、`IMPORT_NOT_FOUND`、`RESERVATION_NOT_FOUND`、`POOL_NOT_FOUND`、`COUNT_NOT_FOUND`、`STOCK_IMPORT_NOT_FOUND`、`ENTRY_NOT_FOUND`、`SKU_MERGE_NOT_FOUND`…） | 跨租户对象同样返回 404，不暴露存在性：同一类对象不存在与属于别的租户，错误码与 message 完全相同；路由不存在用 `NOT_FOUND` |
+| 404 | `NOT_FOUND`（`PRODUCT_NOT_FOUND`、`SKU_NOT_FOUND`、`IMPORT_NOT_FOUND`、`RESERVATION_NOT_FOUND`、`POOL_NOT_FOUND`、`COUNT_NOT_FOUND`、`STOCK_IMPORT_NOT_FOUND`、`ENTRY_NOT_FOUND`、`SKU_MERGE_NOT_FOUND`；0.22 起另有 `LISTING_NOT_FOUND`、`PLATFORM_ORDER_NOT_FOUND`，只在后台…） | 跨租户对象同样返回 404，不暴露存在性：同一类对象不存在与属于别的租户，错误码与 message 完全相同；路由不存在用 `NOT_FOUND` |
 | 409 | `INSUFFICIENT_STOCK` | 整单不进入付款；`details.lines` 列出不足的行。标不可售超过可售量也用它（§6.5） |
 | 409 | `POOL_NOT_LIVE` / `POOL_ALREADY_LIVE` | 库存池还在初始化，只能做期初、更正与读 / 池已上线，期初一律拒绝（§6.2 第 2 条）；不重试 |
 | 409 | `QUANTITY_EXCEEDS_UNAVAILABLE` | 恢复可售或报损的件数超过不可售量（§6.5）；不重试 |
@@ -1890,6 +1926,11 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 | 409 | `QUANTITY_EXCEEDS_OUTSTANDING` | 发货/回库/退货超过该行余量；`details.lines` 列出超过的行与 `limit`（§5.8）；不重试 |
 | 409 | `ORDER_REFERENCE_CONFLICT` / `BUSINESS_REF_CONFLICT` / `IDEMPOTENCY_CONFLICT` | 调用方 bug；不重试，告警 |
 | 409 | `REQUEST_IN_PROGRESS` | 按 `Retry-After` 用同键等待 |
+| 409 | （0.22，待批准）`SKU_HAS_ACTIVE_LISTINGS` | 停用 SKU 或商品、新建 SKU 合并时，SKU 下还有生效的平台商品（§2.6 第 5 条、§2.8）；先解除平台商品。`/v1` 的停用与合并命令也会返回它，但只有有平台入口的池才有平台商品，Demo 实际不会遇到 |
+| 409 | （0.22，待批准）`LISTING_ALREADY_LINKED` / `LISTING_SKU_TAKEN` / `LISTING_HAS_QUOTA` | 平台商品（§2.9）：这个平台规格已经挂着，改挂用改挂命令 / 同入口同 SKU 已有别的生效平台商品，先解除那一条 / 原 SKU 在这个入口上的配额不为 0，先把配额改为 0；不重试 |
+| 409 | （0.22，待批准）`NO_ACTIVE_LISTING` / `ALLOCATION_EXCEEDS_UNALLOCATED` / `MANUAL_CHECK_OVERDUE` / `QUOTA_CHANGED` | 改配额（§3.1）：要加配额的入口上这个 SKU 没有生效的平台商品，先挂上 / 加了之后未分配会小于 0，`details` 给出各量，少加或先补货 / 别的入口有逾期的人工核对，先补核对 / 页面上看到的配额已被平台事件改过，重读后再提交（新的提交键） |
+| 409 | （0.22，待批准）`INBOX_NOT_DRAINED` | 后台提交盘点实数时，收件箱里还有涉及这些 SKU 的未处理平台事件（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.3 节），`details.sku_ids` 列出；等处理完（人工模式下先把交运登记完）再提交 |
+| 409 | （0.22，待批准）`POSSIBLE_DUPLICATE` | 后台人工登记“平台没有给 ID”的单据时，可能与已有单据重复（§5.10）；核对后带确认再交 |
 | 413 | `REQUEST_TOO_LARGE` | 不得把整单拆成逐行预留绕过原子性 |
 | 429 | `RATE_LIMITED` | 按 `Retry-After` 同键退避 |
 | 503 | `UNAVAILABLE` | 结果**确定未生效**，可同键重试 |
@@ -2002,9 +2043,9 @@ V1 先把三类“不会让任何请求报错、没人看就发现不了”的�
      以后要分操作员与管理员时，加一张账号的角色表、按它断言，角色表本身不用改。
    - **后台发起的库存管理命令**（期初、池切 live、收货、盘点、不可售与报损、更正）：池取正文的 `pool_id`，来源入口是这个池的 `backoffice` 入口（§3、§6.2 第 6 条）；判定与写入同 `/v1` 的对应命令。
    - **后台对平台订单的操作**都写成收件箱里的一条事件（`source` 为 `manual`，去重键里的 `event_key` 用这次提交的幂等键），走 §5.10 的平台事件执行器，操作主体与 `actor_ref` 是这个管理员：
-     人工登记（人工模式下登记平台订单的新订单、待发货、取消、交运，[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)）；待处理重试（`held` 的单补货或解除停用之后，再做一次 `ready_to_ship`）；映射补上之后继续处理（给找不到平台商品的行定下 SKU，从 `created` 起补做）；退货验收（`return_received`，可售与不可售件数）；平台已取消的待处理单结束（`cancelled`）。
+     人工登记（人工模式下登记平台订单的新订单、待发货、取消、交运，[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)）；待处理重试（`held` 的单补货或解除停用之后，再做一次 `ready_to_ship`）；映射补上之后继续处理（给找不到平台商品的行定下 SKU，从 `created` 起补做）；退货验收（`return_received`，可售与不可售件数）；关闭平台已取消的待处理单（`held` 单，`cancelled`）。
      这样人工与自动走同一条管线、同一套去重（原 Inventory 设计 7.2）。写入收件箱与处理在同一个事务里，取不到订单锁时什么也不写；同键同内容原样返回、换内容 409（§5.10“后台的人工操作”）。
-   - **后台的运营操作**（§3.2）：设上与解除“自动写平台暂停”、解除读回待核对、记人工核对、确认人工配额已生效、记已知差异、结束待处理、确认告警、记“继续销售或手动停售”的决定、手动发起对账、授权与断开平台连接、切换模式。都走后台执行器、写 `platform_ops_log`，角色见 §10 第 3 条的角色表。
+   - **后台的运营操作**（§3.2）：设上与解除“自动写平台暂停”、解除读回待核对、记人工核对、确认人工配额已生效、记已知差异、清除已确认单的待处理标记、确认告警、记“继续销售或手动停售”的决定、手动发起对账、授权与断开平台连接、切换模式。都走后台执行器、写 `platform_ops_log`，角色见 §10 第 3 条的角色表。
    - **V1 后台的页面**（覆盖原 Inventory 设计第 10 节的页面；目录与库存的运维操作也在这里）：
 
      | 页面 | 调什么 |
@@ -2153,10 +2194,10 @@ Core 健康检查返回的环境标记（`demo` / `production`）必须与网店
    | 全部读接口 | 不要求 |
    | （0.22，待批准）平台商品的挂上、改挂、解除（§2.9） | `catalog_admin` |
    | （0.22，待批准）改配额与安全库存（§3.1）；平台连接的授权与断开（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)） | `stock_admin` |
-   | （0.22，待批准）后台对平台订单的操作：人工登记、待处理重试、映射补上后继续处理、退货验收、待处理单结束（§8.6 第 2 条） | `stock_operator`、`stock_admin` |
+   | （0.22，待批准）后台对平台订单的操作：人工登记、待处理重试、映射补上后继续处理、退货验收、关闭平台已取消的待处理单（`held` 单）（§8.6 第 2 条） | `stock_operator`、`stock_admin` |
    | （0.22，待批准）平台事件处理自动发出的订单命令（§5.10） | 不要求（不带操作者） |
    | （0.22，待批准）平台运营：设上与解除“自动写平台暂停”、解除读回待核对、确认人工配额已生效、手动发起对账、切换平台连接的模式（§3.2） | `stock_admin` |
-   | （0.22，待批准）平台运营：记人工核对、记已知差异、结束待处理、确认告警、记“继续销售或手动停售”的决定（§3.2） | `stock_operator`、`stock_admin` |
+   | （0.22，待批准）平台运营：记人工核对、记已知差异、清除已确认单的待处理标记（`attention`）、确认告警、记“继续销售或手动停售”的决定（§3.2） | `stock_operator`、`stock_admin` |
 4. **凭据形式（0.6 细化，Q-31）：**
    - **凭据与令牌分开。**凭据（`credential_id`，前缀 `cred_`）是一个调用方服务身份：绑定 `tenant_id`、可空的 `channel_id`、
      一组 scope，状态为 active 或 revoked。一个凭据下可以有多个令牌（令牌 ID 前缀 `ctk_`）。
@@ -2363,7 +2404,7 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
 | 11 | 订单库存查询不返回流水，预留、释放、确认销售的流水不能按订单查（只能按池、SKU 与时间段翻） | REQUIREMENTS ORD-06 | Q-65（0.14）：每行状态由累计量还原、发货回库退货的流水由单据指明；REQUIREMENTS ORD-06 已于 2026-11-18 随 0.14 更新 |
 | 12 | ORD-08 写对账比对“库存流水”，对账查询（§5.9）不返回流水 | REQUIREMENTS ORD-08 | Q-67（0.15）：比对预留状态与每行累计量，累计量与流水在同一事务里写，账面与流水是否一致由不变量自查（§4.4）查；要看某单的流水照第 11 条。REQUIREMENTS ORD-08 已于 2026-11-19 随 0.15 更新 |
 | 13 | 生产 Core 的首个接入方由“真实网店（待定）”改为 Inventory：一个入口代表两个外部店铺，店铺之间的配额不在 Core | DECISIONS C-13、I-08；README“网店单卖与加购 Inventory”；Inventory `HUB_ARCHITECTURE_ALIGNMENT` 第 5 节 | Q-76～Q-78（0.19）。DECISIONS I-08 已于 2026-11-21 记下；README 随本次改 |
-| 14 | （0.22，待批准）Inventory 不再是独立的系统：两个平台店铺是 Core 的两个入口，配额、安全库存、`pending`、平台映射、平台事件、发布与对账都成了 Core 的规则；一个池可以有多个入口；生产实例有后台、开公网入口；“谁做的”改用操作主体 | DECISIONS C-21（部分取代 I-08 ③、V-11）、C-04、C-07、C-08；REQUIREMENTS OPS-01、OPS-02；Q-12；本表第 13 行；原 Inventory 设计 0.3（`acuven_inventory` 仓库）第 2、3、13、15 节与 `HUB_ARCHITECTURE_ALIGNMENT`、`SYSTEM_DECOUPLING`、`DEVELOPMENT` 里“Inventory 是独立服务、经版本化 API 调 Core”的写法 | Q-81～Q-101（0.22）。REQUIREMENTS 的 OPS-01、OPS-02 随本次按实例加注；原 Inventory 的业务规则写进本契约与 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)、[ADMIN_AUTH.md](ADMIN_AUTH.md)；`acuven_inventory` 的文档留在那边、不改，归档后只作历史；DECISIONS C-21 已记下（2026-11-23），“C-21 后续”在本版批准后更新。产品上“Inventory 是可选模块”（C-04、C-05、C-15）是否仍成立、以什么形态售卖，见 Q-81 的说明 |
+| 14 | （0.22，待批准）Inventory 不再是独立的系统：两个平台店铺是 Core 的两个入口，配额、安全库存、`pending`、平台映射、平台事件、发布与对账都成了 Core 的规则；一个池可以有多个入口；生产实例有后台、开公网入口；“谁做的”改用操作主体 | DECISIONS C-21（部分取代 I-08 ③、V-11）、C-04、C-07、C-08；REQUIREMENTS OPS-01、OPS-02；Q-12；本表第 13 行；原 Inventory 设计 0.3（`acuven_inventory` 仓库）第 2、3、13、15 节与 `HUB_ARCHITECTURE_ALIGNMENT`、`SYSTEM_DECOUPLING`、`DEVELOPMENT` 里“Inventory 是独立服务、经版本化 API 调 Core”的写法 | Q-81～Q-102（0.22）。REQUIREMENTS 的 OPS-01、OPS-02 随本次按实例加注；原 Inventory 的业务规则写进本契约与 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)、[ADMIN_AUTH.md](ADMIN_AUTH.md)；`acuven_inventory` 的文档留在那边、不改，归档后只作历史；DECISIONS C-21 已记下（2026-11-23），“C-21 后续”在本版批准后更新。产品上“Inventory 是可选模块”（C-04、C-05、C-15）是否仍成立、以什么形态售卖，见 Q-81 的说明 |
 
 ---
 
@@ -2850,7 +2891,7 @@ Kelvin 2026-11-23 定：改成两个运维凭据（本项目记为 Q-80）。
 
 来源：Kelvin 2026-11-23 决定把 `acuven_inventory` 并入本仓库（`acuven_hub/DECISIONS.md` C-21，部分取代 I-08 ③）。
 0.22 先按“进程内模块”起草（Inventory 作为 Core 进程里的一个模块，用一个没有令牌的内部凭据经进程内入口调 Core 的命令，自己在另一个事务里记账、崩溃后存完整请求同键重放，另有写操作白名单、`inv:` 幂等键格式与恢复代号），在 PR #189 上过了三轮独立审查。
-**Kelvin 否决了这个写法：要深度融合，不能是两个项目塞在一起。**本版整体替换那一稿，第 104 条起重新编号；那一稿的取舍（原 Q-81～Q-99）作废，换成新的 Q-81～Q-101。
+**Kelvin 否决了这个写法：要深度融合，不能是两个项目塞在一起。**本版整体替换那一稿，第 104 条起重新编号；那一稿的取舍（原 Q-81～Q-99）作废，换成新的 Q-81～Q-102。
 深度融合的方向（Kelvin 同意按此重写）：没有“Inventory 模块”，只有一个多了平台渠道能力的 Core——两个店铺直接是 Core 的两个入口；配额、安全库存、`pending` 是 Core 的状态，随订单事件在 Core 的同一事务里改；处理平台订单事件就是 Core 自己的命令；“谁做的”用通用的操作主体；平台映射并入目录；一个后台、一套管理员登录；只有一套文档。
 原 Inventory 设计 0.3 与后台登录设计 0.1（都经 Kelvin 批准）里的业务规则原样保留，搬进本契约与 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)、[ADMIN_AUTH.md](ADMIN_AUTH.md)；改的是它们放在哪、在哪个事务里执行、由谁执行。
 
@@ -2902,8 +2943,19 @@ Kelvin 2026-11-23 定：改成两个运维凭据（本项目记为 Q-80）。
 | 147 | （建议 16）人工模式下“连接正常”永不成立；“已发货后申请退货退款”没有对应的动作 | 未决定 | 人工模式下恢复条件第 1 项换成“没有逾期的人工核对”，加回的配额要管理员确认生效（Q-99）；加动作 `return_requested`，只记事件 | §3.1 恢复条件、§3.2、§5.10 |
 | 148 | （建议 17）后台登录说 D1–D7 没改而 D3 改了；“前端只解析一种格式”与 ③④ 用 `{"detail"}` 矛盾 | 措辞 | ADMIN_AUTH 照实写 D3 的改动；§8.6 第 2 条写明两种形状、前端都要解析 | §8.6 第 2 条；ADMIN_AUTH 头部与第 8 节 |
 | 149 | （建议 18）规模估计漏项；P2d、P2e 可能超 1500 行；删唯一约束后 Demo 也失去数据库层保护 | 措辞 | PLATFORM_CHANNELS 第 14 节补漏并先拆 P2d、P2e；§3 写明 Demo 一并受影响 | §3；PLATFORM_CHANNELS 第 14 节 |
+| 150 | （第 2 轮审查）待处理单被取消“一件也不加回”的理由写得不准 | 措辞 | 理由改为“保守、原设计 0.3 批准过；超卖时 `F` 多为负，恢复条件第 4 项本就拒绝加回”；写明有行没映射的待处理单被取消后预期读回不符 | §3.1；PLATFORM_CHANNELS 第 4 节 |
+| 151 | （第 2 轮，必须改 1）按状态链排序会颠倒真实先后（先取消一行、后待发货） | 设计缺陷 | 先按 payload 的平台时间排（没有就用 `received_at`），状态链只排同一时刻的先后与发现缺步 | §5.10 第 2 步；PLATFORM_CHANNELS 第 3 节 |
+| 152 | （必须改 2）人工操作与处理同一事务，照搬第 3–8 步的“回滚、留给下一轮”会让人工事件一起消失；人工模式没法补拉 | 设计缺陷 | 人工路径逐个情形写死：锁取不到与重做不成 503、平台订单不存在 404、越阶段与已有自动事件 409 `STATE_CONFLICT`、可能重复 409 `POSSIBLE_DUPLICATE`，都什么也不写 | §5.10“后台的人工操作” |
+| 153 | （必须改 3）新错误码没进 §8.3；盘点前收件箱未清空、人工操作找不到平台订单没有码；“新码只在后台出现”不准 | 措辞 | §8.3 补齐各码的含义与调用方动作，404 列表加两个；新码 `INBOX_NOT_DRAINED`、`PLATFORM_ORDER_NOT_FOUND`、`POSSIBLE_DUPLICATE`、`QUOTA_CHANGED`；第 14 节改准 | §8.3、第 14 节 |
+| 154 | （必须改 4）授权早于切自动，人工模式下 webhook 已在推，`m1` 与真实包裹 ID 会重复发货 | 设计缺陷 | `mode=manual` 时 webhook 只应答不写收件箱、补拉不运行；已有自动事件的订单服务端拒绝人工登记；“没有 ID”的同类单据重复登记时提示 | §5.10 引用格式、后台的人工操作 |
+| 155 | （必须改 5）“回滚、另开事务重新判定”写法与代码不符：那是 `BusinessRefTaken` 由执行器做；确认销售走 `RedoCommand` | 设计缺陷 | 平台事件执行器捕获 `BusinessRefTaken`，回滚到保存点、丢弃事件与保留写入、同事务调 `rejudge`，结果一律按缺陷告警；`RedoCommand` 仍整笔重做；命令体不改，P2c′ 只留“按业务引用返回原结果”的标记 | §5.10“命令体共用”；PLATFORM_CHANNELS 第 14 节 |
+| 156 | （建议 6）`ready_at` 被拒时是否保留、payload 没有平台时间怎么办 | 措辞 | `ready_at` 写在保存点之外、被拒也保留；没有平台时间时用 `received_at` | §5.10 |
+| 157 | （建议 7）平台事件每次改 `Q` 都加 `version`，改配额会一直撞冲突 | 取舍 | 采用：每个入口带 `expected_quota`，只有被改的入口变过才 409 `QUOTA_CHANGED`；`version` 只在管理员改时加一；冲突时页面自动重读（Q-102） | §3.1 |
+| 158 | （建议 8）派生正文没说要过 `/v1` 的请求模型校验；同包裹里多条平台行映射到同一 Core 行 | 设计缺陷 | 派生前合并求和、去掉件数为 0 的行；校验不过不调 Core，扣数前 `held`、之后 `attention` | §5.10 派生正文 |
+| 159 | （建议 9）`platform_ops_log` 的 `action` 与前后值没有约束 | 设计缺陷 | `action` 检查约束列全取值；每种动作的键白名单；不得记令牌、凭据、`code`、`state`、顾客资料；前后值各不超过 4 KiB | §3.2 |
+| 160 | （建议 10）`platform_publishes`、OAuth `state` 的存放不在 §3.2；`manual_checks` 的时间没有约束；两种“结束”同名 | 措辞 | §3.2 补两张表；`checked_from < checked_until`（检查约束）、`checked_until` 不晚于数据库时间（服务层）；改名为“关闭平台已取消的待处理单”与“清除已确认单的待处理标记” | §3.2、§5.10、§8.6、§10 第 3 条 |
 
-本稿（深度融合）第 1 轮独立审查（要求修改：必须改 10 条、建议 8 条）之后补了第 132–149 条，取舍新增 Q-98～Q-101、改写 Q-86、Q-97。
+本稿（深度融合）第 1 轮独立审查（要求修改：必须改 10 条、建议 8 条）之后补了第 132–149 条，取舍新增 Q-98～Q-101、改写 Q-86、Q-97。第 2 轮独立审查（要求修改：必须改 5 条、建议 5 条）之后补了第 150–160 条，新增 Q-102，改写 Q-97 的理由。
 
 **被否决的那一稿在三轮独立审查里抓出的问题，融合之后怎么样**：
 - 崩溃后重放（“记下、提交、结账”三个事务，存完整请求、同键重放，两线程同时重放只结一次）：**不再成立**。平台事件是一笔事务，没有提交就什么也没发生，提交了就连去重记录一起在（§5.10 例子第 3 种）。
@@ -2917,7 +2969,7 @@ Kelvin 2026-11-23 定：改成两个运维凭据（本项目记为 Q-80）。
 - `/v1` 在生产只挂自查与只读命令行、`/api/` 的请求头规则、uvicorn 访问日志、关停宽限期与并行停止、新令牌立即存下：**仍成立**，照搬（§8.6）。
 - 第 3 轮的两条遗留小建议：暂停标记已设上时不改它的原因字段——写进 §12.1 第 3 条；两个“暂停”各管什么——写进 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)。
 
-不改：四个账面量与流水的规则、预留状态机、已有命令的判定顺序、`/v1` 已有接口的语义、错误码（只加 `SKU_HAS_ACTIVE_LISTINGS`、`LISTING_NOT_FOUND`、`LISTING_ALREADY_LINKED`、`LISTING_SKU_TAKEN`、`LISTING_HAS_QUOTA`、`ALLOCATION_EXCEEDS_UNALLOCATED`、`MANUAL_CHECK_OVERDUE`，`NO_ACTIVE_LISTING`，都只在后台出现）、scope 表；幂等作用域与锁名的拼法不变。角色表加了 0.22 的六行。
+不改：四个账面量与流水的规则、预留状态机、已有命令的判定顺序、`/v1` 已有接口的语义、错误码（只加 §8.3 里标“0.22”的几个：`SKU_HAS_ACTIVE_LISTINGS` 也出现在 `/v1` 的停用与合并命令里，但只有有平台入口的池会触发，Demo 实际不会遇到；其余只在后台出现）、scope 表；幂等作用域与锁名的拼法不变。角色表加了 0.22 的六行。
 
 **对调用方的影响**：
 - Demo 网店没有变化：Demo 实例照旧只有 `/v1`、不挂公网、后台开关为假；Demo 的池只有一个 `api` 入口，没有配额、平台商品与平台订单；凭据不变。变化只有两处，都不影响请求的结果：`/api/`、`/admin/` 路径的 404 不再回显调用方给的 `X-Request-ID`；容器日志里没有 uvicorn 的访问行（Core 按路径记的照旧）。
@@ -2925,7 +2977,7 @@ Kelvin 2026-11-23 定：改成两个运维凭据（本项目记为 Q-80）。
 - 生产实例没有经 `/v1` 的调用方。
 
 **要人做的事**（批准之后，另行登记或照运行手册做，不在本次）：
-- Kelvin 逐条确认 Q-81～Q-101；批准后更新 `acuven_hub/DECISIONS.md` 的“C-21 后续”。
+- Kelvin 逐条确认 Q-81～Q-102；批准后更新 `acuven_hub/DECISIONS.md` 的“C-21 后续”。
 - 按 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 的工作包登记实现任务（`CORE-TASK-NNN`），照 CLAUDE.md 过设计预审；原 INVENTORY-TASK-001～004（后台登录四层）按 [ADMIN_AUTH.md](ADMIN_AUTH.md) 改登记。
 - 在 `vps_infra` 给生产实例开 vhost（只转发 `/admin/`、`/api/`，覆盖设置 `X-Real-IP`），在 Cloudflare 配子域名；真实域名只配在服务器与 GitHub 变量里，不写进仓库。
 - 生产实例的运维照 [PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 的 0.22 说明：只签巡检凭据；开通平台入口与后台入口；建管理员账号。

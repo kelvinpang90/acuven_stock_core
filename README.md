@@ -16,7 +16,7 @@
 | [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) | Core V1 契约（0.5，2026-11-12 批准）：商品身份、库存池、数量模型与流水、预留→确认→释放、幂等与审计、`/v1` API、`StockGateway`、迁移与回退样例、租户与鉴权、恢复目标（RPO≤5 分钟、RTO≤4h）的设计约束 |
 | [docs/TEMPLATE_BOOTSTRAP_PLAN.md](docs/TEMPLATE_BOOTSTRAP_PLAN.md) | 从项目模板起步的方案（2026-11-10 已按它起步，2026-11-11 已推送并部署，之后已登记控制面） |
 | [docs/ESTIMATE_BREAKDOWN.md](docs/ESTIMATE_BREAKDOWN.md) | 工期重估（I-04）用的工作拆分，不是排期 |
-| [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | 设计问题与 Kelvin 的答复（Q-24 暂缓；深度融合的取舍 Q-81～Q-101 待确认） |
+| [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | 设计问题与 Kelvin 的答复（Q-24 暂缓；深度融合的取舍 Q-81～Q-102 待确认） |
 | [docs/PLATFORM_CHANNELS.md](docs/PLATFORM_CHANNELS.md) | 平台渠道（0.1 草案，待批准）：自营 Shopee 与 TikTok Shop 的授权与令牌、收事件、库存发布与读回、两种暂停、上线切换与人工模式、对账、告警、适配器，以及深度融合的工作包与改造规模 |
 | [docs/ADMIN_AUTH.md](docs/ADMIN_AUTH.md) | Core 后台的管理员账号、密码登录与会话（0.3 草案，待批准；规则沿用原 Inventory 后台登录 0.1） |
 | [docs/PRODUCTION_AND_RECOVERY.md](docs/PRODUCTION_AND_RECOVERY.md) | 生产实例部署与 W7a 备份恢复的设计（0.5，Kelvin 2026-11-21 批准）：同机第二实例、网络隔离、手工升级、binlog 每 4 分钟传 R2、时间点恢复、整机恢复与演练 |
