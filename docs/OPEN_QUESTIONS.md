@@ -197,7 +197,7 @@ Kelvin 2026-11-21 批准 Inventory 最小 V1 设计时，按建议答复了其�
 
 ### 1.18 生产实例的运维凭据（Kelvin，2026-11-23）
 
-CORE-TASK-069 起草运行手册时发现（[PRODUCTION_AND_RECOVERY.md](PRODUCTION_AND_RECOVERY.md) 0.6 第 1.1 节）；条文写进契约 0.21（第 14 节第 103 条），待 Kelvin 批准。
+CORE-TASK-069 起草运行手册时发现（[PRODUCTION_AND_RECOVERY.md](PRODUCTION_AND_RECOVERY.md) 0.6 第 1.1 节）；条文写进契约 0.21（第 14 节第 103 条），Kelvin 2026-11-23 批准。
 
 | 编号 | 问题 | 答复 |
 | --- | --- | --- |
