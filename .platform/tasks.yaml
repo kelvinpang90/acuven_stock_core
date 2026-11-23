@@ -3630,9 +3630,9 @@ tasks:
       - 契约 5.10 例子第 1 种完整：created 与 ready_to_ship 各一次，第二笔预留并确认 2 件、pending 2 变 0、阶段 committed；账面、预留状态与订单行的 committed_qty 照 /v1 的同样命令的结果；流水与预留上的 credential_id 是 system 主体、actor 为空
       - 例子第 3 种：补拉以另一 event_key 再写的 ready_to_ship 得 ignored、不改任何量；例子第 6 种：available 只有 1 时预留 409 INSUFFICIENT_STOCK，账面不变、没有预留、阶段 held、attention_code INSUFFICIENT_STOCK、pending 仍为 2、ready_at 已记
       - 契约 3.1 例子一第 11 步（E 被拒进待处理）与第 9 步（D 16 件预留只看 available）各一条用例
-      - 摘要：同一订单的 ready_to_ship 分别从 webhook 与补拉到达（平台时间不同）时，两条命令的 request_digest 相同（直接比较派生正文与摘要）；派生正文超过 100 个 SKU 时不调 Core、held、attention_code INVALID_REQUEST
+      - 摘要：同一订单的 ready_to_ship 分别从 webhook 与补拉到达（平台时间不同）时，reservations.create 的派生正文与摘要相同，sale_commits.create 在给定同一个 reservation_id 时派生正文与摘要相同（reservation_id 每次保存点里新生成，不比它本身）；派生正文超过 100 个 SKU 时不调 Core、held、attention_code INVALID_REQUEST
       - 例子第 4 种：在确认销售之后、提交之前让事务失败，什么也没留下（没有预留、流水，pending 不变），收件箱行仍未处理，下一轮照常处理一次
-      - BusinessRefTaken：测试用 monkeypatch 让本模块调用的 create_reservation 先真正执行一次、再抛 BusinessRefTaken(rejudge)，rejudge 分别是返回那次结果的函数与抛 ApiError 的函数；断言保存点回滚了第一次的写入、rejudge 成功时继续确认销售得 committed、失败时得 held，两种都 attention 为 defect；087 里断言“待发货仍未处理”的用例改为断言待发货已按本任务处理；CORE-TASK-086、087 的测试照常通过（它们里“未处理的动作停下”的用例改为用仍未实现的 shipped 或 return_received）
+      - BusinessRefTaken：测试用 monkeypatch 让本模块调用的 create_reservation 先真正执行一次、再抛 BusinessRefTaken(rejudge)，rejudge 分别是用新的 Execution 再真正调一次 create_reservation 的函数（保存点已回滚了第一次的写入，这一次重新写入）与抛 ApiError 的函数；断言第一次的写入被回滚、rejudge 成功时用它返回的 reservation_id 继续确认销售得 committed、失败时得 held，两种都 attention 为 defect；087 里断言“待发货仍未处理”的用例改为断言待发货已按本任务处理；CORE-TASK-086、087 的测试照常通过（它们里“未处理的动作停下”的用例改为用仍未实现的 shipped 或 return_received）
       - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
       - app/services/platform_commands.py
