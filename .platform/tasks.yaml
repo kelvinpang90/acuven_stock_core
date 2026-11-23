@@ -2901,7 +2901,7 @@ tasks:
       巡检的装法仍在 docs/OPS_MONITORING.md，手册里只链过去；vps_infra 那边的步骤写成指向 vps_infra 的说明，不抄它的脚本。
       命令里服务器上的目录、账号、主机名、库名与地址一律用占位符；密钥只写从密码管理器取回（恢复时拉镜像用的只读包令牌按设计第 2.4 节第 7 步临时新建），不写值。
       明确不做：改脚本、工作流、契约与设计；vps_infra 的改动。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-067
       - CORE-TASK-068
