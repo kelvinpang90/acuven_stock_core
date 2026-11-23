@@ -64,8 +64,7 @@ container="$(core_find_api_containers)"; echo "$container"
 ## 2. 签发运维凭据
 
 只在生产实例上签。运维凭据只带 `ops.read`、不带销售入口，只查它所属的租户（V1 一个租户、一个令牌）。
-这是巡检专用的运维凭据；Inventory 每日对账另有自己的运维凭据（契约 §10 第 2 条，`docs/PRODUCTION_AND_RECOVERY.md` 第 1.1 节），两者不共用，不给对账在这个凭据下另签令牌（这里的轮换只是巡检自己换令牌）。
-（2026-11-23，契约 0.22 草案，待批准）Inventory 并入生产实例后，对账在进程内直接调不变量自查，不再有对账用的运维凭据；巡检凭据是生产上唯一带令牌的凭据，本节的做法不变。在服务器上：
+这是巡检专用的运维凭据；Inventory 每日对账另有自己的运维凭据（契约 §10 第 2 条，`docs/PRODUCTION_AND_RECOVERY.md` 第 1.1 节），两者不共用，不给对账在这个凭据下另签令牌（这里的轮换只是巡检自己换令牌）。在服务器上：
 
 ```bash
 docker exec "$container" python -m app.cli credential issue --tenant ten_… --name "Stock core monitor" \
@@ -178,7 +177,6 @@ rm -f "$drill_env"
 - **P1 `violation_count=…`**：账面不一致。正文列出各 `check` 的项数与最多前 5 项的 ID（`violation_count` 超过 100 时注明只数了返回的前 100 项）。
   用运维凭据取完整结果，按 ID 定位（契约 §4.4“查出违反怎么办”）：`pool_id`＋`sku_id` 用 §6.8 的流水查询 `GET /v1/ledger`，
   `reservation_id` 用 `GET /v1/reservations/{id}`，再用 §5.8 的订单库存查询 `GET /v1/orders/{order_ref}/stock`。自查只读，不会修任何东西。
-  （2026-11-23，契约 0.22 草案，待批准，Q-95）生产实例的 `/v1` 只挂不变量自查，上面三个 `/v1` 查询在生产上不存在（404）。生产上改在容器里用只读命令行子命令查（照 [PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 第 0.2 节经 `deploy/instance.sh` 找到容器）：`python -m app.cli inspect ledger …`（流水）、`inspect reservation …`（预留）、`inspect order-stock …`（订单库存），输出与对应 `/v1` 读接口的 `data` 相同；具体参数以实现这些子命令的任务为准，实现之前生产上只能看自查结果本身。完整的自查结果仍用运维令牌取 `GET /v1/ops/invariants`。
 - **P2 `not checked: …`**（自查没跑成）：
   - `CORE_MONITOR_TOKEN is not configured`：`.env` 里没有这个键或值为空，或 `.env` 不存在、运行账号读不了；
   - `HTTP 401`：令牌错、已吊销或已过轮换重叠期，按第 2 节轮换并改 `.env`；`HTTP 403`：凭据不带 `ops.read`；
