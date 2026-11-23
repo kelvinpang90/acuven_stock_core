@@ -267,7 +267,7 @@ core credential list --tenant <租户 ID>
 ### 3.1 开机器、取密钥
 
 1. 开新机器，装 Docker。
-2. 从密码管理器取回重建要用的密钥（设计 P-05 的清单）：R2 凭据、`vps_infra` 的 `MYSQL_ROOT_PASSWORD`、源站证书、两个 Core 检出与 Demo 网店、Inventory 的 `.env`、心跳地址。（0.22，待批准：“Inventory 的 `.env`”改为生产 Core 的平台应用凭据、令牌加密主密钥与 Telegram 令牌。）
+2. 从密码管理器取回重建要用的密钥（设计 P-05 的清单）：R2 凭据、`vps_infra` 的 `MYSQL_ROOT_PASSWORD`、源站证书、两个 Core 检出与 Demo 网店、Inventory 的 `.env`、心跳地址。（0.22：“Inventory 的 `.env`”改为生产 Core 的平台应用凭据、令牌加密主密钥与 Telegram 令牌。）
    这些 `.env` 里没有令牌那几行（存的时候去掉了），令牌在第 3.7 步重新轮换出来。
 
 ### 3.2 起基础设施
@@ -421,13 +421,13 @@ core credential rotate --credential <凭据 ID> --overlap-hours 0 \
 
 生产的巡检按 [OPS_MONITORING.md](OPS_MONITORING.md) 第 3、4 节确认 `.env` 并装 cron。
 
-**再起调用方**：网店、Inventory 等，按各自的部署说明。（0.22，待批准：生产实例没有外部调用方，平台事件处理与后台随上面的生产部署一起起来；`.env` 里的 `CORE_ADMIN_ENABLED=true` 随 P-05 的那份写回。）
+**再起调用方**：网店、Inventory 等，按各自的部署说明。（0.22：生产实例没有外部调用方，平台事件处理与后台随上面的生产部署一起起来；`.env` 里的 `CORE_ADMIN_ENABLED=true` 随 P-05 的那份写回。）
 
 ### 3.8 补交与补录（契约 §12.1 第 4 条）
 
 1. 调用方补交“结果未知”的命令，补录丢失窗口：网店按支付记录；Inventory 按两个平台的订单补拉，人工模式下由管理员重新核对卖家后台、在 Inventory 重新登记。
    （0.22）生产实例改为：没有要补交的命令（平台事件的效果与去重记录一起退回）；先在后台看两个平台连接，丢失窗口里刷新过令牌的会显示授权失效，重新授权（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 2 节）；再从丢失窗口的起点补拉两个平台的订单（补拉作业从连接上的游标开始；人工模式下由管理员重新核对卖家后台、在后台重新登记）。
-2. 网店与 Inventory 都用 `GET /v1/skus?ids=…` 重读映射，Core 查不到的 SKU 标为待处理。（0.22，待批准：生产实例的平台商品就在同一个库里，不用重读。）
+2. 网店与 Inventory 都用 `GET /v1/skus?ids=…` 重读映射，Core 查不到的 SKU 标为待处理。（0.22：生产实例的平台商品就在同一个库里，不用重读。）
 3. 然后对账，跑一次不变量自查。生产上在 `<生产检出目录>` 里手工跑一轮巡检：
 
    ```bash

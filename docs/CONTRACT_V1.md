@@ -349,8 +349,8 @@ V1 用拉取，不做推送（Q-08）。
 - 表 `catalog_changes`，只追加（不 UPDATE、不 DELETE），永久保留；它既是 §7.2 的目录审计，也是 §2.5 变更流的来源。
   每个命令对每个改动了的对象写一条：新建商品写一条 `product_created`，再按请求顺序给每个 SKU 写一条 `sku_created`；一次修改改了几个字段都只写一条。
 - 列：`id`（自增 `BIGINT` 主键，变更流的顺序与游标都由它来）、`tenant_id`、`event_type`（`VARCHAR(32)`，不加检查约束，以后加事件类型不改表，
-  由应用校验）、`object_type`（`product` / `sku`，检查约束；0.22 待批准：加 `listing`，迁移重建这条约束）、`object_id`、`product_id`（SKU 事件为所属商品，商品事件等于 `object_id`；
-  复合外键指向商品；0.22 待批准：`listing` 时为所映射 SKU 的商品）、`version`（改动后的版本；0.22：`listing` 时为平台商品行的版本）、`changes`（JSON，`{字段名: {"before": …, "after": …}}`，字段名与表示里的相同，
+  由应用校验）、`object_type`（`product` / `sku`，检查约束；0.22：加 `listing`，迁移重建这条约束）、`object_id`、`product_id`（SKU 事件为所属商品，商品事件等于 `object_id`；
+  复合外键指向商品；0.22：`listing` 时为所映射 SKU 的商品）、`version`（改动后的版本；0.22：`listing` 时为平台商品行的版本）、`changes`（JSON，`{字段名: {"before": …, "after": …}}`，字段名与表示里的相同，
   `reference_price` 整个对象算一个字段，停用与重新启用记 `status`）、`credential_id`、`actor_ref`、`actor_role`（写变更记录的命令都要求角色——目录命令
   `catalog_admin`、SKU 合并执行 `stock_admin`，所以两者必有）、`reason`、`import_id`（导入确认建的才有，复合外键指向 `catalog_imports`）、`request_id`、
   `idempotency_key`、`created_at`。索引 `(tenant_id, id)`、`(tenant_id, object_id, id)`。
@@ -714,7 +714,7 @@ Inventory 用 O/H/C/U；两套量可互相换算，**不需要两本账**：
 | C（committed，已售未出库） | `paid_pending_dispatch` | |
 | U（unavailable） | `unavailable` | |
 | `H + C + U ≤ O` | `reserved + unavailable ≤ stock_balance` | 两式等价 |
-| A（不含安全库存时） | `available` | 安全库存 S 是 Inventory 政策，Core V1 不实现（0.22，待批准：S 与配额成了 Core 的规则，只用于有平台入口的池，§3.1；`available` 的定义不变） |
+| A（不含安全库存时） | `available` | 安全库存 S 是 Inventory 政策，Core V1 不实现（0.22：S 与配额成了 Core 的规则，只用于有平台入口的池，§3.1；`available` 的定义不变） |
 
 **已知分歧（见 OPEN_QUESTIONS Q-20）：**Inventory 允许把真实超卖事实记成 `C > O` 的“需求缺口”并标 `needs_review`；
 Core 需求要求所有量非负、缺货时“暂停履约交管理员”（ORD-03）。V1 按 Core 需求实现。0.19：生产实例接 Inventory 时仍按 Core（Q-78）：平台超卖的订单 Core 照常拒绝预留，订单留在 Inventory 待处理，不入 Core 的账。
@@ -2354,7 +2354,7 @@ DEVPRI 阶段 1 也要求 ERP 旧数据的升级与回退样例。Kelvin 定为�
    这条不是为了 RPO，而是为了恢复后调用方（网店；0.19 起生产实例上是 Inventory）按原幂等键补交时不会重复扣库。Redis 只能做非权威缓存。
    （0.22）平台事件也是一笔事务：配额、`pending`、平台订单、收件箱的去重记录与 Core 的账同时提交（§5.10）。所以恢复到任何时间点，“处理过哪些平台事件”与“账上有它们的效果”都一致，不需要补交，补拉重新处理即可。
 2. **异地日志。**`infra_mysql` 开启 binlog（ROW 格式），至少每 5 分钟把新的 binlog 传到另一家供应商或另一地区的存储；
-   每日全量备份也传到异地。超过 5 分钟没传成功就告警。0.19：可恢复的备份至少保留 30 天（Inventory 的库在同一实例上，它的需求要求 30 天）。（0.22，待批准：原 Inventory 的状态现在就是 Core 生产库里的表，30 天的要求不变。）
+   每日全量备份也传到异地。超过 5 分钟没传成功就告警。0.19：可恢复的备份至少保留 30 天（Inventory 的库在同一实例上，它的需求要求 30 天）。（0.22：原 Inventory 的状态现在就是 Core 生产库里的表，30 天的要求不变。）
 3. **恢复流程（RTO≤4h）。**新开一台机器（开机器的时间也算在 4 小时里）→ 拉最近一次全量备份 → 重放 binlog 到最后一份 →
    把 `catalog_changes` 的自增起点调到恢复后的最大 `id` 加 1,000,000（§2.5，0.8；Demo 库与生产库各做一次，用 `SHOW CREATE TABLE` 核对新起点，
    不用 `information_schema.TABLES`——它默认缓存统计值、可能显示旧值）→ 启动 Core 和调用方（Demo 实例是网店，生产实例是 Inventory，0.19）→ 调用方补交“结果未知”的命令 → 对账。写成运行手册，按步骤计时。
