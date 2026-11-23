@@ -2919,3 +2919,341 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+
+  - id: CORE-TASK-070
+    title: 关停留足宽限：关掉 uvicorn 自带的访问日志，定时任务改为并行停止
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 4、5 条（Q-94）改进程的关停与访问日志（工作包 P0a，docs/PLATFORM_CHANNELS.md 第 14 节）。Demo 与生产用同一个镜像与同一个 compose 文件，两个实例一起改。
+      一，Dockerfile 的启动命令（仍为 exec 形式）加 --no-access-log：uvicorn 自带的访问日志记完整的请求行、含查询串，关掉它；Core 自己按路径记的访问日志（app.api.access）不变。再加 --timeout-graceful-shutdown 10：收到停止信号后给正在处理的请求收尾，最多 10 秒。
+      二，docker-compose.yml 给 core_api 设 stop_grace_period 为 45s：uvicorn 收尾上限 10 秒，加定时任务停止的截止时间 30 秒（app/services/periodic.py 的 DEFAULT_STOP_TIMEOUT），加 5 秒余量；算式写进注释。
+      三，定时任务并行停止：app/services/periodic.py 提供“先通知全部任务停止，再用同一个截止时间等它们全部结束”的停止方式（截止时间默认 DEFAULT_STOP_TIMEOUT），过了截止时间仍没结束的任务各记一行警告（同现在 stop 的写法）；app/main.py 的 lifespan 退出时用它一次停掉全部定时任务，不再逐个等。启动的先后、启动出错时的收尾、退出后在 periodic_tasks 里换上没启动的新任务对象（就绪检查读它；app.state 上的 security_event_purge 与 reservation_expiry 照现在不换），都照现在的做法。
+      明确不做：部署脚本与部署工作流（正常关停几秒内完成，45 秒只在作业正在跑时才会用满，不改超时算式）；平台的定时作业与命名锁（第 4 组）；网络与注释（CORE-TASK-072）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - Dockerfile 的 CMD 仍是 exec 形式，带 --no-access-log 与 --timeout-graceful-shutdown 10；docker-compose.yml 的 core_api 设了 stop_grace_period 为 45s，注释写明 10＋30＋5 的算式
+      - tests/integration/test_deploy_scripts.py 加两条：读 Dockerfile 的 CMD 核对这两个参数；对 Demo 与生产两组实例变量各跑一次 docker compose config，core_api 的 stop_grace_period 都是 45 秒（没有 docker 时测试失败而不是跳过，同文件已有的做法）
+      - 并行停止的测试写在 tests/integration/test_security_event_purge.py（沿用其中 PeriodicTask 测试的写法）：两个任务的函数都阻塞到测试放开为止，以 0.5 秒截止时间一起停止，总用时小于 0.9 秒（不是两个截止时间之和），两个任务各记一行没停下的警告；函数很快返回时停止之后两个线程都已结束；从没启动过的任务也能一起停止、不报错
+      - lifespan 退出后两个定时任务都已停止，就绪检查看到的是换上的没启动的新任务，app.state 上的两项照现在的做法不变；已有的 lifespan 与定时任务测试照常通过
+      - 已有的单元与集成测试照常通过；Core 按路径记的访问日志的测试不改、照常通过
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署脚本与部署工作流；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - Dockerfile
+      - docker-compose.yml
+      - app/services/periodic.py
+      - app/main.py
+      - tests/integration/test_security_event_purge.py
+      - tests/integration/test_deploy_scripts.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-071
+    title: 生产实例只挂不变量自查接口，新增容器里的只读排查命令行
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 1 条与 4.4 的 0.22 说明（Q-88；工作包 P0b，docs/PLATFORM_CHANNELS.md 第 14 节）。
+      一，app/main.py：CORE_ENV 为 production 时 /v1 只挂不变量自查（app/api/ops.py 的 GET /v1/ops/invariants），别的 /v1 路由都不挂，按 8.1 第 1 步同不存在的路径一样 404 NOT_FOUND、不鉴权，做法同 Demo 重置按实例挂；Demo 实例照旧挂全部路由（含 Demo 重置）。/healthz 与 /readyz 两个实例都照旧。只看 CORE_ENV，不看别的配置。
+      二，新增只读命令行 python -m app.cli inspect（新模块 app/cli/inspect.py，在 app/cli/__main__.py 的 build_parser 里注册，照现有子命令的 register 写法），三个子命令：
+      ledger（--tenant、--pool、--sku 必填；--from、--to、--after、--limit 可选，取值规则与 GET /v1/ledger 的同名查询参数相同）；reservation（--tenant、--reservation-id 必填）；order-stock（--tenant、--channel、--order-ref 必填，--after、--limit 可选，规则同 GET /v1/orders/{order_ref}/stock；订单引用按入口区分，所以要 --channel）。
+      复用这三个读接口已在用的 app/services 与 app/domain 里的读函数、表示函数与参数解析函数，标准输出写一份 JSON，内容与对应读接口响应里的 data 相同。只读：读完回滚，不写库、不写安全事件、不用令牌；照现有子命令经 run_command 做启动核对，两个实例都能用。
+      --tenant 指的租户里找不到池、SKU、预留或订单（不存在或属于别的租户，不区分）时以退出码 2、标准错误一行原因结束，不回显参数值；参数不合格照现有子命令的参数错误处理。
+      明确不做：平台订单的子命令（第 2 组之后的任务补）；改读接口与 services 里的读函数；后台开关（CORE-TASK-073）。
+    status: ready
+    depends_on:
+      - CORE-TASK-070
+    acceptance_criteria:
+      - 新增 app/cli/inspect.py、tests/integration/test_cli_inspect.py 与 tests/integration/test_production_routes.py；只改 allowed_change_paths 里的其余文件
+      - test_production_routes 照 tests/integration/test_demo_resets_api.py 生产实例那条测试的做法（instance_marked 加 create_app 传 production）建生产应用，从 Demo 应用的路由表列出每个 /v1 路由与方法（不变量自查除外），在生产应用上带合格凭据与不带凭据各请求一次，都是 404 NOT_FOUND、X-Request-ID 照回、没有安全事件；生产上带 ops.read 凭据调不变量自查照常 200，/healthz 与 /readyz 照常
+      - Demo 应用挂的路由与改动前相同，已有的集成测试照常通过
+      - test_cli_inspect 在 Demo 测试库上造流水、预留与带单据的订单，三个子命令的输出与 TestClient 用该租户凭据以同样参数调对应读接口得到的 data 相等，含 ledger 用 after 与 limit 翻页、order-stock 用 after 翻页
+      - 找不到的池、SKU、预留与订单（含属于别的租户的）以退出码 2 结束，标准错误恰好一行、不含参数值，标准输出为空；limit 越界、游标不合格同样以非 0 结束
+      - 只读：运行前后各业务表与安全事件表的行数不变；库标记为 production、CORE_ENV 为 production 时照样能查（照 tests/integration/test_cli_service_auth.py 的 instance_marked 用法）；--help 不碰数据库
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/main.py
+      - app/cli/__main__.py
+      - app/cli/inspect.py
+      - tests/integration/test_cli_inspect.py
+      - tests/integration/test_production_routes.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-072
+    title: 部署改为生产实例挂代理网络，不再建生产的调用方内部网络
+    purpose: >-
+      按设计 docs/PRODUCTION_AND_RECOVERY.md 0.7 的第 0 节、第 1.1 节网络一行与第 1.2 节第 1 条的 0.7 一项，以及契约 docs/CONTRACT_V1.md 0.22 的 10 第 5 条（Q-89；工作包 P0c）：生产实例没有外部调用方，不再建 stock_core_production_net，改挂边缘反向代理所在的代理网络 proxy_net（名字以 vps_infra 为准，它的 compose 里就叫 proxy_net）。Demo 一切不变。
+      一，deploy/instance.sh：production 给出的 CORE_CALLER_NETWORK 改为 proxy_net，CORE_CALLER_ALIAS 仍为 stock_core_production（vhost 按这个别名转发）；另给出一个标记，说明本实例的这条网络是外部的（由 vps_infra 建、部署脚本不建），Demo 的标记为由部署脚本确保存在的内部网络。Demo 的各值不变；变量名不改；仍只由 CORE_ENV 决定，不读 .env 里别的键。
+      二，deploy/deploy.sh：Demo 照旧在 stock_core_net 不存在时以 --internal 建；生产的代理网络不存在时以失败结束、什么也不改（不拉镜像、不备份、不迁移、不换容器），从不自己建，同生产的专用数据网络。服务器上已建的 stock_core_production_net 不由脚本删除，留给人处理。
+      三，docker-compose.yml：网络写法不变（网络名与别名仍是必填变量、不给默认值）；更新过时的注释：“Core 不开公网入口、不挂 proxy_net”改为 Demo 不开公网入口，生产挂代理网络、由一个只转发后台与平台接口两个路径前缀的 vhost 对外；“调用方内部网络”的说明按实例分开写（Demo 是调用方内部网络，生产是代理网络）。
+      四，过时的注释：deploy/healthcheck.sh 与 .github/workflows/deploy.yml 里“Core 没有公网入口”改为健康检查端点不经反向代理转发（Demo 没有公网入口，生产的 vhost 只转发两个前缀），所以仍在服务器上进容器取 /healthz；deploy/deploy.sh 与 deploy/instance.sh 里“调用方内部网络”的说法按实例分开写。deploy.yml 与 healthcheck.sh 只改注释。
+      明确不做：vps_infra 的 vhost 与网络（由人与 vps_infra 做）；应用代码；ci.yml（compose 解析那一步用的是 Demo 的值，不受影响）；运行手册（已在设计 0.7 里写好）。
+    status: ready
+    depends_on:
+      - CORE-TASK-070
+    acceptance_criteria:
+      - 只改 allowed_change_paths；deploy.yml 与 healthcheck.sh 只有注释改动；instance.sh 导出的变量名不变
+      - tests/integration/test_deploy_scripts.py 的实例场景：production 给出 proxy_net、stock_core_production 与外部网络的标记；demo 给出的值与标记同改动前
+      - deploy.sh 的场景：Demo 在 stock_core_net 不存在时以 --internal 建、存在时不建；生产在 proxy_net 存在时没有 docker network create 调用，不存在时以失败结束，假 docker 收到的调用里没有拉镜像、备份、迁移与换容器；生产在任何情形下都不建网络
+      - docker compose config 按 production 的值解析出 core_api 只挂 infra_mysql_core_production_net 与 proxy_net（别名 stock_core_production），不挂 data_net 与 stock_core_production_net；按 demo 的值解析结果同改动前
+      - 已有的部署、巡检与健康检查脚本测试照常通过；deploy 目录下四个脚本的 shellcheck 零退出
+      - 改动的文件里不写域名、主机名、IP 与服务器上的路径
+      - 改动只落在 allowed_change_paths；不改 .platform/、应用代码与 ci.yml；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；脚本测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - deploy/instance.sh
+      - deploy/deploy.sh
+      - deploy/healthcheck.sh
+      - docker-compose.yml
+      - .github/workflows/deploy.yml
+      - tests/integration/test_deploy_scripts.py
+    allowed_commands:
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-073
+    title: 新增后台开关配置，Demo 实例上打开即拒绝启动
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 6.1 后台开关（Q-87；工作包 P0d）。
+      一，配置 CORE_ADMIN_ENABLED：app/config.py 的 Settings 加 admin_enabled（布尔），只认 true 与 false 两个字符串（严格匹配：不去空格、不认大小写变体，空串也不收），不设时为 false，只在启动时读；判定写成 app/domain/environment.py 里的纯函数，单元测试在 tests/unit/test_environment.py。值不合格时同其他配置不合格：Settings 构造失败，API 与命令行都拒绝启动；app/cli/__main__.py 的 invalid configuration 提示里加上这个键名（只写键名，不写值）。
+      二，CORE_ENV 为 demo 而开关为 true：API（create_app）与连库的命令行（app/cli/__init__.py 的 run_command）都拒绝启动，做法同现有的启动核对：退出码非 0、标准错误一行原因、不带连接串，在连库之前判出；命令行的 --help 与参数错误不判。CORE_ENV 为 production 时开关为 true 或 false 都照常启动。
+      三，接线：create_app 把开关记在 app.state 上，命令行在 run_command 交给子命令的参数上也能读到，供之后的后台登录、后台接口与平台任务按它挂路由与作业；本任务不挂任何路由、不加空的占位函数。生产的 /v1 只挂不变量自查仍只由 CORE_ENV 决定（CORE-TASK-071），开关为 true 时也一样。
+      四，docker-compose.yml 的 environment 加 CORE_ADMIN_ENABLED，取 .env 的值、没设时为 false（写成 compose 的带默认值的变量），注释写明 Demo 不设或设为 false。.env.example 的这一项由登记 PR 写好，本任务不改。
+      明确不做：后台页面、登录、平台接口与平台作业、管理员账号命令（之后的任务）。
+    status: ready
+    depends_on:
+      - CORE-TASK-071
+      - CORE-TASK-072
+    acceptance_criteria:
+      - 单元测试：true 与 false 各得对应的布尔值；TRUE、True、前后带空格、1、yes、空串都不合格；判定函数所在模块仍不 import 任何做 I/O 的库
+      - 集成测试写在 tests/integration/test_instance_check.py（沿用其中拒绝启动的测试写法）：Demo 标记的库、CORE_ENV 为 demo、开关为 true 时，create_app 以非 0 退出、标准错误一行原因（含 CORE_ADMIN_ENABLED 与 demo，不含连接串）；连库的命令行子命令同样拒绝，不执行命令、不写安全事件；开关为 false 或不设时两者照常
+      - 生产标记的库、CORE_ENV 为 production 时，开关为 true 与 false 都照常启动；开关为 true 时 /v1 仍只挂不变量自查（在 tests/integration/test_production_routes.py 加一条，照 CORE-TASK-071 的写法）
+      - 开关的值不合格时命令行输出 invalid configuration 提示，含 CORE_ADMIN_ENABLED 键名、不含配置值，退出码非 0
+      - tests/integration/test_deploy_scripts.py 加一条：对 demo 与 production 两组实例变量跑 docker compose config，core_api 的环境变量 CORE_ADMIN_ENABLED 在 .env 不设时为 false、设为 true 时为 true
+      - 已有的单元与集成测试照常通过；不改 .env.example
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署脚本与工作流；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/domain/environment.py
+      - tests/unit/test_environment.py
+      - app/config.py
+      - app/main.py
+      - app/cli/__init__.py
+      - app/cli/__main__.py
+      - docker-compose.yml
+      - tests/integration/test_instance_check.py
+      - tests/integration/test_production_routes.py
+      - tests/integration/test_deploy_scripts.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-074
+    title: 新增与 HTTP 无关的命令上下文，幂等执行器拆成收上下文的核心与 HTTP 包装
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 5.10 命令体共用（Q-84）与 docs/PLATFORM_CHANNELS.md 第 14 节 P1a。纯重构，/v1 的行为一点不变。
+      一，新模块 app/services/command_context.py 定义命令上下文（不可变的数据类），不 import FastAPI 与 Starlette：租户、入口与它绑定的池（都可空）、操作主体的 credential_id、操作者（可空，ref 与 role）、request_id、幂等键（可空；目录变更记录与 SKU 合并要存它，契约 2.7、2.8）、预留有效期秒数，以及登记安全事件时要写的 HTTP 方法、路径（不含查询串）与 User-Agent（都可空，非 HTTP 的执行器给空值）。
+      二，app/services/idempotency.py：run_idempotent(request, …) 的签名、默认值与行为不变，改成 HTTP 包装：从 get_access、request.state.request_id 与 app.state 上的预留有效期组上下文，再调新的核心函数。核心收请求与上下文：作用域、锁名、幂等记录、安全事件与日志里的身份、入口、操作者与 request_id 一律只从上下文取，不再调 get_access；取连接、作废连接与写响应仍按请求（后台执行器也是 HTTP，以后共用这个核心；平台事件执行器另写，不用它）。
+      三，Execution 改为持有上下文：新增 context 属性；record_security_event 按上下文与上面的 HTTP 三项组事件；connection、operation、request_digest、keep_on_rejection、BusinessRefTaken、RedoCommand 的用法不变。暂时保留 access 与 request 两个兼容属性，返回值与现在相同，服务层与接口层一处不改（CORE-TASK-075、076 改读上下文，079 去掉兼容属性）。
+      四，tests/integration/test_idempotency.py 里的测试命令改读 execution.context，并加下面验收标准里的测试。
+      明确不做：服务层与接口层（075、076）；入口种类的检查（契约 5.10 由后台执行器建上下文时做，随后台执行器的任务）；按业务引用返回原结果的标记（工作包 P2c′）；平台事件执行器。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 新增 app/services/command_context.py，只改 allowed_change_paths 里的其余文件；测试用 ast 读这个模块的 import，没有 fastapi 与 starlette
+      - run_idempotent 的签名与默认值不变；app/api 与 app/services 下除新建的 command_context.py 与 idempotency.py 外没有改动；已有的集成测试除 test_idempotency.py 里测试命令改读上下文外一字不改、照常通过
+      - test_idempotency 新增：测试路由直接调核心、传入与令牌不同的上下文（同租户另一个凭据 ID、另一组操作者与 request_id），幂等记录的作用域与 credential_id、保存的 request_id、取的命名锁名、安全事件的 tenant_id、credential_id、actor_ref 与 request_id 都取自上下文；同一上下文同键重放、换内容冲突照常
+      - HTTP 包装组出的上下文与请求一致：租户、凭据、入口、池、操作者、幂等键、request_id 与预留有效期都等于 get_access、请求与 app.state 给出的值（测试命令里逐项断言）
+      - 兼容属性 access 与 request 返回与改动前相同的对象；命令抛 BusinessRefTaken 与 RedoCommand 的已有测试照常通过
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/command_context.py
+      - app/services/idempotency.py
+      - tests/integration/test_idempotency.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-075
+    title: 订单类命令改从命令上下文取租户、入口、操作主体与请求标识
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 5.10 命令体共用与 docs/PLATFORM_CHANNELS.md 第 14 节 P1b。纯重构，/v1 的行为一点不变。
+      订单类的命令体改从 execution.context（CORE-TASK-074）取租户、入口与池、操作主体、操作者、request_id、幂等键与预留有效期，不再读 execution.access 与 execution.request：
+      app/services/reservations.py、sale_commits.py、fulfilment.py、demo_resets.py（例如 app/services/sale_commits.py 里经 execution.request.app.state 读预留有效期的地方改从上下文取；app/services/reservations.py 的 create_reservation 照旧收预留有效期参数，由接口层传入，不改签名）。
+      app/api 下同名的四个接口模块在命令里本来就不读 execution.access 与 execution.request，074 也不改 run_idempotent 的签名，所以不改接口层；鉴权依赖、读接口与 HTTP 的各项检查不动。
+      这四个服务调用的 app/services/stock.py 的公共函数（例如 entry_identity）里仍经兼容属性取值，由 CORE-TASK-076 改。
+      两个测试里经兼容属性取值的钩子改读上下文：tests/integration/test_reservations_api.py 与 test_demo_resets_api.py。
+      明确不做：库存、合并与目录类（076）；去掉兼容属性（079）；判定与写入的任何改动。
+    status: ready
+    depends_on:
+      - CORE-TASK-074
+    acceptance_criteria:
+      - 只改 allowed_change_paths；这四个服务模块里用检索式 execution\.(access|request)\b 查不到任何属性访问（execution.request_digest 照常保留；PR 正文贴出检索命令与结果）
+      - 订单类的全部集成测试（预留、释放、到期、确认销售含故障补交与晚到支付、待审结案与列表、发货、退款回库、退货验收、订单库存查询、对账、Demo 重置与它们的并发测试）照常通过；除上面两个钩子外测试一字不改
+      - 预留、流水、单据、待审与 demo_resets 行上的 credential_id、actor_ref、actor_role、request_id 与改动前相同（已有测试对这些列的断言照常通过）
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/reservations.py
+      - app/services/sale_commits.py
+      - app/services/fulfilment.py
+      - app/services/demo_resets.py
+      - tests/integration/test_reservations_api.py
+      - tests/integration/test_demo_resets_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-076
+    title: 库存、合并与目录类命令改从命令上下文取租户、入口、操作主体与请求标识
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 5.10 命令体共用与 docs/PLATFORM_CHANNELS.md 第 14 节 P1c。纯重构，/v1 的行为一点不变。
+      一，库存与合并类的命令体改从 execution.context 取租户、入口与池、操作主体、操作者、request_id 与幂等键，不再读 execution.access 与 execution.request：app/services/counts.py、stock.py（含 entry_identity 等被订单类服务共用的函数）、stock_documents.py、stock_imports.py、sku_merges.py。
+      二，接口层里在命令中取身份的三个模块改读上下文：app/api/catalog.py 与 app/api/catalog_imports.py 组目录变更的作者（ChangeAuthor）与取租户，app/api/stock_imports.py 的确认与切 live。目录的两个服务本来就收接口层组好的作者，不用改。鉴权依赖、读接口与 HTTP 的各项检查不动。
+      三，四个测试里经兼容属性取值的钩子改读上下文：tests/integration/test_corrections_api.py、test_counts_api.py、test_stock_documents_api.py 按 request_id 区分请求的改用 execution.context.request_id；test_stock_imports_api.py 的并发确认钩子现在按 execution.request.path_params 取导入 ID，改为不经请求对象区分两个请求（例如按上下文里的 request_id，测试自己发请求时知道各自的 request_id）。
+      工作包 P1c 原本还含“去掉兼容属性”：加上 idempotency.py 允许路径会到 13 个，超过拆分规则的 12 个，所以拆到 CORE-TASK-079；本任务之后兼容属性仍在，app 与 tests 里除执行器自己（app/services/idempotency.py，不在本任务的允许路径里，由 079 一并改）之外不再有人用。
+      明确不做：去掉兼容属性（079）；判定与写入的任何改动；入口种类的检查；平台事件执行器。
+    status: ready
+    depends_on:
+      - CORE-TASK-074
+      - CORE-TASK-075
+    acceptance_criteria:
+      - 只改 allowed_change_paths；app 与 tests 目录下除 app/services/idempotency.py 与 tests/integration/test_idempotency.py（执行器与它的测试，由 CORE-TASK-079 改）外，用检索式 execution\.(access|request)\b 查不到任何属性访问（execution.request_digest 照常保留；PR 正文贴出检索命令与结果）
+      - 目录变更记录、流水、盘点单、期初导入、池切 live、SKU 合并单上的 credential_id、actor_ref、actor_role、request_id 与 idempotency_key 与改动前相同（已有测试对这些列的断言照常通过）
+      - 全部集成测试照常通过（目录、导入、期初及其并发确认、收货、不可售与报损、更正、盘点、SKU 合并及其并发、幂等执行器，以及 CORE-TASK-075 覆盖的订单类）；除上面四个钩子外测试一字不改，test_stock_imports_api 的并发确认测试仍能让两个请求按原来的先后停住与放行
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/counts.py
+      - app/services/stock.py
+      - app/services/stock_documents.py
+      - app/services/stock_imports.py
+      - app/services/sku_merges.py
+      - app/api/catalog.py
+      - app/api/catalog_imports.py
+      - app/api/stock_imports.py
+      - tests/integration/test_corrections_api.py
+      - tests/integration/test_counts_api.py
+      - tests/integration/test_stock_documents_api.py
+      - tests/integration/test_stock_imports_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-077
+    title: 凭据表扩成操作主体表：加种类列，按种类重建权限检查约束
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 10 第 4 条操作主体（Q-85；工作包 P1d）。
+      一，迁移 alembic/versions/20261123_0012_principal_kind.py（revision 0012，down_revision 0011）：credentials 加列 kind，取值 service、admin、system（检查约束），默认值 service，已有的行都是 service；同一条迁移里先删现有的检查约束 scopes，再按种类建新约束（MySQL 的检查约束不能同名并存，新约束可沿用这个名字）：service 的 scopes 是非空 JSON 数组；admin 与 system 的 scopes 是空数组、channel_id 为空。
+      downgrade 反向：删按种类的约束、删列、恢复原约束（库里有 admin 或 system 主体时降级失败，降级只用于 CI 与开发库）。模型 app/models/service_auth.py 同步；种类的取值常量放 app/domain/service_auth.py。credential_tokens 不加约束（令牌只由命令行签给 service，命令行与鉴权两处保证）。
+      二，命令行 app/cli/service_auth.py：credential issue 只建 service；credential rotate 与 credential revoke 对 admin、system 主体拒绝（退出码 2、一行原因、什么也不写、不记安全事件）；credential list 每项输出 kind。token revoke 不变。
+      三，鉴权 app/api/auth.py：按令牌找主体时只认 kind 为 service 的；令牌挂在别的种类下时与令牌不存在一样 401 UNAUTHORIZED，对外不区分原因，安全事件照现有无效凭据的做法记。
+      明确不做：建 admin 主体（随后台登录的任务）与 system 主体（CORE-TASK-078）；入口种类；service 凭据的任何行为变化。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 只改 allowed_change_paths；迁移为 alembic/versions/20261123_0012_principal_kind.py、down_revision 为 0011；upgrade 后 alembic check 无差异；降到 0011 再升回 head 照常，照 tests/integration/test_demo_reset_schema.py 的先例在 production 测试库上做，无论成败都在 finally 里升回 head，不动共享的 demo 库
+      - 约束测试写在 tests/integration/test_service_auth_schema.py：kind 为三个取值以外、service 的 scopes 为空数组、admin 或 system 的 scopes 非空、admin 或 system 带 channel_id，各自被预期的那条约束拒绝；admin 与 system 带空数组、不带入口能写入；不写 kind 的插入得 service；原有的 scopes 约束测试照常通过
+      - 命令行测试写在 tests/integration/test_cli_service_auth.py：issue 出来的主体是 service；对直接插入的 admin 与 system 主体执行 rotate 与 revoke 以退出码 2 结束、库里没有变化、没有新安全事件；list 列出每个主体的 kind
+      - 鉴权测试写在 tests/integration/test_api_auth.py：给直接插入的 admin 主体挂一个令牌（直接写 credential_tokens），用它调一个读接口得 401 UNAUTHORIZED，响应与安全事件同未知令牌
+      - 已有的单元与集成测试照常通过（service 凭据的签发、轮换、吊销、鉴权与 scope 校验不变）
+      - 测试提交进共享 demo 库的 admin、system 主体（含挂在它们下面的令牌）都在测试自己的 finally 里删掉（先删令牌再删主体；它们没有别的行引用），所以会话结束时 conftest 的 migrated_engine 降到 base 照常成功（0012 的降级要恢复 scopes 非空的约束），之后的迁移往返照常
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - alembic/versions/20261123_0012_principal_kind.py
+      - app/models/service_auth.py
+      - app/domain/service_auth.py
+      - app/cli/service_auth.py
+      - app/api/auth.py
+      - tests/unit/test_service_auth.py
+      - tests/integration/test_service_auth_schema.py
+      - tests/integration/test_cli_service_auth.py
+      - tests/integration/test_api_auth.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-078
+    title: 销售入口加种类与平台两列，开通入口改为在命令行里按组合检查
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 3 入口的种类与组合（Q-81）与 10 第 4 条的 system 主体（工作包 P1e）。
+      一，迁移 alembic/versions/20261123_0013_sales_channel_kind.py（revision 0013，down_revision 0012）：sales_channels 加列 kind，取值 api、platform、backoffice（检查约束），默认值 api，已有的行都是 api；加列 platform（shopee、tiktok_shop）与 platform_shop_id（1–64 个字母、数字、点、下划线、冒号或连字符）；检查约束保证 kind 为 platform 时两列都非空、其他时都为空，并约束 platform 的取值与店铺 ID 的字符集；(tenant_id, platform, platform_shop_id) 唯一。
+      去掉唯一约束 (tenant_id, pool_id)：它同时是到 stock_pools 的复合外键要用的索引，所以先建同列的普通索引、再删唯一约束。downgrade 反向（一个池有多个入口时降级失败，降级只用于 CI 与开发库）。模型 app/models/inventory.py 同步。
+      二，组合规则写成纯函数（新模块 app/domain/channels.py，单元测试 tests/unit/test_channels.py）：给定池里已有入口的种类（不论状态）与要开通的种类，判定是否允许。契约的两种组合（恰好一个 api；或一个以上 platform 加恰好一个 backoffice）是开通完成后的样子，而入口只能逐个开通，所以按“开通之后仍能成为两种组合之一”判：池里已有任何入口时不能加 api；已有 api 时不能加别的；backoffice 最多一个；platform 可以多个。店铺 ID 的格式也在这里判。
+      三，命令行 app/cli/provisioning.py 的 channel create：加 --kind（默认 api，现有用法不变）、--platform 与 --platform-shop-id（kind 为 platform 时都必填，别的种类带了就拒绝）；在命令的事务里先以 FOR UPDATE 锁池行、再以 FOR UPDATE 锁租户行（固定这个先后：销售与库存命令是先 FOR SHARE 读池行、再经租户外键对租户行取共享锁，开通入口先锁租户再锁池会与它们死锁；锁租户行是为了下面每个租户只建一个 system 主体，同租户不同池并发开通时也串行）。不对同一行先取共享锁再取排他锁（锁升级会让同租户并发开通死锁），所以 channel create 不调 app/cli/__init__.py 里 FOR SHARE 的 require_tenant，在 provisioning.py 里自己写这两条加排他锁的查询；为了让报错的先后与文字照现在（租户找不到或停用先于池找不到），可以先用不加锁的普通读核对租户，再按上面的先后加锁并复核租户仍为 active。命令行事务是默认的 REPEATABLE READ，读快照在第一条普通读时就建好了（早于等锁），所以锁住之后读池里已有的入口、读这个租户的 system 主体，都必须用加锁读（FOR SHARE），不能用普通读，否则看不到并发的另一个开通刚提交的入口或 system 主体，会在同一个池上开出两个 api 或两个 backoffice、或给同一租户建两个 system 主体（入口组合与 system 主体都没有数据库约束兜底）。按上面的规则判。判定的先后：参数（种类与 platform、platform_shop_id 的搭配，店铺 ID 的格式）→ 租户 → 池 → 组合 → 同租户同平台同店铺 ID 已有；每种拒绝以退出码 2、一行固定的英文原因结束（照现有命令行的写法，不回显参数值），什么也不写；同租户同平台同店铺 ID 并发撞上唯一约束时报同一句（照现在 POOL_HAS_CHANNEL 的兜底写法）。
+      开通 platform 入口而这个租户还没有 system 主体时，在同一事务里建一个（kind 为 system，name 为 platform_events，scopes 为空数组，不带入口，active），已有就不再建。开通 platform 入口的输出带键 system_credential_id，值为这个租户的 system 主体的 credential_id（新建的或已有的都给）；api 与 backoffice 入口的输出没有这个键。建 system 主体不记安全事件：它没有令牌，不是签发（契约 10 第 4 条的安全事件只管签发、轮换、吊销），开通命令本来也不记。show 输出每个入口的 kind、platform 与 platform_shop_id。
+      逐个开通允许池停在只有 platform、还没有 backoffice 的中间状态（反过来也一样）；之后后台执行器找不到池的 backoffice 入口时怎么处理，留给后台的任务，本任务不管。
+      四，app/cli/service_auth.py 的 credential issue：--channel 只接受 api 入口，指向别的种类以退出码 2 结束、什么也不写。app/cli/__init__.py 的 require_channel 不取 kind（也不在本任务路径里），照旧调它之后在 service_auth.py 里另查这个入口的 kind。
+      明确不做：配额、平台商品、平台订单、收件箱与连接（第 2 组起）；后台；让 platform、backoffice 入口经任何执行器写。
+    status: ready
+    depends_on:
+      - CORE-TASK-077
+    acceptance_criteria:
+      - 只改 allowed_change_paths；迁移为 alembic/versions/20261123_0013_sales_channel_kind.py、down_revision 为 0012；upgrade 后 alembic check 无差异；降到 0012 再升回 head 照常，在 production 测试库上做、无论成败都在 finally 里升回 head，不动共享的 demo 库
+      - 单元测试逐条验证组合规则：空池加 api、platform、backoffice 都允许；已有 api 时再加任何种类都拒绝；已有 platform 或 backoffice 时加 api 拒绝；已有 backoffice 时再加 backoffice 拒绝；已有两个 platform 与一个 backoffice 时再加 platform 允许；空、65 个字符、含空格或斜杠的店铺 ID 被拒；判定模块不 import 任何做 I/O 的库
+      - 约束测试写在 tests/integration/test_inventory_schema.py：kind 取值以外、platform 入口缺 platform 或店铺 ID、api 或 backoffice 入口带了这两列、platform 取值以外、店铺 ID 字符集不对、同租户同平台同店铺 ID 重复，各被预期的那条约束拒绝；同一个池上的第二个入口不再被数据库拒绝（原来断言同池第二个入口被唯一约束拒绝的测试改为断言这一点）
+      - 命令行测试写在 tests/integration/test_cli_provisioning.py，覆盖两种组合与各种违反：池上开通 api 之后再开任何种类被拒；开通两个 platform 与一个 backoffice 成功，第二个 backoffice 被拒、再加 api 被拒；被拒时库里没有新行；不带 --kind 的现有用法得 api 入口，已有的拒绝用例照常
+      - 第一个 platform 入口建出这个租户的 system 主体（kind、name、空 scopes、无入口、active），不记安全事件；同租户之后的 platform 入口（含开在另一个池上的）不再建；锁住池行与租户行之后读池里已有入口与读 system 主体的两条查询是加锁读（FOR SHARE），不是普通读；show 输出每个入口的 kind、platform 与 platform_shop_id
+      - credential issue 以 platform 或 backoffice 入口作 --channel 时以退出码 2 结束，没有新凭据、令牌与安全事件；以 api 入口照常（tests/integration/test_cli_service_auth.py）
+      - 测试提交进共享 demo 库的同池多入口（platform、backoffice 入口）与 system 主体都在测试自己的 finally 里删掉（它们没有别的行引用），所以会话结束时 conftest 的 migrated_engine 降到 base 照常成功（0013 的降级要恢复 uq_sales_channels_tenant_id_pool_id，0012 的要恢复 scopes 非空），之后的迁移往返照常
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - alembic/versions/20261123_0013_sales_channel_kind.py
+      - app/models/inventory.py
+      - app/domain/channels.py
+      - tests/unit/test_channels.py
+      - app/cli/provisioning.py
+      - app/cli/service_auth.py
+      - tests/integration/test_inventory_schema.py
+      - tests/integration/test_cli_provisioning.py
+      - tests/integration/test_cli_service_auth.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-079
+    title: 去掉幂等执行器上的兼容属性，命令体只经命令上下文取身份
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 5.10 命令体共用与 docs/PLATFORM_CHANNELS.md 第 14 节 P1c 的最后一项（从 CORE-TASK-076 拆出：一起做允许路径会超过 12 个）。纯重构，/v1 的行为一点不变。
+      app/services/idempotency.py 的 Execution 删掉 CORE-TASK-074 暂留的 access 与 request 两个兼容属性，不再持有请求对象，构造时也不收它；命令体只经 execution.context 取身份与入口。执行器自己里经 execution.request 取值的地方（例如执行命令时组响应）改为直接用核心手里的请求或上下文。核心照旧按请求取连接、作废连接与写响应（074），HTTP 包装与核心的其余行为不变。
+      tests/integration/test_idempotency.py：074 加的“兼容属性返回与改动前相同的对象”的测试删掉，改成一条断言 Execution 上没有 access 与 request 属性；这个文件里还有经兼容属性取值的地方一并改读上下文。
+      明确不做：服务层与接口层（075、076 已改完，本任务不应再碰它们）；判定与写入的任何改动。
+    status: ready
+    depends_on:
+      - CORE-TASK-075
+      - CORE-TASK-076
+    acceptance_criteria:
+      - 只改 allowed_change_paths；Execution 没有 access 与 request 属性、构造参数里没有请求对象；app 与 tests 目录下用检索式 execution\.(access|request)\b 查不到任何属性访问（execution.request_digest 照常保留；PR 正文贴出检索命令与结果）
+      - 全部集成测试照常通过（含幂等执行器、订单类、库存与合并类、目录类）；只有 test_idempotency.py 有改动，且只限上面说的兼容属性测试的删改与改读上下文
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/idempotency.py
+      - tests/integration/test_idempotency.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
