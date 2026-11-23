@@ -38,7 +38,7 @@
 
 Kelvin 2026-11-23 决定把 `acuven_inventory` 并入本仓库（`acuven_hub/DECISIONS.md` C-21），并否决了“Inventory 作为进程内模块”的第一稿，要求深度融合。改写后的设计**待 Kelvin 批准**：
 
-- 契约 [CONTRACT_V1.md](CONTRACT_V1.md) 0.22 草案：平台入口、配额进 Core（§3、§3.1）、平台商品（§2.9）、平台订单事件（§5.10）、操作主体（§10 第 4 条）、后台与生产实例的接口（§8.6）；取舍 Q-81～Q-97 见 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) 第 2.1 节；
+- 契约 [CONTRACT_V1.md](CONTRACT_V1.md) 0.22 草案：平台入口、配额进 Core（§3、§3.1）、平台商品（§2.9）、平台订单事件（§5.10）、操作主体（§10 第 4 条）、后台与生产实例的接口（§8.6）；取舍 Q-81～Q-101 见 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) 第 2.1 节；
 - [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 0.1 草案（授权、收事件、发布与读回、上线切换与人工模式、对账、告警；第 14 节是工作包与改造规模）；
 - [ADMIN_AUTH.md](ADMIN_AUTH.md) 0.3 草案（后台登录四层）；
 - [PRODUCTION_AND_RECOVERY.md](PRODUCTION_AND_RECOVERY.md) 0.7 草案与 [PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 的相应说明。
