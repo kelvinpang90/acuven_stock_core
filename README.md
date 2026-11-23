@@ -4,6 +4,8 @@
 
 服务范围：统一 SKU、条码、基本商品名称与参考价；记录库存地点、预留、出入库与可追溯流水。`acuven_inventory` 另负责跨销售入口的库存分配、外部平台同步与对账。
 
+**2026-11-23：Inventory 深度融合进 Core**（`acuven_hub/DECISIONS.md` C-21；条文是契约 0.22与 [docs/PLATFORM_CHANNELS.md](docs/PLATFORM_CHANNELS.md)、[docs/ADMIN_AUTH.md](docs/ADMIN_AUTH.md)，**Kelvin 2026-11-23 批准**）。没有独立的 Inventory，也没有“Inventory 模块”：上一段说的库存分配、平台同步与对账成了 Core 自己的能力。生产实例上，自营 Shopee 店与 TikTok Shop 店各是 Core 的一个平台入口，配额、安全库存与平台已售未扣是 Core 的状态，平台订单事件在 Core 的一笔事务里处理；Core 有一个后台（目录、库存、平台渠道）与一套管理员登录；生产实例对公网只开放后台与平台回调（契约 §3、§3.1、§5.10、§8.6）。**Demo 实例不变**：只有 `/v1`、不挂公网、后台开关为假。同一个 OpenClaw 项目 `stock_core`，任务编号仍是 `CORE-TASK-NNN`。`acuven_inventory` 仓库即将归档，那边的文档只作历史。
+
 项目名确定为 **Acuven Stock Core**，部署边界确定为**独立常驻服务及独立持久化库**。V1 先接公开网店 Demo（独立的 Demo Core 实例），单一库存池；生产实例先给 Inventory 用，由它代表 Acuven 自营的 Shopee 与 TikTok Shop 两个店（契约 0.19，Kelvin 2026-11-21 批准）；真实网店何时接入待定，ERP、POS 以及网店与 Inventory 共卖同一池后续接入。恢复目标：RPO≤5 分钟、RTO≤4 小时（2026-11-10 由 RPO=0 放宽）。不同套餐的装配方式见 [部署包装讨论](../acuven_hub/STOCK_CORE_DEPLOYMENT_PACKAGING_2026-10-08.md)；原方案比较见 [商品与库存关系](../acuven_hub/REVISED_PRODUCT_STOCK_ARCHITECTURE_2026-10-07.md)及[开发优先顺序](../acuven_hub/DEVELOPMENT_PRIORITY_2026-10-08.md)。
 
 ## 阶段 1 设计文档（2026-11-10，契约已由 Kelvin 批准）
@@ -14,7 +16,9 @@
 | [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md) | Core V1 契约（0.5，2026-11-12 批准）：商品身份、库存池、数量模型与流水、预留→确认→释放、幂等与审计、`/v1` API、`StockGateway`、迁移与回退样例、租户与鉴权、恢复目标（RPO≤5 分钟、RTO≤4h）的设计约束 |
 | [docs/TEMPLATE_BOOTSTRAP_PLAN.md](docs/TEMPLATE_BOOTSTRAP_PLAN.md) | 从项目模板起步的方案（2026-11-10 已按它起步，2026-11-11 已推送并部署，之后已登记控制面） |
 | [docs/ESTIMATE_BREAKDOWN.md](docs/ESTIMATE_BREAKDOWN.md) | 工期重估（I-04）用的工作拆分，不是排期 |
-| [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | 设计问题与 Kelvin 的答复（Q-24 暂缓） |
+| [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | 设计问题与 Kelvin 的答复（Q-24 暂缓；深度融合的取舍 Q-81～Q-102 待确认） |
+| [docs/PLATFORM_CHANNELS.md](docs/PLATFORM_CHANNELS.md) | 平台渠道（0.1，Kelvin 2026-11-23 批准）：自营 Shopee 与 TikTok Shop 的授权与令牌、收事件、库存发布与读回、两种暂停、上线切换与人工模式、对账、告警、适配器，以及深度融合的工作包与改造规模 |
+| [docs/ADMIN_AUTH.md](docs/ADMIN_AUTH.md) | Core 后台的管理员账号、密码登录与会话（0.3，Kelvin 2026-11-23 批准；规则沿用原 Inventory 后台登录 0.1） |
 | [docs/PRODUCTION_AND_RECOVERY.md](docs/PRODUCTION_AND_RECOVERY.md) | 生产实例部署与 W7a 备份恢复的设计（0.5，Kelvin 2026-11-21 批准）：同机第二实例、网络隔离、手工升级、binlog 每 4 分钟传 R2、时间点恢复、整机恢复与演练 |
 
 开发任务清单与 OpenClaw 计划见 [docs/TODO.md](docs/TODO.md)；项目规则见 [CLAUDE.md](CLAUDE.md)（与 `AGENTS.md` 同一内容）。
@@ -78,6 +82,8 @@ docker exec "$container" python -m app.cli credential list --tenant ten_…
 | --- | --- | --- | --- |
 | 只有网店 | 使用随附的 Core 商品目录 | 网店后端通过稳定的库存接口直连 Core，查可售量、预留、确认销售及释放 | Core 的一份基础库存账 |
 | 后加 Inventory 并与其他入口共卖同一批货 | 仍使用原 Core 商品目录；图片、文案与渠道售价留在网店 | 网店后端的库存适配器改接 Inventory；Inventory 处理入口映射、份额、同步与异常，再向同一 Core 提交唯一的库存命令 | **同一个** Core 库存账，不在 Inventory 另建余额账 |
+
+（2026-11-23，契约 0.22）本节说的是网店将来与别的入口共卖同一批货时的连接方式。深度融合之后没有单独的 Inventory 系统：平台入口的配额已经在 Core 的同一事务里改（契约 §3.1），网店若要与两个平台共卖同一个池，是在 Core 里给网店的 `api` 入口也加配额，另行设计（契约 §3 的组合规则）。下面两段是 2026-11 之前的建议，留作来历。
 
 Inventory 只在**库存命令路径**上处于网店与 Core 之间，不代理网店所有页面、订单或付款。Core 在单一数量交易内校验已生效的入口额度与预留（这是网店与 Inventory 共卖同一池时的做法；生产实例上 Inventory 是唯一入口、配额不在 Core，见契约 §3 的 0.19 条），Inventory 不可先在自己数据库扣数、再要求 Core 扣第二次。Shop 与 Inventory 都不得同时对 Core 提交同一笔销售事实。
 

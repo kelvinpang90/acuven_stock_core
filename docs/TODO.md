@@ -33,3 +33,14 @@
 <!-- openclaw:planning-v1:end -->
 
 ---
+
+## Inventory 深度融合进 Core（2026-11-23，Kelvin 同日批准）
+
+Kelvin 2026-11-23 决定把 `acuven_inventory` 并入本仓库（`acuven_hub/DECISIONS.md` C-21），并否决了“Inventory 作为进程内模块”的第一稿，要求深度融合。改写后的设计 **Kelvin 2026-11-23 批准**：
+
+- 契约 [CONTRACT_V1.md](CONTRACT_V1.md) 0.22：平台入口、配额进 Core（§3、§3.1）、平台商品（§2.9）、平台订单事件（§5.10）、操作主体（§10 第 4 条）、后台与生产实例的接口（§8.6）；取舍 Q-81～Q-102 见 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) 第 2.1 节；
+- [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 0.1（授权、收事件、发布与读回、上线切换与人工模式、对账、告警；第 14 节是工作包与改造规模）；
+- [ADMIN_AUTH.md](ADMIN_AUTH.md) 0.3（后台登录四层）；
+- [PRODUCTION_AND_RECOVERY.md](PRODUCTION_AND_RECOVERY.md) 0.7与 [PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 的相应说明。
+
+实现任务还没有登记（上面的 planning-v1 块与 `.platform/` 由登记 PR 改）：按 PLATFORM_CHANNELS 第 14.2 节的工作包登记 `CORE-TASK-NNN`（先第 0、1 组：运维前置、执行器与操作主体；再第 2 组：配额与平台事件命令；再第 3、4 组：后台与平台对接），照 CLAUDE.md 过设计预审。
