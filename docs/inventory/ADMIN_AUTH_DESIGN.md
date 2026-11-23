@@ -1,19 +1,40 @@
 # 后台管理员账号、密码登录与会话（V1 设计补充）
 
-> 版本：0.1 · 日期：2026-11-23 · 状态：**Kelvin 2026-11-23 批准全文**（含第 7 节的取舍与残余风险）。批准的是设计；INVENTORY-TASK-001～004 按登记的契约逐个开启（CLAUDE.md「碰个人数据的任务先出设计」）。
+> **出处**：从 `acuven_inventory` 仓库 main 的 `d421aba` 搬来（0.1，Kelvin 2026-11-23 批准），2026-11-23 起放在本仓库 `docs/inventory/`。
+> 版本：**0.2 · 日期：2026-11-23 · 状态：草案，待 Kelvin 批准**。0.2 按 C-21（Inventory 并入 Stock Core）把表、文件位置、迁移、时间、命令行与接口接线改到本仓库的约定；改动的地方都标“（0.2，待 Kelvin 批准）”，汇总在第 0 节，取舍登记为 Core 的 Q-89～Q-91（[OPEN_QUESTIONS](../OPEN_QUESTIONS.md) 第 2.1 节）。密码、锁定、会话、CSRF 的规则与例子（P1–P4、L1–L8、S1–S4、A1–A8）没有改。
+> 0.1 的状态：Kelvin 2026-11-23 批准全文（含第 7 节的取舍与残余风险）。批准的是设计；原 INVENTORY-TASK-001～004 不再在 `acuven_inventory` 执行，0.2 批准后在本仓库改登记为 `CORE-TASK-NNN`（CLAUDE.md「碰个人数据的任务先出设计」）。
 > 依据：[V1_MINIMAL_DESIGN](V1_MINIMAL_DESIGN.md) 第 2 节（登录限流用库表计数，不用 Redis）、第 10 节（V1 只有管理员一个角色；登录页：密码登录、限流、记录异常尝试）、第 12 节（独立账号、密码登录、带限流；变更记操作者）；
-> [REQUIREMENTS](REQUIREMENTS.md) 第 5 节「安全」（独立账号、不与他人共用、登录限流、记录异常尝试、支持立即停用、首期不做双重验证）。
+> [REQUIREMENTS](../../../acuven_inventory/docs/REQUIREMENTS.md)（在 `acuven_inventory` 仓库）第 5 节「安全」（独立账号、不与他人共用、登录限流、记录异常尝试、支持立即停用、首期不做双重验证）；
+> 0.2 另依据本仓库的 [CONTRACT_V1.md](../CONTRACT_V1.md)（0.22 草案）§1、§2.2、§7.2、§8.6、§10 第 1 条与 `CLAUDE.md` 的代码约定。
 > 取值与做法尽量沿用 acuven-shop 已获批、已上线的管理员登录（同样是标准库 scrypt、按来源与用户名组合锁定、服务端会话），不同处与接受的残余风险在第 7 节列出。
 > 本文是 V1_MINIMAL_DESIGN 的补充，只管后台登录；与它冲突时以 V1_MINIMAL_DESIGN 为准。设计有改动时，改动部分的批准作废、须重新批准。
 
-分四个任务实现，每个只做一层：
+分四个任务实现，每个只做一层（0.2：编号改为本仓库的 `CORE-TASK-NNN`，批准后登记；分层不变）：
 
 | 任务 | 层 | 本文章节 |
 | --- | --- | --- |
-| INVENTORY-TASK-001 | 数据模型与第一条迁移 | 第 3 节 |
-| INVENTORY-TASK-002 | 规则与服务（密码、锁定、登录、会话、账号变更） | 第 4.1–4.5 节 |
-| INVENTORY-TASK-003 | 服务器上的账号命令 | 第 4.6 节 |
-| INVENTORY-TASK-004 | 登录、会话、退出接口与后台共用的依赖 | 第 5 节 |
+| 原 INVENTORY-TASK-001 | 数据模型与迁移 | 第 3 节 |
+| 原 INVENTORY-TASK-002 | 规则与服务（密码、锁定、登录、会话、账号变更） | 第 4.1–4.5 节 |
+| 原 INVENTORY-TASK-003 | 服务器上的账号命令 | 第 4.6 节 |
+| 原 INVENTORY-TASK-004 | 登录、会话、退出接口与后台共用的依赖 | 第 5 节 |
+
+前置：Core 契约 0.22 的开关（`CORE_INVENTORY_ENABLED`，§6.1）已实现，第 4.6、5 节靠它判断模块开没开；没实现之前这几个任务不能登记（0.2）。
+
+## 0. 并入 Core 后的改动（0.2，待 Kelvin 批准）
+
+| 项 | 0.1（`acuven_inventory`） | 0.2（本仓库） | 依据 |
+| --- | --- | --- | --- |
+| 账号表的主键 | 自增整数 `id` | `admin_account_id`，`adm_` 加 ULID，`VARCHAR(32)`；它就是写进 Core 流水的 `actor_ref` | Core 契约 §1 的稳定 ID；Q-89 |
+| 会话、登录尝试的主键 | 自增整数 | 不变：自增整数（只在本模块内部用，同 Core 的 `sku_code_history`） | Q-89 |
+| 租户 | 没有 | 账号、会话带 `tenant_id`（非空），登录尝试的 `tenant_id` 可空；表间用复合外键。用户名**全库唯一**（登录时还不知道租户，同令牌摘要的例外）；登录尝试认不出账号时 `tenant_id` 为空（同安全事件的例外） | Core 契约 §10 第 1 条；Q-89 |
+| 时间列 | `DATETIME`（不带小数秒） | `DATETIME(6)`，UTC（Core 的列约定）；`utc_now()` 仍截到整秒，规则与例子不变 | Core 契约 §2.2；Q-90 |
+| 服务函数收什么 | SQLAlchemy `Session` | `Connection`（Core 的服务层不用 ORM 会话）；“提交”指在这个连接上提交事务 | 本仓库代码约定 |
+| 迁移 | 第一条，`0001` | 接在本仓库最后一条之后：`0012`，`down_revision = "0011"`（`20261119_0011_sku_merges.py`）；文件名按 `alembic.ini` 的模板带登记那天的日期 | 本仓库 `alembic/versions/` |
+| 配置 | `INVENTORY_DATABASE_URL` | Core 的 `CORE_DATABASE_URL`；测试库照本仓库 `tests/integration/conftest.py` 的 `CORE_TEST_DATABASE_URL` | 本仓库 `app/config.py` |
+| 账号命令 | `python -m app.admin`，业务错误退出 1、环境错误退出 2，不记审计 | 并进 Core 的运维命令行 `python -m app.cli admin …`；退出码照它（参数与校验错误 2、其他失败 1）；改账号的子命令要 `--actor`、`--reason`，成功后记安全事件 | Core README“运维命令行”、契约 §7.2；Q-91 |
+| 接口的数据库连接 | `app.state.sessionmaker` 与 `get_db` | 用 Core 已有的 `app.state.engine` 取连接，不另建 `sessionmaker`；未配置数据库的 503 去掉（Core 没有连接串就拒绝启动） | 本仓库 `app/main.py` |
+| 路由 | `/api/v1/admin/session` | 不变；与 Core 的 `/v1` 不冲突；只在 `CORE_INVENTORY_ENABLED=true` 时挂上；Core 的请求中间件对 `/api/` 不校验 `X-Request-ID`（总是生成），同 `/healthz` | Core 契约 §8.6 第 4 条、§10 第 5 条 |
+| 引擎 | `make_engine` 加 `hide_parameters=True` | 同样要加，但改的是 Core 的 `app/db.py`，对 Core 全部查询生效（Core 的异常消息里也不再带绑定参数，只有好处）；保留 Core 已有的 UTC 会话时区设置 | 本仓库 `app/db.py` |
 
 ---
 
@@ -36,51 +57,57 @@
 ## 3. 数据模型（INVENTORY-TASK-001）
 
 沿用 `app/db.py` 的 `Base` 与命名约定；指向账号的外键一律 `ON DELETE RESTRICT`。
+（0.2，待 Kelvin 批准）本节的表、类型、迁移与测试做法按本仓库改写，见第 0 节；0.1 的写法见第 8 节的 0.2 记录。列类型照本仓库 `app/models/catalog.py` 的写法：ID 列 `ID`（`VARCHAR(32)`，区分大小写的排序规则）、时间列 `TIMESTAMP`（`DATETIME(6)`）。
 
-**时间**：一律是不带时区的 UTC、**精确到整秒**（`DateTime`，即 MySQL 的 `DATETIME`，不带小数秒）。由此存进库的时间与算出来的时间完全相同，4.2 的窗口、4.4 的到期与 5.1 的 `expires_at` 不会差一秒。
+**时间**：一律是不带时区的 UTC。0.2：列用 `DATETIME(6)`（Core 契约 §2.2 的列约定，Q-90），存进去的值与 Python 的值完全相同（精确到微秒，不会四舍五入）；取当前时间仍**截到整秒**，所以 4.2 的窗口、4.4 的到期与 5.1 的 `expires_at` 照旧不会差一秒，例子不变。
+时间都由应用写，不用数据库的默认值。登录、会话这类判定用应用时钟（`utc_now()`）；Core 契约里“过期判断以数据库时间为准”管的是预留等库存命令，不管本模块。
 取当前时间的函数只有一个：`utc_now()`，在 `app/services/admin_auth.py`（002 写），返回 `datetime.now(UTC).replace(tzinfo=None, microsecond=0)`（截断，不四舍五入）；命令（4.6）与接口（第 5 节）都调它，不另写。
 规则与服务函数接受的 `now` 参数必须是不带时区（`tzinfo` 为 `None`）的整秒，带时区或带小数秒时报 `ValueError`。
 
-**`admin_accounts`**
+**`admin_accounts`**（0.2，待 Kelvin 批准：主键与租户按 Core 的约定，Q-89）
 
 | 列 | 类型 | 约束 |
 | --- | --- | --- |
-| `id` | Integer | 主键，自增 |
-| `username` | String(32) | 非空；唯一 `uq_admin_accounts_username`；检查 `ck_admin_accounts_username_length`：`LENGTH(username) >= 3 AND LENGTH(username) <= 32`。字符集规则在规则层（4.1） |
+| `admin_account_id` | `ID`（`VARCHAR(32)`） | 主键；`adm_` 加 ULID（本仓库 `app/domain/ids.py` 的 `new_id`），永不复用；写进 Core 流水与审计的 `actor_ref` 就是它 |
+| `tenant_id` | `ID` | 非空；外键 → `tenants.tenant_id`；`(tenant_id, admin_account_id)` 唯一（复合外键的引用目标） |
+| `username` | String(32) | 非空；**全库**唯一 `uq_admin_accounts_username`（登录时还不知道租户，同 Core 令牌摘要的例外，契约 §10 第 1 条）；检查 `ck_admin_accounts_username_length`：`LENGTH(username) >= 3 AND LENGTH(username) <= 32`。字符集规则在规则层（4.1） |
 | `password_hash` | String(255) | 非空 |
-| `created_at` | DateTime | 非空 |
-| `password_updated_at` | DateTime | 非空 |
-| `disabled_at` | DateTime | 可空；非空 = 已停用 |
+| `created_at` | `TIMESTAMP`（`DATETIME(6)`） | 非空 |
+| `password_updated_at` | `TIMESTAMP` | 非空 |
+| `disabled_at` | `TIMESTAMP` | 可空；非空 = 已停用 |
 
 **`admin_sessions`**
 
 | 列 | 类型 | 约束 |
 | --- | --- | --- |
-| `id` | Integer | 主键，自增 |
-| `admin_account_id` | Integer | 非空；外键 → `admin_accounts.id`（RESTRICT）；普通索引 |
-| `token_hash` | String(64) | 非空；唯一 `uq_admin_sessions_token_hash`；检查 `ck_admin_sessions_token_hash_length`：`LENGTH(token_hash) = 64` |
-| `created_at` | DateTime | 非空 |
-| `expires_at` | DateTime | 非空；检查 `ck_admin_sessions_expires_after_created`：`expires_at > created_at` |
-| `revoked_at` | DateTime | 可空；非空 = 已撤销 |
+| `id` | BigInteger | 主键，自增（只在本模块内部用，不对外，Q-89） |
+| `tenant_id` | `ID` | 非空；外键 → `tenants.tenant_id` |
+| `admin_account_id` | `ID` | 非空；复合外键 `(tenant_id, admin_account_id)` → `admin_accounts`（RESTRICT）；普通索引 |
+| `token_hash` | String(64) | 非空；唯一 `uq_admin_sessions_token_hash`（全库唯一，同上的例外）；检查 `ck_admin_sessions_token_hash_length`：`LENGTH(token_hash) = 64` |
+| `created_at` | `TIMESTAMP` | 非空 |
+| `expires_at` | `TIMESTAMP` | 非空；检查 `ck_admin_sessions_expires_after_created`：`expires_at > created_at` |
+| `revoked_at` | `TIMESTAMP` | 可空；非空 = 已撤销 |
 
 **`admin_login_attempts`**
 
 | 列 | 类型 | 约束 |
 | --- | --- | --- |
 | `id` | BigInteger | 主键，自增 |
-| `occurred_at` | DateTime | 非空 |
+| `occurred_at` | `TIMESTAMP` | 非空 |
 | `throttle_key` | String(64) | 非空；检查 `ck_admin_login_attempts_throttle_key_length`：`LENGTH(throttle_key) = 64`；与 `occurred_at` 组成普通复合索引（列顺序 `throttle_key`、`occurred_at`） |
 | `source_key` | String(64) | 非空；检查 `ck_admin_login_attempts_source_key_length`：`LENGTH(source_key) = 64`；与 `occurred_at` 组成普通复合索引（列顺序 `source_key`、`occurred_at`） |
-| `admin_account_id` | Integer | 可空（提交的用户名没有对应账号时为空）；外键 → `admin_accounts.id`（RESTRICT） |
+| `tenant_id` | `ID` | 可空（认不出账号时为空，同 Core 安全事件的例外）；外键 → `tenants.tenant_id` |
+| `admin_account_id` | `ID` | 可空（提交的用户名没有对应账号时为空）；复合外键 `(tenant_id, admin_account_id)` → `admin_accounts`（RESTRICT）；检查 `ck_admin_login_attempts_account_tenant`：`admin_account_id IS NULL OR tenant_id IS NOT NULL`（没有这条，复合外键在 `tenant_id` 为空时不检查；同 Core 安全事件表的 `credential_tenant`） |
 | `outcome` | String(20) | 非空；检查 `ck_admin_login_attempts_outcome_known`：`outcome IN ('success', 'bad_password', 'unknown_user', 'disabled', 'locked')` |
 
-- 迁移是本仓库的第一条：按 `alembic.ini` 的 `file_template`，文件是 `alembic/versions/20261123_0001_admin_auth.py`，revision `"0001"`，`down_revision = None`；
-  upgrade 建三张表、逐个写出上面的约束与索引名（与模型按命名约定生成的名字一致）；downgrade 按依赖反序删表。
-- 模型放 `app/models/admin_auth.py`，`app/models/__init__.py` 导出 `AdminAccount`、`AdminSession`、`AdminLoginAttempt`；`alembic/env.py` 加一行 `import app.models`，让 `Base.metadata` 里有这三张表（env.py 顶部注释已要求这样做）。
-- **检查约束要对迁移建出的表测**：CI 的 `alembic check` 比对列、索引、唯一约束与外键，**不比对 CHECK 约束**。所以 001 的集成测试不用 `create_all`，而是用 `alembic.command.upgrade(Config("alembic.ini"), "head")` 在 CI 的一次性库上建表
-  （测试里临时把环境变量 `INVENTORY_DATABASE_URL` 设成 `INVENTORY_TEST_DATABASE_URL` 的值，结束时恢复），跑完下面的例子后 `downgrade(…, "base")`，不影响 CI 之后的迁移步骤。没有测试库时跳过。
-- 002、004 的集成测试只测规则与接口，用 `Base.metadata.create_all` / `drop_all` 建删表即可，测试结束必须删表；没有测试库时跳过。
-- `app/db.py` 的 `make_engine` 改为 `create_engine(database_url, pool_pre_ping=True, hide_parameters=True)`：SQLAlchemy 的异常消息默认带着 SQL 的绑定参数（密码哈希、`token_hash`、`throttle_key` 等），开了它，SQLAlchemy 拼进异常的绑定参数就不出现。数据库自己的错误文本仍可能含列值（例如重复键报错里的用户名），所以异常消息一律不输出、不写进响应：命令只输出异常类名（4.6），接口回答固定的 503（5.1）。
+- **租户**（0.2）：V1 生产实例只有一个租户。建号命令必须给 `--tenant`（4.6），租户须存在且 `active`。会话的 `tenant_id` 取自账号；第 5.4 节的依赖把它放进 `AdminPrincipal`，之后的后台接口经进程内入口发 Core 命令时，它必须等于内部凭据的租户（Core 契约 §8.6 第 1 条），不等就拒绝（V1 不会发生，有了第二个租户再设计）。
+- 迁移（0.2）：接在本仓库最后一条之后，revision `"0012"`，`down_revision = "0011"`；文件名按 `alembic.ini` 的 `file_template`（`<登记那天的日期>_0012_admin_auth.py`）。
+  upgrade 建三张表、逐个写出上面的约束与索引名（与模型按命名约定生成的名字一致）；downgrade 按依赖反序删表。两种实例的库都建这三张表，Demo 库里始终为空（Core 契约 §6.1 的 0.22 开关一条）。
+  第 4.6 节的安全事件要给 `security_events.event_type` 的检查约束加四个值，也在这一条迁移里重建那条约束（Q-91）。
+- 模型放 `app/models/admin_auth.py`，`app/models/__init__.py` 导出 `AdminAccount`、`AdminSession`、`AdminLoginAttempt`；按本仓库 CLAUDE.md 的共享文件清单，`alembic/env.py` 里 import 新模型模块（登记到 `Base.metadata`），`app/models/__init__.py` 与新迁移文件一起列。
+- **检查约束要对迁移建出的表测**：CI 的 `alembic check` 比对列、索引、唯一约束与外键，**不比对 CHECK 约束**。所以 001 的集成测试不用 `create_all`，而是按迁移建出的表测（0.2：照本仓库 `tests/integration/conftest.py` 已有的迁移测试做法与 `CORE_TEST_DATABASE_URL`，例如 `test_demo_reset_schema.py`），跑完下面的例子后复原，不影响 CI 之后的步骤。没有测试库时跳过。
+- 002、004 的集成测试只测规则与接口，建表删表照本仓库集成测试的现有做法；测试结束必须复原；没有测试库时跳过。
+- `app/db.py` 的 `make_engine` 加上 `hide_parameters=True`（0.2：Core 已有的 `pool_pre_ping` 与把会话时区固定为 UTC 的 `connect_args` 保留）：SQLAlchemy 的异常消息默认带着 SQL 的绑定参数（密码哈希、`token_hash`、`throttle_key` 等），开了它，SQLAlchemy 拼进异常的绑定参数就不出现。数据库自己的错误文本仍可能含列值（例如重复键报错里的用户名），所以异常消息一律不输出、不写进响应：命令只输出异常类名（4.6），接口回答固定的 503（5.1）。
 - **上线前提**：生产 MySQL 至少 8.0.16（更早的版本只解析、不执行 CHECK 约束）。CI 用的 `mysql:8.0` 镜像是最新的 8.0 小版本。
 
 **约束的例子**（001 的集成测试对迁移建出的表逐条验证）：
@@ -94,8 +121,13 @@
 | D5 | 空表 | 插入 `outcome` 为 `ok` 的登录尝试；插入 `source_key` 为 63 个字符的登录尝试 | 分别被 `ck_admin_login_attempts_outcome_known`、`ck_admin_login_attempts_source_key_length` 拒绝；五个合法 `outcome` 都可以 |
 | D6 | 账号 1 有一条会话或一条登录尝试 | 删除账号 1 | 被外键拒绝（停用账号用 `disabled_at`，不删行） |
 | D7 | 空表 | 插入 `admin_account_id` 为空的登录尝试 | 可以（用户名不存在的尝试） |
+| D8 | （0.2）租户 A、B 各有一个账号 | 插入一条会话：`tenant_id` 为 B、`admin_account_id` 为 A 的账号；插入一条登录尝试：`admin_account_id` 有值、`tenant_id` 为空；在租户 B 下建与 A 的账号同名的账号 | 前两条分别被复合外键与 `ck_admin_login_attempts_account_tenant` 拒绝；第三条被 `uq_admin_accounts_username` 拒绝（用户名全库唯一） |
+
+上表的“账号 1”在 0.2 指某个 `adm_…` 账号。
 
 ## 4. 规则与服务（INVENTORY-TASK-002，命令是 003）
+
+（0.2，待 Kelvin 批准）本节所有服务函数的 `db`（SQLAlchemy `Session`）改为 `connection`（SQLAlchemy `Connection`，本仓库服务层的写法，不用 ORM 会话）；“提交”“回滚”指在这个连接上提交、回滚事务。账号 ID 由整数改为 `adm_…` 字符串（第 3 节），下面的 `account_id`、`create_account` 的返回值随之为字符串。
 
 ### 4.1 用户名与密码
 
@@ -170,7 +202,7 @@
 - **令牌**：`secrets.token_urlsafe(32)`；库里只存它的 SHA-256 十六进制（`token_hash`）；原文只在登录成功时返回一次。
 - **有效期**：自登录起 **12 小时**绝对到期，使用中不延长。
 - **解析**：`resolve_session(db, *, token, now) -> ActiveSession | None`。按 `token_hash` 找会话；`revoked_at` 为空、`expires_at > 现在`、账号 `disabled_at` 为空，三条都成立才返回
-  `ActiveSession(session_id, account_id, username, expires_at)`（不可变数据类），否则返回 `None`。`token` 不是字符串、为空串或无法按 UTF-8 编码时直接返回 `None`，不抛异常。只读，不提交。
+  `ActiveSession(session_id, account_id, username, expires_at)`（不可变数据类；0.2 加 `tenant_id`），否则返回 `None`。`token` 不是字符串、为空串或无法按 UTF-8 编码时直接返回 `None`，不抛异常。只读，不提交。
 - **撤销**：`revoke_session(db, *, session_id, now) -> None`，把该会话的 `revoked_at` 设为现在并提交；已撤销的再撤销不改原值；没有这个 `session_id` 时什么都不做、不报错。重设密码、停用账号时撤销该账号**全部**未撤销的会话（与改账号在同一事务）。
 - **并发**：登录（4.3）与重设密码、停用、启用（4.5）都先对账号行 `SELECT … FOR UPDATE`，在同一事务里改完才提交，所以对同一账号是串行的：
   停用先提交时，排在后面的登录看到 `disabled_at` 已设，写 `disabled`；登录先提交时，它建的会话已在库里，随后的停用把它一起撤销。重设密码同理（后到的登录用新哈希校验）。
@@ -190,7 +222,7 @@
 
 在 `app/services/admin_auth.py`，各自完成并提交一个事务，时间由参数传入（S3、S4 直接调它们）：
 
-- `create_account(db, *, username, password, now) -> int`（返回账号 id；`created_at` 与 `password_updated_at` 为 `now`）
+- `create_account(db, *, username, password, now) -> int`（返回账号 id；`created_at` 与 `password_updated_at` 为 `now`）（0.2：`create_account(connection, *, tenant_id, username, password, now) -> str`，返回 `adm_…`；租户不存在或已停用抛 `AccountError`，`code` 为 `invalid_tenant`，检查放在用户名合法之后、账号存在与否之前）
 - `reset_password(db, *, username, password, now) -> None`（更新哈希与 `password_updated_at`，撤销该账号全部会话）
 - `disable_account(db, *, username, now) -> bool`（设 `disabled_at` 并撤销全部会话；`False` = 原本已停用，未改）
 - `enable_account(db, *, username) -> bool`（清空 `disabled_at`，不恢复已撤销的会话；`False` = 原本未停用，未改）
@@ -204,6 +236,14 @@
 `python -m app.admin <子命令> <用户名>`，在服务器上的 API 容器里运行；数据库连接串取自 `INVENTORY_DATABASE_URL`（`app/config.py` 的 `Settings`）。
 判定顺序：`argparse` 解析参数 → 没设连接串（退出码 2）→ 用户名合法（退出码 1）→ 查库与提示输入密码。输出的具体措辞由实现定，但必须含规范用户名与结果；测试断言退出码、输出去向与是否含规范用户名，不逐字比对措辞。
 
+（0.2，待 Kelvin 批准，Q-91）**并进 Core 的运维命令行**，下面 0.1 的写法凡与这几条冲突的，以这几条为准：
+- 入口：`python -m app.cli admin <子命令> …`（`app/cli/` 下新加一个模块，照 `app/cli/service_auth.py` 的写法接进 `app/cli/__main__.py`）；连接串取 `CORE_DATABASE_URL`。在服务器上照 Core README 的做法经 `deploy/instance.sh` 找到生产容器，因为要交互输入密码，用 `docker exec -it`。
+- 只在 `CORE_ENV=production` 且 `CORE_INVENTORY_ENABLED=true` 时可用，否则报错退出（不碰库）。
+- `create-account` 多一个必填的 `--tenant ten_…`；四个子命令都要 `--actor`（运维人员标识）与 `--reason`，格式同 Core 命令行的 `credential issue`。
+- **退出码照 Core 命令行**（`app/cli/__init__.py`）：0 成功（含两种「已是……状态」）；2 参数或校验错误——参数不对、`AccountError` 的各种、两次输入不一致；1 其他失败——数据库未配置、连不上、表不存在或其他 `SQLAlchemyError`（输出异常类名，不输出连接串）。输入密码时遇到 EOF 或 Ctrl+C：输出「已取消」、什么都不写，退出码 2。这与 0.1 的 1、2 正好相反。
+- **审计**：成功后照 Core 命令行的做法在提交之后记一条安全事件（Core 契约 §7.2），类型 `admin_account_created`、`admin_password_reset`、`admin_account_disabled`、`admin_account_enabled`（「已是……状态」不记），补充说明里写 `--reason`、目标账号 ID 与规范用户名，不写密码与哈希；事件写入失败时操作照样生效，标准错误多一行警告（同 Core 命令行）。
+- 测试照 Core 命令行的写法：直接调 `main`，传参数列表、`Settings` 与两个输出流，替换 `getpass.getpass` 提供输入。
+
 | 子命令 | 做什么 |
 | --- | --- |
 | `create-account` | 先校验用户名并用 `account_exists` 查库，已存在则报错——都在提示输入密码**之前**。密码用 `getpass` 不回显地输入两次，不一致则报错；再调 `create_account` |
@@ -215,12 +255,15 @@
 - 入口是 `main(argv: list[str] | None = None) -> int`，`if __name__ == "__main__": sys.exit(main())`；测试直接调 `main([...])`，替换 `getpass.getpass` 提供输入。
 - 密码只经交互输入，不接受命令行参数或环境变量。
 - **退出码**：0 成功（含两种「已是……状态」）；1 业务错误或取消——`AccountError` 的四种、两次输入不一致、输入密码时遇到 EOF 或 Ctrl+C（输出「已取消」，什么都不写）；
-  2 运行环境错误——没设 `INVENTORY_DATABASE_URL`、连不上数据库、表不存在或其他 `SQLAlchemyError`（输出「数据库错误」加异常类名，不输出连接串）。参数不对由 `argparse` 处理（它自己的退出码 2）。
+  2 运行环境错误——没设 `INVENTORY_DATABASE_URL`、连不上数据库、表不存在或其他 `SQLAlchemyError`（输出「数据库错误」加异常类名，不输出连接串）。参数不对由 `argparse` 处理（它自己的退出码 2）。（0.2：退出码改照 Core 命令行，见本节开头。）
 - 成功结果（含两种「已是……状态」）写到标准输出，错误与「已取消」写到标准错误；输出只有规范用户名与结果，不打印密码或哈希。规范用户名用 `normalize_username`（4.1，在 `app/domain/pw_hash.py`）算，命令不另写规则。
 
 ## 5. 接口（INVENTORY-TASK-004）
 
 ### 5.1 路径与响应
+
+（0.2，待 Kelvin 批准）路径不变，都在 `/api/v1/…` 下，与 Core 的 `/v1` 不冲突；路由只在 `CORE_INVENTORY_ENABLED=true` 时挂上（Core 契约 §8.6 第 4 条）；反向代理转发 `/api/`（Core 契约 §10 第 5 条）。
+Core 的请求中间件对所有路径生效：`/api/` 下的请求不校验 `X-Request-ID`、总是生成（同 `/healthz`，外部来的头不该让登录 400）；128 KiB 的请求体上限照旧先于本节的 4096 字节检查（超过 128 KiB 时回 Core 格式的 413，本节的例子都在 4096 字节附近，不受影响）；不存在的路径回 Core 格式的 404。
 
 | 方法与路径 | 需要 | 成功 | 失败 |
 | --- | --- | --- | --- |
@@ -230,7 +273,7 @@
 
 **登录接口**是 `async def`，按顺序判定，前五步都不写登录尝试、不计入锁定：
 
-1. 未配置数据库（`database_url` 为空）→ 503 `{"detail": "database_not_configured"}`。
+1. 未配置数据库（`database_url` 为空）→ 503 `{"detail": "database_not_configured"}`。（0.2：去掉这一步——Core 没有连接串就拒绝启动，走不到这里；后面的步号不变。）
 2. 请求头 `Sec-Fetch-Site` 的值是 `cross-site` → 403 `{"detail": "cross_site_request"}`。没有这个头（非浏览器客户端）时放行。
 3. `Content-Type` 的媒体类型（分号前部分，忽略大小写与首尾空白）不是 `application/json` → 415 `{"detail": "unsupported_media_type"}`。跨站的 HTML 表单只能发 `text/plain` 等三种类型，发 `application/json` 必须先过 CORS 预检，本服务不开 CORS，所以这一条让跨站表单发不出能被接受的登录请求。
 4. 读请求体：`Content-Length` 大于 4096，或实际读到的字节超过 4096（逐块读，超过即停）→ 422 `{"detail": "invalid_request"}`。
@@ -247,7 +290,9 @@
 - 本节列出的全部响应（200、204、401、403、415、422、429、503）都带 `Cache-Control: no-store`。
 - 处理中数据库出错（`SQLAlchemyError`）→ 503 `{"detail": "database_unreachable"}`，与 `/readyz` 的原因一致，响应不含异常内容。
 - 每个请求用一个 SQLAlchemy `Session`：`create_app` 用已有的 engine 建 `sessionmaker`，存到 `app.state.sessionmaker`（未配置数据库时为 `None`）；`app/api/admin_session.py` 里的依赖 `get_db(request)` 从 `request.app.state.sessionmaker` 取，为空时回答第 1 步的 503，否则建一个 `Session`、请求结束关闭。之后的后台接口也用这个依赖。
-- `app/api/admin_session.py` 导出 `router`（`APIRouter`），`create_app` 用 `include_router` 挂上。
+  （0.2，待 Kelvin 批准）改为：依赖 `get_connection(request)` 从 Core 已有的 `request.app.state.engine` 取一个连接、请求结束归还，不另建 `sessionmaker`；登录接口在线程池里自己从 engine 取连接（`authenticate` 收 `Connection`）。之后的后台接口也用这个依赖。
+- `app/api/admin_session.py` 导出 `router`（`APIRouter`），`create_app` 用 `include_router` 挂上。（0.2：只在开关为真时挂，同 Core 的 Demo 重置按实例挂的写法；按本仓库 CLAUDE.md 的共享文件清单，`app/main.py` 要列进 `allowed_change_paths`。）
+- （0.2）生产实例的内存上限现在是 256 MiB（`docker-compose.yml`），同时两个 scrypt 约 32 MiB；Inventory 模块上线前按实测重估（[PRODUCTION_AND_RECOVERY](../PRODUCTION_AND_RECOVERY.md) 0.7）。
 - 依赖用 `Annotated[..., Depends(...)]` 写法（`pyproject.toml` 的 ruff 选了 B 规则，参数默认值写 `Depends(...)` 会触发 B008，而本任务改不了 `pyproject.toml`）。
 
 ### 5.2 会话 cookie
@@ -275,7 +320,7 @@ TLS 在边缘反向代理终止，浏览器看到的是 HTTPS，所以 `Secure` 
 
 ### 5.4 供之后后台接口用的依赖
 
-- `require_admin`：解析会话 cookie（4.4），无效时 401 `not_authenticated`；有效时返回 `AdminPrincipal(account_id, username, session_id)`，业务任务用它记操作者。
+- `require_admin`：解析会话 cookie（4.4），无效时 401 `not_authenticated`；有效时返回 `AdminPrincipal(account_id, username, session_id)`，业务任务用它记操作者。（0.2：加 `tenant_id`；`account_id` 即 `adm_…`，经进程内入口发 Core 命令时作 `actor_ref` 传入，Core 契约 §10 第 3 条。）
 - `require_admin_csrf`：先做 `require_admin`，再校验 `X-CSRF-Token`，不符时 403 `csrf_failed`。之后所有改数据的后台接口（POST、PUT、PATCH、DELETE）都用它。
 
 | 编号 | 操作 | 结果 |
@@ -291,7 +336,7 @@ TLS 在边缘反向代理终止，浏览器看到的是 HTTPS，所以 `Secure` 
 
 ## 6. 留给之后任务的事
 
-- 登录尝试的查看（后台显示最近的异常尝试）与过期清理（保留 90 天，随定时作业表一起做）：已在 `docs/TODO.md`「后续计划」列为待登记。清理上线之前，记录一直保留。
+- 登录尝试的查看（后台显示最近的异常尝试）与过期清理（保留 90 天，随定时作业表一起做）：已在 `docs/TODO.md`「后续计划」列为待登记。清理上线之前，记录一直保留。（0.2：没有作业表了，清理作为 Inventory 模块的一个进程内定时作业，Core 契约 §8.6 第 6 条；待登记项随合并在本仓库重新列。）
 - 严重告警：本文不推送登录锁定（V1_MINIMAL_DESIGN 第 11 节的严重异常清单里没有它）。
 - 登录页前端：随「后台前端骨架与 CI 前端检查」做，调用 5.1 的接口。
 
@@ -332,3 +377,11 @@ TLS 在边缘反向代理终止，浏览器看到的是 HTTPS，所以 `Secure` 
   再按预审：A6 的嵌套例子改到 4096 字节以内；`sessionmaker` 存在 `app.state`、由 `get_db` 依赖取用；账号变更的检查顺序与无法编码的密码；命令输出规范用户名。再按最终一轮预审：engine 开 `hide_parameters`（001 改 `app/db.py`）；命令的判定顺序与输出措辞；带旧 cookie 再登录时撤销的时机与出错处理。
   再按独立评审第 2 轮：scrypt 的并发上限从 `pw_hash` 的信号量改为接口层的 `anyio.CapacityLimiter(2)` 加进行中 10 个的上限（等待不占线程、连接、行锁），新增 A8；写明代理不设置 `X-Real-IP` 时按来源上限会造成全站锁定；A6 不再断言一定抛 `RecursionError`；第 7 节补「人工解除锁定的命令」。按第 3 轮建议改措辞（不改规则）：第 7 节表格断行、`hide_parameters` 的保证范围、A8 测试复原计数。
 - **0.1 批准**（2026-11-23）：Kelvin 批准全文，包括第 7 节的取舍、没有采用的加固与接受的残余风险。
+- **0.2**（2026-11-23，**草案，待 Kelvin 批准**）：按 C-21 搬进 `acuven_stock_core` 的 `docs/inventory/`，改到本仓库的约定；规则与例子不变。取舍见 Core 的 Q-89～Q-91。
+  1. 头部：注明出处（`acuven_inventory` main 的 `d421aba`）；REQUIREMENTS 改指 `acuven_inventory` 仓库；任务表改为“原 INVENTORY-TASK-00x”，批准后在本仓库登记为 `CORE-TASK-NNN`；加前置“开关已实现”。
+  2. 新增第 0 节，汇总改动。
+  3. 第 3 节：账号主键由自增整数改为 `adm_`＋ULID（0.1：`id` Integer 自增）；三张表加 `tenant_id`、改用复合外键（0.1：单列外键 → `admin_accounts.id`）；用户名与令牌摘要全库唯一（写明是租户约定的例外）；登录尝试加 `ck_admin_login_attempts_account_tenant`；时间列由 `DATETIME` 改为 `DATETIME(6)`，`utc_now()` 仍截整秒（0.1：精确到整秒的 `DateTime`）；迁移由第一条 `0001`（`20261123_0001_admin_auth.py`，`down_revision = None`）改为接在 `0011` 之后的 `0012`，并在同一条迁移里给安全事件加四个类型；测试改用本仓库的 `CORE_TEST_DATABASE_URL` 与迁移测试做法（0.1：`INVENTORY_TEST_DATABASE_URL`）；`hide_parameters` 写明改的是 Core 的 `app/db.py`、保留 UTC 会话时区；新增 D8。
+  4. 第 4 节：服务函数收 `Connection` 而不是 `Session`；账号 ID 为字符串；`create_account` 加 `tenant_id`、新增错误码 `invalid_tenant`；`ActiveSession` 加 `tenant_id`。
+  5. 第 4.6 节：命令由 `python -m app.admin` 并进 `python -m app.cli admin`；只在生产且开关为真时可用；加 `--tenant`、`--actor`、`--reason`；退出码改照 Core 命令行（0.1：业务错误 1、环境错误 2）；成功后记安全事件（0.1：不记）。
+  6. 第 5.1 节：路由只在开关为真时挂；Core 中间件对 `/api/` 不校验 `X-Request-ID`、128 KiB 与 404 的格式照 Core；去掉“未配置数据库”那一步；连接改用 `app.state.engine`（0.1：`sessionmaker` 与 `get_db`）；写明内存上限要重估。
+  7. 第 6 节：登录尝试的清理改为进程内定时作业（0.1：随定时作业表）。
