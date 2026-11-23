@@ -216,7 +216,7 @@ CORE-TASK-069 起草运行手册时发现（[PRODUCTION_AND_RECOVERY.md](PRODUCT
 ### 2.1 Inventory 深度融合进 Core（契约 0.22，2026-11-23 起草，**都待 Kelvin 确认**）
 
 C-21（Kelvin 2026-11-23）已定合并本身。最初按“进程内模块”起草了一版（PR #189 第 1–3 轮审查，当时的 Q-81～Q-99），**Kelvin 否决：要深度融合，不能是两个项目塞在一起**。那一组 Q 作废，换成下面这组，编号从 Q-81 重新起。本稿第 1 轮独立审查之后改写了 Q-83、Q-86、Q-97，新增 Q-98～Q-101；第 2 轮审查之后又改了 Q-83、Q-97，新增 Q-102。
-条文在契约 0.22（第 14 节第 104–160 条）、[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 0.1 与 [ADMIN_AUTH.md](ADMIN_AUTH.md) 0.3。每条都要 Kelvin 确认；不同意哪条就改那条的条文、重新提交。
+条文在契约 0.22（第 14 节第 104–168 条）、[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 0.1 与 [ADMIN_AUTH.md](ADMIN_AUTH.md) 0.3。每条都要 Kelvin 确认；不同意哪条就改那条的条文、重新提交。
 
 | 编号 | 问题 | 选项 | 推荐与理由 | 落到哪里 |
 | --- | --- | --- | --- | --- |
