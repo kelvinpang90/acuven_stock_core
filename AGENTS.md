@@ -6,13 +6,16 @@
 
 ## 项目概况
 
-- **是什么**：Acuven Stock Core，商品身份目录与基础库存账的唯一权威（独立常驻服务＋独立库）。网店等业务模块只经 `/v1` 私有 API 调它；
+- **是什么**：Acuven Stock Core，商品身份目录与基础库存账的唯一权威（独立常驻服务＋独立库）。网店等外部业务模块只经 `/v1` 私有 API 调它；
   没有面向客户的界面。V1 的第一个接入方是公开网店 Demo（独立的 Demo Core 实例，`CORE_ENV=demo`）。
+- **Inventory 深度融合进 Core**（`acuven_hub/DECISIONS.md` C-21，2026-11-23；契约 0.22 草案、[docs/PLATFORM_CHANNELS.md](docs/PLATFORM_CHANNELS.md)、[docs/ADMIN_AUTH.md](docs/ADMIN_AUTH.md)，
+  **待 Kelvin 批准，批准前不登记实现任务**）：没有“Inventory 模块”。生产实例的 Shopee 店与 TikTok Shop 店各是 Core 的一个平台入口，配额、安全库存与平台已售未扣是 Core 的状态，
+  平台订单事件在 Core 的一笔事务里处理；Core 有一个给 Acuven 管理员用的后台（按 `CORE_ADMIN_ENABLED` 打开，Demo 上打开即拒绝启动）。写代码时不要再造“Inventory 服务”“Inventory 模块”这类边界。
 - **设计依据**：[REQUIREMENTS.md](REQUIREMENTS.md)（需求，2026-11-10 修订）与 [docs/CONTRACT_V1.md](docs/CONTRACT_V1.md)（契约 0.21，Kelvin 2026-11-23 批准）。
   账本、流水、预留状态机、幂等、数据库结构都在设计闸门内：实现必须与契约一致，**偏离契约的改动先改契约、重新批准**，不在代码里另立规则。
   问题与答复见 [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md)。
 - **技术栈**：Python 3.12＋FastAPI＋SQLAlchemy 2/Alembic＋MySQL 8（共享 `infra_mysql` 里的独立库）；不用 Redis 存任何权威数据；
-  Docker 镜像按提交 SHA 构建，`deploy.yml` 经 SSH 在服务器上换容器；Core 不开公网入口。
+  Docker 镜像按提交 SHA 构建，`deploy.yml` 经 SSH 在服务器上换容器；Demo 实例不开公网入口，生产实例（契约 0.22 批准后）只经反向代理开放后台与平台接口（`/admin/`、`/api/`）。
 - **任务编号**：`CORE-TASK-NNN`（控制面登记的 task_id_pattern：`^CORE-TASK-[0-9]{3}$`；project_id `stock_core`）
 - **任务清单**：[docs/TODO.md](docs/TODO.md)（顶部的 planning-v1 块决定下一项任务）
 - **OpenClaw 契约**：[.platform/](.platform/)（project / commands / tasks 三个文件，默认 deny）
