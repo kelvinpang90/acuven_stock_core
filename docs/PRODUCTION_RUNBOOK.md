@@ -7,6 +7,9 @@
 
 下面的步骤都由人做。
 
+> **（2026-11-23，草案，待 Kelvin 批准）** Inventory 深度融合进 Core（C-21，契约 0.22、设计 0.7、[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)）：生产实例上没有 Inventory 这个调用方，两个平台店铺是 Core 自己的入口，后台在 Core 的进程里。
+> 所以生产实例不再签 Inventory 的业务凭据与对账凭据，只签巡检凭据；生产 Core 改挂代理网络并开 vhost；恢复时起生产 Core 之前先设上“自动写平台暂停”。受影响的步骤下面都加了“（0.22，待批准）”的说明；批准、相应任务实现之前，照原步骤做（Inventory 的两个凭据先不签）。
+
 ## 0. 约定
 
 ### 0.1 占位符
@@ -26,6 +29,7 @@
 | `<演练标记库名>` | 演练量丢失窗口用的库（第 4.2 节） |
 | `<临时实例容器>` | 误操作恢复用的临时 MySQL 实例的容器名（第 3.10 节） |
 | `<运行账号>` | 服务器上跑 cron 的账号 |
+| `<代理网络>` | （0.22，待批准）`infra_nginx` 所在的代理网络的名字（以 `vps_infra` 为准） |
 | `<操作人引用>` | 命令行 `--actor` 用的引用（契约第 1 节的引用格式，不含姓名与邮箱），例如 `ops-7` |
 | `<租户 ID>`、`<地点 ID>`、`<池 ID>`、`<入口 ID>`、`<凭据 ID>` | 命令行输出里的 `ten_…`、`loc_…`、`pool_…`、`chan_…`、`cred_…` |
 | `<SHA>` | 完整的 40 位小写 commit SHA |
@@ -161,6 +165,30 @@ core credential list --tenant <租户 ID>
 
 之后按 [OPS_MONITORING.md](OPS_MONITORING.md) 装生产的巡检（心跳检查、`.env`、cron 与演练）。
 
+**（0.22，待批准）深度融合之后的开通与签发**：
+- 入口不再是一个名为 Inventory 的入口，而是同一个池上的三个入口：两个 `platform` 入口（Shopee、TikTok Shop，带平台与店铺 ID）与一个 `backoffice` 入口（契约 0.22 §3）。开通第一个平台入口时，命令行自动建平台事件的系统主体。具体的参数以实现入口种类的任务（工作包 P1e）为准。
+- 凭据只签巡检那一个（`Stock core monitor`）；**不签** `Inventory` 业务凭据与 `Inventory reconciliation` 对账凭据。
+- 核对：`core credential list --tenant <租户 ID>` 应有一个 `service` 种类、`active` 的凭据（巡检，下面恰好一个令牌），另有一个 `system` 种类的平台事件主体（没有令牌）；建了管理员账号之后，每个账号还有一个 `admin` 种类的主体（没有令牌）。
+- 已经按上面签过 Inventory 业务凭据或对账凭据的，用 `core credential revoke --credential <凭据 ID> …` 吊销它们。
+
+### 1.5b 开放后台与平台接口（0.22，待批准）
+
+前提：契约 0.22 批准、生产实例改挂代理网络的部署任务已合并并部署（设计第 1.2 节第 1 条的 0.7 一项）。真实域名、vhost 文件名与路径都不写进本仓库、工单与对话。
+
+1. 由 `vps_infra` 给生产实例开 vhost（做法以 `vps_infra` 的说明为准），要求：
+   - 只转发 `/admin/` 与 `/api/` 两个前缀到生产 Core 在代理网络上的别名 `stock_core_production` 的 8000 端口，其余路径（含 `/v1`、`/healthz`、`/readyz`）一律 404；
+   - `proxy_set_header X-Real-IP $remote_addr`（覆盖，不是追加）；
+   - TLS 用现有的通配符证书。
+2. 在 Cloudflare 配子域名。
+3. 生产检出的 `.env` 加一行 `CORE_ADMIN_ENABLED=true`（只写这一行，不加引号、空格与注释）；平台应用凭据、令牌加密主密钥与 Telegram 令牌按实现任务写的 secrets 文件放好；按第 1.4 步手工触发一次生产部署。
+4. 建管理员账号（要交互输入密码，所以用 `-it`；`container` 照第 0.2 节取）：
+   `docker exec -it "$container" python -m app.cli admin create-account <用户名> --tenant <租户 ID> --actor <操作人引用> --reason "First admin"`（参数以实现它的任务为准，[ADMIN_AUTH.md](ADMIN_AUTH.md) 第 4.6 节）。
+5. 从外网核对：
+   - `/api/` 下的一个回调路由能访问到（未授权时回答它自己的错误，不是代理的 404）；
+   - `/v1/ops/invariants`、`/healthz`、`/readyz` 都是 404；
+   - 带一个伪造的 `X-Real-IP` 头登录失败几次，在库里看 `admin_login_attempts` 的 `source_key` 没有随头变化（[ADMIN_AUTH.md](ADMIN_AUTH.md) 第 5.3 节）。**这项没过，把开关改回 `false` 再部署一次**，修好 vhost 再来。
+6. 在服务器上核对：`docker network inspect <代理网络> --format '{{range .Containers}}{{.Name}} {{end}}'` 里有生产的 `core_api` 容器；`data_net` 里没有。
+
 ### 1.6 真实期初之前的核对
 
 四项都过了才做真实期初：
@@ -237,7 +265,7 @@ core credential list --tenant <租户 ID>
 ### 3.1 开机器、取密钥
 
 1. 开新机器，装 Docker。
-2. 从密码管理器取回重建要用的密钥（设计 P-05 的清单）：R2 凭据、`vps_infra` 的 `MYSQL_ROOT_PASSWORD`、源站证书、两个 Core 检出与 Demo 网店、Inventory 的 `.env`、心跳地址。
+2. 从密码管理器取回重建要用的密钥（设计 P-05 的清单）：R2 凭据、`vps_infra` 的 `MYSQL_ROOT_PASSWORD`、源站证书、两个 Core 检出与 Demo 网店、Inventory 的 `.env`、心跳地址。（0.22，待批准：“Inventory 的 `.env`”改为生产 Core 的平台应用凭据、令牌加密主密钥与 Telegram 令牌。）
    这些 `.env` 里没有令牌那几行（存的时候去掉了），令牌在第 3.7 步重新轮换出来。
 
 ### 3.2 起基础设施
@@ -339,6 +367,9 @@ printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u <GitHub 账号> --passw
 unset GHCR_READ_TOKEN
 ```
 
+**（0.22，待批准，契约 §12.1 第 3 条、Q-95）部署生产实例之前，设上“自动写平台暂停”**：按第 0.2 节定义 `mysql_root`，在恢复出的生产库里把暂停标记设上，原因写“整机恢复”。
+SQL 写成**只在还没设上时才改**（已设上时不改原因、设上人与时间，[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 5 节）；表与 SQL 由实现这个标记的任务补进这里。必须在起生产容器之前做：容器一起来发布作业就会跑，等不及后台。设好后查一遍，确认标记已设上，再往下。
+
 **部署两个实例**（工作流的 secrets 还指着旧机器，所以直接在机器上跑 `deploy/deploy.sh`）。每个实例：
 
 ```bash
@@ -371,6 +402,8 @@ docker logout ghcr.io
 | 生产 | 巡检的运维凭据 | `<生产检出目录>/.env` 的 `CORE_MONITOR_TOKEN` |
 | 生产 | Inventory 对账的运维凭据 | Inventory 服务器的密钥文件 |
 
+（0.22，待批准）深度融合之后，上表生产的两行 Inventory 凭据不存在；管理员与平台事件的操作主体没有令牌，不用轮换。生产上只轮换巡检的运维凭据。
+
 在对应的检出目录里，按第 0.2 节找到**本实例**的容器并定义 `core`，然后：
 
 ```bash
@@ -386,12 +419,13 @@ core credential rotate --credential <凭据 ID> --overlap-hours 0 \
 
 生产的巡检按 [OPS_MONITORING.md](OPS_MONITORING.md) 第 3、4 节确认 `.env` 并装 cron。
 
-**再起调用方**：网店、Inventory 等，按各自的部署说明。
+**再起调用方**：网店、Inventory 等，按各自的部署说明。（0.22，待批准：生产实例没有外部调用方，平台事件处理与后台随上面的生产部署一起起来；`.env` 里的 `CORE_ADMIN_ENABLED=true` 随 P-05 的那份写回。）
 
 ### 3.8 补交与补录（契约 §12.1 第 4 条）
 
 1. 调用方补交“结果未知”的命令，补录丢失窗口：网店按支付记录；Inventory 按两个平台的订单补拉，人工模式下由管理员重新核对卖家后台、在 Inventory 重新登记。
-2. 网店与 Inventory 都用 `GET /v1/skus?ids=…` 重读映射，Core 查不到的 SKU 标为待处理。
+   （0.22，待批准）生产实例改为：没有要补交的命令（平台事件的效果与去重记录一起退回）；先在后台看两个平台连接，丢失窗口里刷新过令牌的会显示授权失效，重新授权（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 2 节）；再从丢失窗口的起点补拉两个平台的订单（补拉作业从连接上的游标开始；人工模式下由管理员重新核对卖家后台、在后台重新登记）。
+2. 网店与 Inventory 都用 `GET /v1/skus?ids=…` 重读映射，Core 查不到的 SKU 标为待处理。（0.22，待批准：生产实例的平台商品就在同一个库里，不用重读。）
 3. 然后对账，跑一次不变量自查。生产上在 `<生产检出目录>` 里手工跑一轮巡检：
 
    ```bash
@@ -399,6 +433,7 @@ core credential rotate --credential <凭据 ID> --overlap-hours 0 \
    ```
 
    标准错误里不应有以 `P1 invariants` 或 `P2 invariants` 开头的行（判读见 [OPS_MONITORING.md](OPS_MONITORING.md) 第 6.3 节）。
+4. （0.22，待批准，Q-95）生产实例：在后台确认收件箱没有积下的未处理事件；由管理员手动发起一次平台对账。差异处理完之后，才由管理员在后台解除“自动写平台暂停”，平台的库存发布从这时起恢复。
 
 到这里停表，记下第 3.1–3.8 步的总用时。
 
@@ -441,6 +476,7 @@ core credential rotate --credential <凭据 ID> --overlap-hours 0 \
 
 5. 在临时实例上**只把受影响的库**导出（`mysqldump --single-transaction --databases <受影响的库>`），搬回线上。
 6. 搬回的是 Core 的库时，第 3.5 步**只对搬回的那个 Core 库做**，并在起它的 Core 之前做：按第 0.2 节找到该实例的容器，`docker stop "$container"`，导入，调自增起点并用 `SHOW CREATE TABLE` 核对，再 `docker start "$container"`。调完之后同样不能再往这个库重放 binlog。
+   （0.22，待批准）搬回的是生产 Core 的库时，在导入、调自增起点之后、`docker start` 之前，照第 3.7 步那段 SQL 设上“自动写平台暂停”（平台订单、配额与收件箱随库一起退回了，平台上的显示量没有）；起来之后照第 3.8 步第 1、4 条检查连接、补拉、对账，再由管理员解除。
 7. 用完删掉临时实例。
 
 ---
@@ -454,6 +490,7 @@ core credential rotate --credential <凭据 ID> --overlap-hours 0 \
 
 - 演练机**不改 DNS**、**不装任何 cron**，`.env` 里**不填心跳地址**（演练机推成功会把线上真实的故障遮住）。第 3.9 步不做，GitHub secrets 不改。
 - 只起 Core 和第 3.8 步要用的调用方：Demo 网店与一套演练用的 Inventory 配置，不连线上的平台。它们的外发凭据（平台、支付、短信、邮件、WhatsApp、Telegram）一律换成假值。
+  （0.22，待批准）“演练用的 Inventory 配置”即演练机上的生产 Core 打开后台开关，平台应用凭据与 Telegram 换成假值，令牌加密主密钥用演练专用的；不开 vhost。第 3.7 步设上的“自动写平台暂停”演练全程**不解除**。
 - 读 R2 用一个**只读令牌**（由人新建，设计第 4 节），演练机的 rclone 配置只放它，不放可写的 R2 凭据。
 - 第 3.6 步：只做那次全量导出并计时，导出留在演练机上、随机器一起删；**不传 R2**、不启用 binlog 上传 cron 与每晚备份。
 - 第 3.7 步：轮换只发生在演练机恢复出的库里，不影响线上的凭据与令牌。拉镜像照第 3.7 步临时建只读包令牌登录，演练完在 GitHub 删掉。
