@@ -574,7 +574,8 @@ V1 用拉取，不做推送（Q-08）。
 
 **改配额与安全库存** `allocations.update`（后台，§8.6；`stock_admin`）
 - 正文：`pool_id`、`sku_id`、`expected_version`（`pool_allocations` 的版本，行还不存在时为 0）、可选的 `safety_stock`、可选的 `quotas`（`[{"channel_id": …, "quota": …}, …]`，每个入口最多出现一次，必须是这个池的 `platform` 入口）、`reason`（必填）。`safety_stock` 与 `quotas` 至少带一个。
-- 事务里按上面的锁序锁住池行、余额行与配额行，然后依次判定：SKU 不存在 404 → 版本不符 409 `VERSION_CONFLICT`（`details.current_version`）→ **有任何一个入口的配额增加**时，按新值算的 `F'` 必须 ≥ 0，否则 409 `ALLOCATION_EXCEEDS_UNALLOCATED`，`details` 带 `available`、`safety_stock`、`quota_total`、`pending_total` 与 `unallocated`（即 `F'`）。只减配额、只改 `S` 不做这项判定（减配额总是让 `F` 变大；提高 `S` 造成的超额照上面的规则处理）。
+- 事务里按上面的锁序锁住池行、余额行与配额行，然后依次判定：SKU 不存在 404 → 版本不符 409 `VERSION_CONFLICT`（`details.current_version`）→ **有任何一个入口的配额增加**时，按新值算的 `F'` 必须 ≥ 0，否则 409 `ALLOCATION_EXCEEDS_UNALLOCATED`，`details` 带 `available`、`safety_stock`、`quota_total`、`pending_total` 与 `unallocated`（即 `F'`）。只减配额、只改 `S` 不做这项判定（减配额总是让 `F` 变大；提高 `S` 造成的超额照上面的规则处理）
+  → 人工模式下这个 SKU 在某个平台入口有逾期的人工核对，又要增加**别的**平台入口的配额：409 `MANUAL_CHECK_OVERDUE`，`details` 带逾期的 `channel_id`（原 Inventory 需求 4.1；核对记录见 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节）。
 - 通过后写新值、`version` 加一、写一条 `allocation_changes`，与幂等记录同一事务提交。之后的发布见 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)。
 - 页面上看到的是旧版本时被拒（`VERSION_CONFLICT`），所以两个管理员不会互相覆盖；平台事件同时改了这个 SKU 的配额也会让版本加一（见下面的例子第 4 步之后的说明）。
 
@@ -2758,7 +2759,7 @@ Kelvin 2026-11-23 定：改成两个运维凭据（本项目记为 Q-80）。
 | 106 | 配额、安全库存、`pending` 原是 Inventory 的状态，与 Core 的账在两个事务里 | 范围变化 | 成为 Core 的状态与规则：`pool_allocations`、`channel_allocations`，锁序插在余额行与 SKU 行之间；事件对各量的影响、恢复条件、超额规则照原 Inventory 设计 4.2；平台订单的预留不看 `S` 与配额；`api` 入口的可售量不变（Q-81） | §3.1 |
 | 107 | `pending` 怎么建模：单独计数，还是用不过期的预留表示未付款的平台订单 | 未决定 | 单独计数，按平台入口 × SKU 存；未付款与被拒的平台订单都在里面；比较见 Q-82 | §3.1 |
 | 108 | 平台在发布生效前多卖、超过剩余配额时 `Q` 怎么改 | 未决定 | `Q` 只减到 0，多出来的件照样进 `pending`，由 `F` 体现、按超额处理（Q-97） | §3.1 |
-| 109 | 管理员改配额与安全库存的命令 | 范围变化 | `allocations.update`：带版本、锁序同上；配额增加时要求 `F' ≥ 0`，否则 409 `ALLOCATION_EXCEEDS_UNALLOCATED`；改动记在只追加的 `allocation_changes`；配例子 | §3.1 |
+| 109 | 管理员改配额与安全库存的命令 | 范围变化 | `allocations.update`：带版本、锁序同上；配额增加时要求 `F' ≥ 0`，否则 409 `ALLOCATION_EXCEEDS_UNALLOCATED`；人工核对逾期时不能加别的平台的配额（409 `MANUAL_CHECK_OVERDUE`）；改动记在只追加的 `allocation_changes`；配例子 | §3.1 |
 | 110 | 平台规格与 SKU 的映射原在 Inventory | 范围变化 | 并入目录：`sku_listings`（挂在 SKU 下），挂上、改挂、解除三个命令，写目录变更记录、取目录写锁；同一入口一个 SKU 最多一条生效的平台商品；配额不为 0 时不能改挂或解除（Q-90） | §2.9 |
 | 111 | 目录的停用与合并不知道平台商品 | 范围变化 | 有生效平台商品的 SKU（及其商品）不能停用，新建合并也拒绝，409 `SKU_HAS_ACTIVE_LISTINGS`；变更流加三种 `listing_*` 事件与 `object_type` `listing`（Q-90） | §2.5、§2.6 第 5 条、§2.7、§2.8 |
 | 112 | 平台订单与事件存在哪、Core 的引用怎么派生 | 范围变化 | `platform_orders`（四个阶段）、`platform_order_lines`、`platform_events`（收件箱，原 Inventory 设计 5.2 的去重键唯一）；引用格式照原 Inventory 设计 3.2 | §5.10 |
@@ -2794,7 +2795,7 @@ Kelvin 2026-11-23 定：改成两个运维凭据（本项目记为 Q-80）。
 - `/v1` 在生产只挂自查与只读命令行、`/api/` 的请求头规则、uvicorn 访问日志、关停宽限期与并行停止、新令牌立即存下：**仍成立**，照搬（§8.6）。
 - 第 3 轮的两条遗留小建议：暂停标记已设上时不改它的原因字段——写进 §12.1 第 3 条；两个“暂停”各管什么——写进 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)。
 
-不改：四个账面量与流水的规则、预留状态机、已有命令的判定顺序、`/v1` 已有接口的语义、错误码（只加 `SKU_HAS_ACTIVE_LISTINGS`、`LISTING_NOT_FOUND`、`LISTING_ALREADY_LINKED`、`LISTING_SKU_TAKEN`、`LISTING_HAS_QUOTA`、`ALLOCATION_EXCEEDS_UNALLOCATED`，都只在后台出现）、scope 表；幂等作用域与锁名的拼法不变。角色表加了 0.22 的四行。
+不改：四个账面量与流水的规则、预留状态机、已有命令的判定顺序、`/v1` 已有接口的语义、错误码（只加 `SKU_HAS_ACTIVE_LISTINGS`、`LISTING_NOT_FOUND`、`LISTING_ALREADY_LINKED`、`LISTING_SKU_TAKEN`、`LISTING_HAS_QUOTA`、`ALLOCATION_EXCEEDS_UNALLOCATED`、`MANUAL_CHECK_OVERDUE`，都只在后台出现）、scope 表；幂等作用域与锁名的拼法不变。角色表加了 0.22 的四行。
 
 **对调用方的影响**：
 - Demo 网店没有变化：Demo 实例照旧只有 `/v1`、不挂公网、后台开关为假；Demo 的池只有一个 `api` 入口，没有配额、平台商品与平台订单；凭据不变。变化只有两处，都不影响请求的结果：`/api/`、`/admin/` 路径的 404 不再回显调用方给的 `X-Request-ID`；容器日志里没有 uvicorn 的访问行（Core 按路径记的照旧）。
