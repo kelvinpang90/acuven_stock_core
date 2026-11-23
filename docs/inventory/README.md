@@ -1,7 +1,7 @@
 # Inventory 模块的设计文档
 
 > 2026-11-23 起草。Kelvin 2026-11-23 决定把 `acuven_inventory` 并入本仓库（`acuven_hub/DECISIONS.md` C-21）：同一仓库、同一服务、同一个 OpenClaw 项目 `stock_core`，Inventory 只在生产实例按开关打开，在进程内调用 Core。
-> Core 一侧的条文在 [CONTRACT_V1.md](../CONTRACT_V1.md) 0.22（草案，待批准；§8.6 进程内入口），取舍见 [OPEN_QUESTIONS.md](../OPEN_QUESTIONS.md) 第 2.1 节的 Q-81～Q-91。
+> Core 一侧的条文在 [CONTRACT_V1.md](../CONTRACT_V1.md) 0.22（草案，待批准；§8.6 进程内入口），取舍见 [OPEN_QUESTIONS.md](../OPEN_QUESTIONS.md) 第 2.1 节的 Q-81～Q-99。
 
 ## 现行设计（在本目录）
 

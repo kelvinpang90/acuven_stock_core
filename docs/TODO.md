@@ -38,7 +38,7 @@
 
 Kelvin 2026-11-23 决定把 `acuven_inventory` 并入本仓库（`acuven_hub/DECISIONS.md` C-21）。设计改写已起草、**待 Kelvin 批准**：
 
-- 契约 [CONTRACT_V1.md](CONTRACT_V1.md) 0.22 草案（新增 §8.6 进程内入口；取舍 Q-81～Q-88，见 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) 第 2.1 节）；
+- 契约 [CONTRACT_V1.md](CONTRACT_V1.md) 0.22 草案（新增 §8.6 进程内入口；取舍 Q-81～Q-88、Q-92～Q-99，见 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) 第 2.1 节）；
 - [inventory/V1_MINIMAL_DESIGN.md](inventory/V1_MINIMAL_DESIGN.md) 0.4、[inventory/ADMIN_AUTH_DESIGN.md](inventory/ADMIN_AUTH_DESIGN.md) 0.2 草案（取舍 Q-89～Q-91）；
 - [PRODUCTION_AND_RECOVERY.md](PRODUCTION_AND_RECOVERY.md) 0.7 草案与 [PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 的相应说明。
 
