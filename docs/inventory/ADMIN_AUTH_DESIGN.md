@@ -29,11 +29,11 @@
 | 租户 | 没有 | 账号、会话带 `tenant_id`（非空），登录尝试的 `tenant_id` 可空；表间用复合外键。用户名**全库唯一**（登录时还不知道租户，同令牌摘要的例外）；登录尝试认不出账号时 `tenant_id` 为空（同安全事件的例外） | Core 契约 §10 第 1 条；Q-89 |
 | 时间列 | `DATETIME`（不带小数秒） | `DATETIME(6)`，UTC（Core 的列约定）；`utc_now()` 仍截到整秒，规则与例子不变 | Core 契约 §2.2；Q-90 |
 | 服务函数收什么 | SQLAlchemy `Session` | `Connection`（Core 的服务层不用 ORM 会话）；“提交”指在这个连接上提交事务 | 本仓库代码约定 |
-| 迁移 | 第一条，`0001` | 接在本仓库最后一条之后：`0012`，`down_revision = "0011"`（`20261119_0011_sku_merges.py`）；文件名按 `alembic.ini` 的模板带登记那天的日期 | 本仓库 `alembic/versions/` |
+| 迁移 | 第一条，`0001` | 接在**登记时**本仓库的最后一条之后（写这一版时最后一条是 `0011`，`20261119_0011_sku_merges.py`；登记之前若已有别的迁移合并，就接在那条之后），revision 与文件名按 `alembic.ini` 的模板与登记那天的日期取 | 本仓库 `alembic/versions/` |
 | 配置 | `INVENTORY_DATABASE_URL` | Core 的 `CORE_DATABASE_URL`；测试库照本仓库 `tests/integration/conftest.py` 的 `CORE_TEST_DATABASE_URL` | 本仓库 `app/config.py` |
 | 账号命令 | `python -m app.admin`，业务错误退出 1、环境错误退出 2，不记审计 | 并进 Core 的运维命令行 `python -m app.cli admin …`；退出码照它（参数与校验错误 2、其他失败 1）；改账号的子命令要 `--actor`、`--reason`，成功后记安全事件 | Core README“运维命令行”、契约 §7.2；Q-91 |
 | 接口的数据库连接 | `app.state.sessionmaker` 与 `get_db` | 用 Core 已有的 `app.state.engine` 取连接，不另建 `sessionmaker`；未配置数据库的 503 去掉（Core 没有连接串就拒绝启动） | 本仓库 `app/main.py` |
-| 路由 | `/api/v1/admin/session` | 不变；与 Core 的 `/v1` 不冲突；只在 `CORE_INVENTORY_ENABLED=true` 时挂上；Core 的请求中间件对 `/api/` 不校验 `X-Request-ID`（总是生成），同 `/healthz` | Core 契约 §8.6 第 4 条、§10 第 5 条 |
+| 路由 | `/api/v1/admin/session` | 不变；与 Core 的 `/v1` 不冲突；只在 `CORE_INVENTORY_ENABLED=true` 时挂上；Core 的请求中间件对 `/api/` **一律不用调用方给的 `X-Request-ID`、总是生成**，也不读鉴权、幂等与操作者头（契约 §8.1 的 0.22 一条，Q-97）。这与 `/healthz` 不同：`/healthz` 在调用方给的 ID 合格时会用它 | Core 契约 §8.1、§8.6 第 4、8 条、§10 第 5 条 |
 | 引擎 | `make_engine` 加 `hide_parameters=True` | 同样要加，但改的是 Core 的 `app/db.py`，对 Core 全部查询生效（Core 的异常消息里也不再带绑定参数，只有好处）；保留 Core 已有的 UTC 会话时区设置 | 本仓库 `app/db.py` |
 
 ---
@@ -60,7 +60,7 @@
 （0.2，待 Kelvin 批准）本节的表、类型、迁移与测试做法按本仓库改写，见第 0 节；0.1 的写法见第 8 节的 0.2 记录。列类型照本仓库 `app/models/catalog.py` 的写法：ID 列 `ID`（`VARCHAR(32)`，区分大小写的排序规则）、时间列 `TIMESTAMP`（`DATETIME(6)`）。
 
 **时间**：一律是不带时区的 UTC。0.2：列用 `DATETIME(6)`（Core 契约 §2.2 的列约定，Q-90），存进去的值与 Python 的值完全相同（精确到微秒，不会四舍五入）；取当前时间仍**截到整秒**，所以 4.2 的窗口、4.4 的到期与 5.1 的 `expires_at` 照旧不会差一秒，例子不变。
-时间都由应用写，不用数据库的默认值。登录、会话这类判定用应用时钟（`utc_now()`）；Core 契约里“过期判断以数据库时间为准”管的是预留等库存命令，不管本模块。
+时间都由应用写，不用数据库的默认值（与契约 §2.2 “`created_at` 默认 `CURRENT_TIMESTAMP(6)`”有出入：数据库默认值不截整秒，与 `utc_now()` 的值对不上；这处出入登记在 Q-90，批准即接受）。登录、会话这类判定用应用时钟（`utc_now()`）；Core 契约里“过期判断以数据库时间为准”管的是预留等库存命令，不管本模块。
 取当前时间的函数只有一个：`utc_now()`，在 `app/services/admin_auth.py`（002 写），返回 `datetime.now(UTC).replace(tzinfo=None, microsecond=0)`（截断，不四舍五入）；命令（4.6）与接口（第 5 节）都调它，不另写。
 规则与服务函数接受的 `now` 参数必须是不带时区（`tzinfo` 为 `None`）的整秒，带时区或带小数秒时报 `ValueError`。
 
@@ -83,7 +83,7 @@
 | `id` | BigInteger | 主键，自增（只在本模块内部用，不对外，Q-89） |
 | `tenant_id` | `ID` | 非空；外键 → `tenants.tenant_id` |
 | `admin_account_id` | `ID` | 非空；复合外键 `(tenant_id, admin_account_id)` → `admin_accounts`（RESTRICT）；普通索引 |
-| `token_hash` | String(64) | 非空；唯一 `uq_admin_sessions_token_hash`（全库唯一，同上的例外）；检查 `ck_admin_sessions_token_hash_length`：`LENGTH(token_hash) = 64` |
+| `token_hash` | `CHAR(64)`，排序规则 `utf8mb4_bin`（照 Core 令牌摘要 `credential_tokens.token_digest` 的写法，`app/models/service_auth.py`） | 非空；唯一 `uq_admin_sessions_token_hash`（全库唯一，契约 §10 第 1 条的例外）；检查 `ck_admin_sessions_token_hash`：`REGEXP_LIKE(token_hash, '^[0-9a-f]{64}$', 'c')`（SHA-256 小写十六进制；0.1 只查长度） |
 | `created_at` | `TIMESTAMP` | 非空 |
 | `expires_at` | `TIMESTAMP` | 非空；检查 `ck_admin_sessions_expires_after_created`：`expires_at > created_at` |
 | `revoked_at` | `TIMESTAMP` | 可空；非空 = 已撤销 |
@@ -101,7 +101,7 @@
 | `outcome` | String(20) | 非空；检查 `ck_admin_login_attempts_outcome_known`：`outcome IN ('success', 'bad_password', 'unknown_user', 'disabled', 'locked')` |
 
 - **租户**（0.2）：V1 生产实例只有一个租户。建号命令必须给 `--tenant`（4.6），租户须存在且 `active`。会话的 `tenant_id` 取自账号；第 5.4 节的依赖把它放进 `AdminPrincipal`，之后的后台接口经进程内入口发 Core 命令时，它必须等于内部凭据的租户（Core 契约 §8.6 第 1 条），不等就拒绝（V1 不会发生，有了第二个租户再设计）。
-- 迁移（0.2）：接在本仓库最后一条之后，revision `"0012"`，`down_revision = "0011"`；文件名按 `alembic.ini` 的 `file_template`（`<登记那天的日期>_0012_admin_auth.py`）。
+- 迁移（0.2）：接在**登记时**本仓库的最后一条迁移之后（不写死编号；写这一版时最后一条是 `0011`）；revision 照本仓库的四位顺序号，文件名按 `alembic.ini` 的 `file_template`（`<登记那天的日期>_<编号>_admin_auth.py`）。
   upgrade 建三张表、逐个写出上面的约束与索引名（与模型按命名约定生成的名字一致）；downgrade 按依赖反序删表。两种实例的库都建这三张表，Demo 库里始终为空（Core 契约 §6.1 的 0.22 开关一条）。
   第 4.6 节的安全事件要给 `security_events.event_type` 的检查约束加四个值，也在这一条迁移里重建那条约束（Q-91）。
 - 模型放 `app/models/admin_auth.py`，`app/models/__init__.py` 导出 `AdminAccount`、`AdminSession`、`AdminLoginAttempt`；按本仓库 CLAUDE.md 的共享文件清单，`alembic/env.py` 里 import 新模型模块（登记到 `Base.metadata`），`app/models/__init__.py` 与新迁移文件一起列。
@@ -116,7 +116,7 @@
 | --- | --- | --- | --- |
 | D1 | 已有账号 `kelvin` | 再插入用户名 `kelvin` 的账号 | 被 `uq_admin_accounts_username` 拒绝 |
 | D2 | 空表 | 插入用户名 `ab`（2 个字符）的账号 | 被 `ck_admin_accounts_username_length` 拒绝；`abc` 可以 |
-| D3 | 账号 1 存在 | 插入 `token_hash` 为 63 个字符的会话 | 被 `ck_admin_sessions_token_hash_length` 拒绝 |
+| D3 | 账号 1 存在 | 插入 `token_hash` 为 63 个字符的会话 | 被 `ck_admin_sessions_token_hash` 拒绝（0.2：另外 64 个字符但含大写字母或非十六进制字符的也被拒绝） |
 | D4 | 账号 1 存在 | 插入 `expires_at` 等于 `created_at` 的会话 | 被 `ck_admin_sessions_expires_after_created` 拒绝 |
 | D5 | 空表 | 插入 `outcome` 为 `ok` 的登录尝试；插入 `source_key` 为 63 个字符的登录尝试 | 分别被 `ck_admin_login_attempts_outcome_known`、`ck_admin_login_attempts_source_key_length` 拒绝；五个合法 `outcome` 都可以 |
 | D6 | 账号 1 有一条会话或一条登录尝试 | 删除账号 1 | 被外键拒绝（停用账号用 `disabled_at`，不删行） |
@@ -263,7 +263,7 @@
 ### 5.1 路径与响应
 
 （0.2，待 Kelvin 批准）路径不变，都在 `/api/v1/…` 下，与 Core 的 `/v1` 不冲突；路由只在 `CORE_INVENTORY_ENABLED=true` 时挂上（Core 契约 §8.6 第 4 条）；反向代理转发 `/api/`（Core 契约 §10 第 5 条）。
-Core 的请求中间件对所有路径生效：`/api/` 下的请求不校验 `X-Request-ID`、总是生成（同 `/healthz`，外部来的头不该让登录 400）；128 KiB 的请求体上限照旧先于本节的 4096 字节检查（超过 128 KiB 时回 Core 格式的 413，本节的例子都在 4096 字节附近，不受影响）；不存在的路径回 Core 格式的 404。
+Core 的请求中间件对所有路径生效：`/api/` 下的请求一律不用调用方给的 `X-Request-ID`、总是生成，不因它不合格回 400（契约 §8.1 的 0.22 一条，Q-97；与 `/healthz` 不同，`/healthz` 在调用方给的值合格时会用它）；128 KiB 的请求体上限照旧先于本节的 4096 字节检查（超过 128 KiB 时回 Core 格式的 413，本节的例子都在 4096 字节附近，不受影响）；不存在的路径回 Core 格式的 404。
 
 | 方法与路径 | 需要 | 成功 | 失败 |
 | --- | --- | --- | --- |
@@ -385,3 +385,4 @@ TLS 在边缘反向代理终止，浏览器看到的是 HTTPS，所以 `Secure` 
   5. 第 4.6 节：命令由 `python -m app.admin` 并进 `python -m app.cli admin`；只在生产且开关为真时可用；加 `--tenant`、`--actor`、`--reason`；退出码改照 Core 命令行（0.1：业务错误 1、环境错误 2）；成功后记安全事件（0.1：不记）。
   6. 第 5.1 节：路由只在开关为真时挂；Core 中间件对 `/api/` 不校验 `X-Request-ID`、128 KiB 与 404 的格式照 Core；去掉“未配置数据库”那一步；连接改用 `app.state.engine`（0.1：`sessionmaker` 与 `get_db`）；写明内存上限要重估。
   7. 第 6 节：登录尝试的清理改为进程内定时作业（0.1：随定时作业表）。
+  8. 按 PR #189 第 1 轮独立审查（提交 `5788048`）补改：第 0 节与第 5.1 节的 `/api/` 请求头改为“一律生成 `X-Request-ID`、不读鉴权与操作者头”，删掉不准确的“同 `/healthz`”；迁移不写死 `0012`，改为接在登记时的最后一条之后；`token_hash` 照 Core 令牌摘要的写法（`CHAR(64)`、`utf8mb4_bin`、正则检查，检查名改为 `ck_admin_sessions_token_hash`），D3 随之补一句；“时间由应用写、不用数据库默认值”注明与契约 §2.2 的出入（Q-90）。安全事件的四个类型与租户约定的三处例外同时写进了契约 §7.2、§10 第 1 条（Q-89、Q-91）。

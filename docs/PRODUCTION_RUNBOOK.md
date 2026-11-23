@@ -362,6 +362,8 @@ printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u <GitHub 账号> --passw
 unset GHCR_READ_TOKEN
 ```
 
+**（0.22，待批准，Q-96）部署生产实例之前，设上“自动写平台暂停”**：按第 0.2 节定义 `mysql_root`，在恢复出的生产库里把 Inventory 的暂停标记设上，原因写“整机恢复”（表与 SQL 由实现这个标记的任务补进这里）。必须在起生产容器之前做：容器一起来定时作业就会跑，等不及命令行。设好后查一遍，确认标记已设上，再往下。
+
 **部署两个实例**（工作流的 secrets 还指着旧机器，所以直接在机器上跑 `deploy/deploy.sh`）。每个实例：
 
 ```bash
@@ -425,6 +427,7 @@ core credential rotate --credential <凭据 ID> --overlap-hours 0 \
    ```
 
    标准错误里不应有以 `P1 invariants` 或 `P2 invariants` 开头的行（判读见 [OPS_MONITORING.md](OPS_MONITORING.md) 第 6.3 节）。
+4. （0.22，待批准，Q-93、Q-96）Inventory：在后台确认没有积下的未结账步骤；丢失窗口里的订单先按业务引用查 Core（它的作业会做），再由管理员手动发起一次对账。差异处理完之后，才由管理员在后台解除“自动写平台暂停”，平台的库存发布从这时起恢复。
 
 到这里停表，记下第 3.1–3.8 步的总用时。
 
@@ -480,7 +483,7 @@ core credential rotate --credential <凭据 ID> --overlap-hours 0 \
 
 - 演练机**不改 DNS**、**不装任何 cron**，`.env` 里**不填心跳地址**（演练机推成功会把线上真实的故障遮住）。第 3.9 步不做，GitHub secrets 不改。
 - 只起 Core 和第 3.8 步要用的调用方：Demo 网店与一套演练用的 Inventory 配置，不连线上的平台。它们的外发凭据（平台、支付、短信、邮件、WhatsApp、Telegram）一律换成假值。
-  （0.22，待批准）“演练用的 Inventory 配置”即演练机上的生产 Core 打开 `CORE_INVENTORY_ENABLED`，Inventory 模块的平台凭据与 Telegram 换成假值；演练机不开 vhost。
+  （0.22，待批准）“演练用的 Inventory 配置”即演练机上的生产 Core 打开 `CORE_INVENTORY_ENABLED`，Inventory 模块的平台凭据与 Telegram 换成假值；演练机不开 vhost。第 3.7 步的“自动写平台暂停”照样设上，演练全程**不解除**（Q-96）。
 - 读 R2 用一个**只读令牌**（由人新建，设计第 4 节），演练机的 rclone 配置只放它，不放可写的 R2 凭据。
 - 第 3.6 步：只做那次全量导出并计时，导出留在演练机上、随机器一起删；**不传 R2**、不启用 binlog 上传 cron 与每晚备份。
 - 第 3.7 步：轮换只发生在演练机恢复出的库里，不影响线上的凭据与令牌。拉镜像照第 3.7 步临时建只读包令牌登录，演练完在 GitHub 删掉。
