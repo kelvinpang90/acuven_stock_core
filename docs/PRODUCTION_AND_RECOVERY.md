@@ -1,6 +1,7 @@
 # 生产实例部署与 W7a 备份恢复的设计
 
 > 版本：0.6 · 日期：2026-11-23 · 状态：**Kelvin 2026-11-23 批准 0.6**（0.5 及之前：Kelvin 2026-11-21 批准；0.4：P-03 改为只用 3 个免费检查，其余待定项按建议定，第 5 节；0.5 的补充与契约 0.20 同日批准）。
+> **0.7（2026-11-23）：草案，待 Kelvin 批准**——按 C-21（Inventory 并入本仓库，进程内调用 Core）与契约 0.22 草案改：生产实例不再给 Inventory 建调用方内部网络、改挂边缘反向代理所在的代理网络并开 vhost；不再签发 Inventory 的业务凭据与对账凭据，改为签发一个没有令牌的内部凭据；恢复与演练里 Inventory 的步骤相应改写。改动处标“（0.7，待 Kelvin 批准）”，见第 7 节。
 > 0.6：运维凭据由一个凭据下两个令牌改为两个运维凭据（Kelvin 2026-11-23 定，第 1.1 节），要改契约 §10 第 2 条的措辞，条文见契约 0.21（同日批准）。
 > P-03 要改契约 §8.5，条文见契约 0.20（同日批准）。
 > 起因：契约 0.19 定生产实例先给 Inventory 用（Q-76），并要求真实库存进生产实例之前先完成 W7a（§0、§11.5、§12.1）。
@@ -21,6 +22,7 @@
 - **生产实例**：同一台 VPS 上，本仓库的第二个检出目录，自己的 `.env`（`CORE_ENV=production`、生产库）。
   - compose 项目名、网络名、别名**都只由 `CORE_ENV` 决定**，compose 文件里这些变量不给默认值，不经实例片段的 compose 命令直接报错；
   - 生产 Core 不挂共享的 `data_net`，只挂一条专用数据网络和一条只给 Inventory 的内部网络（契约 §10 第 5 条“网络上互不可达”，P-07）。
+  - （0.7，待 Kelvin 批准）Inventory 并入生产 Core 的进程后，没有外部调用方，“只给 Inventory 的内部网络”不再需要；生产 Core 改挂边缘反向代理（`infra_nginx`）所在的代理网络，由一个独立的 vhost 只转发 `/admin/` 与 `/api/`（契约 0.22 §10 第 5 条）。专用数据网络不变，仍不挂 `data_net`。
 - **部署**：合并到 main 照旧自动部署 Demo 实例。生产实例由人手工触发同一个工作流升级：选“生产”、填 SHA。生产部署在迁移前先备份本库（P-01、P-09）。
 - **W7a 已有的**：infra_mysql 每晚全量逻辑备份到 R2，保留 30 天，做过一次还原演练（`vps_infra/backup/`）。binlog 已开，本机保留 3 天。
 - **W7a 还缺的**：
@@ -43,10 +45,13 @@
 | 检出目录 | GitHub secret `VPS_APP_DIR` | 新 secret `VPS_APP_DIR_PRODUCTION`，另一个目录 |
 | `.env` | `CORE_ENV=demo`、Demo 库 | `CORE_ENV=production`、生产库（infra_mysql 里新建的独立库与账号） |
 | compose 项目名 | `acuven_stock_core` | `acuven_stock_core_production` |
-| 调用方用的内部网络 | `stock_core_net`（与 Demo 网店共用），别名 `core_api` | `stock_core_production_net`，只给 Inventory 用；生产 Core 在这条网上的别名是 `stock_core_production`，Inventory 只用这个名字 |
+| 调用方用的内部网络 | `stock_core_net`（与 Demo 网店共用），别名 `core_api` | `stock_core_production_net`，只给 Inventory 用；生产 Core 在这条网上的别名是 `stock_core_production`，Inventory 只用这个名字。（0.7，待 Kelvin 批准）改为：不建这条网络；生产 Core 挂到 `infra_nginx` 所在的代理网络（网络名以 `vps_infra` 为准，部署脚本不建它、不存在就失败），在上面的别名仍是 `stock_core_production`，vhost 用这个名字转发 |
 | 数据网络 | `data_net`（与网店等共用） | `infra_mysql_core_production_net`（`--internal`）：只有 infra_mysql 与生产 Core 两个成员（P-07）。infra_mysql 用 `docker network connect --alias mysql` 接上，所以连接串里的主机名照旧是 `mysql` |
-| 凭据 | Demo 网店的业务凭据、运维凭据 | Inventory 的业务凭据；**两个运维凭据**（只带 `ops.read`、不绑入口）：巡检一个（令牌在生产检出的 `.env`）、Inventory 每日对账一个（令牌在 Inventory 的密钥文件）。每个运维凭据下平时只有一个令牌，各自轮换与吊销（§10 第 2、4 条，契约 0.21） |
+| 凭据 | Demo 网店的业务凭据、运维凭据 | Inventory 的业务凭据；**两个运维凭据**（只带 `ops.read`、不绑入口）：巡检一个（令牌在生产检出的 `.env`）、Inventory 每日对账一个（令牌在 Inventory 的密钥文件）。每个运维凭据下平时只有一个令牌，各自轮换与吊销（§10 第 2、4 条，契约 0.21）。（0.7，待 Kelvin 批准）改为：Inventory 的**内部凭据**一个（绑 Inventory 入口、没有令牌，契约 0.22 §8.6 第 1 条）；巡检的运维凭据一个（令牌在生产检出的 `.env`）；**不签** Inventory 的业务凭据与对账凭据（契约 0.22 §10 第 2 条） |
+| Inventory 模块（0.7，待 Kelvin 批准） | 关闭（不设 `CORE_INVENTORY_ENABLED`，或设为 `false`；设为 `true` 拒绝启动） | `.env` 里 `CORE_INVENTORY_ENABLED=true`；Inventory 自己的密钥（平台应用的凭据、平台令牌加密主密钥）按它的设计放进生产实例，具体键名与放法由对应的实现任务定（V1 设计第 8 节） |
 | 心跳检查 | 不推（契约 0.20） | `stock_core production readyz`（含定时任务状态）、`stock_core production invariants`（契约 0.20） |
+
+（0.7 注：下面这段讲的是 0.6 的两个运维凭据；0.7 草案里 Inventory 对账的那一个取消，只剩巡检一个，这段的道理对巡检凭据的轮换照样成立。）
 
 **为什么是两个运维凭据、不是一个凭据下两个令牌**（0.6）：
 - 命令行在已有凭据下再签令牌只有 `credential rotate`，它按契约 §10 第 4 条把同一凭据下其余未吊销的令牌设上不晚于 7 天的截止时间。一个凭据下两个令牌，签出第二个就会让第一个至多 7 天后失效，之后轮换哪一个都会带上另一个，做不到分开轮换。
@@ -64,11 +69,17 @@
 
 Demo 实例不变（它本来就是演示数据）。
 
+**（0.7，待 Kelvin 批准）生产 Core 挂上代理网络之后**：
+- 代理网络上还有别的项目的容器（网店后端等），它们能绕过反向代理直接访问生产 Core 的端口。对策在契约 0.22：生产上 `/v1` 只挂不变量自查、只有巡检的令牌（§8.6 第 5 条）；Inventory 后台接口的暴露与后台登录设计 5.3 已接受的残余风险相同。
+- 第 6 节验收里“生产 Core 在 `stock_core_production_net` 上只能经别名找到”改为“在代理网络上只能经别名找到，在 `data_net` 上不可达”。
+- 内存：生产 Core 现在限 256M；加上 Inventory 模块（后台登录的 scrypt 同时两个约 32 MiB、定时作业、平台客户端）要按实测重估，上线前与第 1.3 节第 6 步的余量核对一起做（P-02）。
+
 ### 1.2 本仓库要改的地方
 
 1. **实例片段 `deploy/instance.sh`**（新增，被其他脚本 `source`）：
    - 按固定规则从检出目录的 `.env` 只读 `CORE_ENV` 一个键，**不 `source` 整个文件**（同 §8.5）。值只接受 `demo` 或 `production`，严格匹配，不去空格、不认引号与行尾注释；别的值一律失败。
    - 由它给出 compose 项目名、网络名与别名（两个实例都给出具体值，Demo 取现在的值）。之后所有 compose 调用一律带 `-p <项目名>`，网络名与别名经环境变量传给 compose。
+   - （0.7，待 Kelvin 批准）生产实例给出的“调用方网络”改为代理网络的名字，并标明它是外部网络：部署脚本不建它、不存在就失败（同专用数据网络）；Demo 的值不变。仍只由 `CORE_ENV` 决定，不随 `CORE_INVENTORY_ENABLED` 变（契约 0.22 Q-85：多一个键就多一种漏配）。这是已合并的 CORE-TASK-067 之后的改动，契约 0.22 批准后另登记任务。
    - **不另设 `COMPOSE_PROJECT_NAME`、`CORE_INTERNAL_NETWORK` 之类的键**：多一个键就多一种漏配。
    - 另提供“找到本实例的 `core_api` 容器”的函数：按 compose 项目标签找，再核对标签 `com.docker.compose.project.working_dir` 与当前检出目录相同（两边都先 `realpath`），并排除一次性容器。
      健康检查、巡检、运行手册里的开通与签发、恢复时起服务，都只经它找容器。
@@ -103,8 +114,14 @@ Demo 实例不变（它本来就是演示数据）。
 3. 在服务器上克隆本仓库到生产检出目录，写 `.env`（`CORE_ENV=production`、生产库连接串），之后按 §8.5 加运维令牌与心跳地址。GitHub 上加 secret `VPS_APP_DIR_PRODUCTION`。
 4. 手工触发部署，实例选“生产”，填当前 main 的 SHA。用 `docker compose ls` 核对两个项目都在。
 5. 经 `instance.sh` 找到生产的容器，用里面的命令行开通租户、地点、池、销售入口（入口名 Inventory），签发 Inventory 的业务凭据，再用两次 `credential issue --scope ops.read`（不带 `--channel`）签发两个运维凭据：巡检一个、Inventory 每日对账一个，名字分开（例如 `Stock core monitor`、`Inventory reconciliation`）。
+   （0.7，待 Kelvin 批准）改为：开通租户、地点、池、销售入口之后，签发 Inventory 的**内部凭据**（命令行的内部签发方式，绑 Inventory 入口，不输出令牌）与**巡检的运维凭据**一个；不签 Inventory 的业务凭据与对账凭据。内部凭据的命令行要等契约 0.22 批准、对应任务实现之后才有；在那之前首次上线照 0.6 只签巡检凭据，Inventory 的两个凭据先不签。
    每次签发得到一个新凭据和它的第一个令牌，令牌只在终端出现一次：业务令牌与对账令牌直接写进 Inventory 服务器的密钥文件，巡检令牌写进生产检出 `.env` 的 `CORE_MONITOR_TOKEN`（`docs/OPS_MONITORING.md` 第 2、3 节）。记下两个运维凭据的 `credential_id` 各归谁。**不用 `credential rotate` 给已有凭据添第二个令牌**（第 1.1 节）。
    - 例子：之前生产库里没有运维凭据；两次签发之后有 `cred_M`（巡检，令牌 `ctk_M1`）与 `cred_R`（对账，令牌 `ctk_R1`），两个令牌的 `expires_at` 都为空，互不影响。
+5b. （0.7，待 Kelvin 批准）开放 Inventory 的公网入口（真实域名只配在服务器、Cloudflare 与 GitHub 变量里，不写进本仓库）：
+   - 由 `vps_infra` 给生产实例开一个 vhost：TLS 照现有通配符证书；只转发 `/admin/` 与 `/api/` 两个前缀到生产 Core 在代理网络上的别名，其余路径（含 `/v1`、`/healthz`、`/readyz`）回 404；用 `proxy_set_header X-Real-IP $remote_addr` 覆盖来源头（后台登录设计 5.3 的上线前提）。
+   - 在 Cloudflare 配子域名。
+   - 生产检出的 `.env` 加 `CORE_INVENTORY_ENABLED=true`，手工触发一次生产部署。
+   - 从外网核对：`/api/` 下的回调路由可达；`/v1/…`、`/healthz` 不可达；带伪造 `X-Real-IP` 登录失败几次，库里的 `source_key` 不随头变。
 6. 真实期初之前：
    - W7a 第 2.5 节的演练通过（契约 §12.1 第 7 条）；
    - 第 2.6 节的心跳检查已建好并演练过；
@@ -180,12 +197,14 @@ Demo 实例不变（它本来就是演示数据）。
    - **怎么部署**：在新机器上从 GitHub 克隆检出，按 P-05 重写 `.env`，直接在机器上跑 `deploy/deploy.sh`（工作流的 secrets 还指着旧机器）；改 GitHub secrets（`VPS_HOST`、`VPS_FINGERPRINT` 等）放到最后一步。两种部署都计入用时。
    - **拉镜像**（0.6）：镜像在 GHCR，平时由工作流用它自己的临时令牌登录；手工跑 `deploy.sh` 前先登录。由人在 GitHub 新建一个只带读包权限（`read:packages`）、7 天内到期的令牌，在新机器上 `docker login ghcr.io -u <GitHub 账号> --password-stdin` 从标准输入登录；`deploy.sh` 照它文件头的用法带上 `CORE_IMAGE_REPO=ghcr.io/<所有者>/<仓库名>`（全小写）与 40 位 SHA；两个实例部署完 `docker logout ghcr.io`，并在 GitHub 删掉这个令牌。它不进密码管理器、`.env` 与 P-05 的清单。
      上面取的两个 SHA 都来自成功的部署运行，那次运行构建过镜像、推到了 GHCR，本仓库不清理 GHCR 的镜像，所以还在；拉不到就停下查明原因，不换 SHA（库里的迁移停在这个 SHA），也不在新机器上自己构建。
+   - （0.7，待 Kelvin 批准）生产上要轮换的只剩巡检的运维凭据；Inventory 的内部凭据没有令牌，不用轮换（下一条 0.6 的写法里 Inventory 的两个凭据随之去掉）。
    - **令牌**：令牌那几行不进密码管理器（P-05），库里的旧令牌还有效但没人持有明文。每个凭据（Demo 网店与 Inventory 的业务凭据、两个运维凭据）各在**自己的凭据下**轮换一次：`credential rotate --credential <该凭据> --overlap-hours 0`，旧令牌即刻失效，拿到的新令牌写回对应的位置。不换新凭据：换凭据会改变幂等作用域（§10 第 4 条），调用方就没法按原键补交“结果未知”的命令。每个凭据平时只有一个令牌，轮换一个凭据不影响别的凭据。
      - 例子：之前 `cred_M` 下 `ctk_M1`、`cred_R` 下 `ctk_R1` 都有效，明文都已丢；先轮换 `cred_M` 得 `ctk_M2`（写进巡检 `.env`），`ctk_M1.expires_at` 为轮换时刻；再轮换 `cred_R` 得 `ctk_R2`（写进 Inventory 密钥文件），`ctk_R1` 同样即刻失效；第二次轮换不动 `cred_M` 下的 `ctk_M2`。
-   - 再起网店、Inventory 等调用方。
+   - 再起网店、Inventory 等调用方。（0.7，待 Kelvin 批准：Inventory 在生产 Core 的进程里，随生产实例一起起来，不另起。）
 8. **补交与补录**（§12.1 第 4 条）：
    - 调用方补交“结果未知”的命令，补录丢失窗口：网店按支付记录；Inventory 按两个平台的订单补拉，人工模式下由管理员重新核对卖家后台、在 Inventory 重新登记；
-   - 网店与 Inventory 都用 `GET /v1/skus?ids=…` 重读映射，Core 查不到的 SKU 标为待处理；
+     （0.7，待 Kelvin 批准）Inventory 改为：先对“已记下、还没落定”的调 Core 步骤同键重放，再从丢失窗口的起点补拉平台订单（契约 0.22 §5.5、§12.1 第 4 条）；
+   - 网店与 Inventory 都用 `GET /v1/skus?ids=…` 重读映射，Core 查不到的 SKU 标为待处理（0.7：Inventory 用 Core 的读函数，不经 `/v1`）；
    - 然后对账，跑一次不变量自查。
 9. **收尾**：DNS 与 Cloudflare 指到新机器，改 GitHub secrets；记下每一步的用时。
 
@@ -198,6 +217,7 @@ Demo 实例不变（它本来就是演示数据）。
 ### 2.5 演练（上线前一次，之后每季度一次）
 
 - **在另一台机器上演练**（契约 §12.1 第 7 条）：临时开一台云主机，按第 2.4 节第 1–8 步从零恢复，演练完删掉（P-06）。第 8 步用 Demo 网店与一套演练用的 Inventory 配置走一遍，不连线上的平台。
+  （0.7，待 Kelvin 批准）“演练用的 Inventory 配置”即演练机上的生产 Core 打开 Inventory 开关、平台凭据与 Telegram 换成假值；演练机不开 vhost、不改 DNS。
   - 第 6 步在演练里（0.6）：只做那次全量导出并计时，导出留在演练机上、随机器一起删；不传 R2（演练只有只读令牌）、不启用 binlog 上传 cron 与每晚备份；
   - 第 7 步的轮换只发生在演练机恢复出的库里，不影响线上的凭据与令牌；拉镜像照第 7 步临时建令牌登录，演练完删掉。
 - **量丢失窗口**：
@@ -256,6 +276,8 @@ Demo 实例不变（它本来就是演示数据）。
 | 心跳检查 | 由人做 | P-03 |
 | 演练 | 由人做，会话可陪同计时 | 第 2.5 节 |
 | 把 Core 生产实例加进 `vps_infra` README“部署串行化”的参与名单 | `vps_infra` PR | 同一个仓库的另一个检出也要排队 |
+| （0.7，待 Kelvin 批准）生产实例的 vhost：只转发 `/admin/` 与 `/api/`，覆盖设置 `X-Real-IP`；代理网络对生产 Core 可用 | `vps_infra` PR，由人在 Cloudflare 配子域名 | 第 1.3 节第 5b 步；真实域名不写进本仓库 |
+| （0.7，待 Kelvin 批准）部署脚本与 compose：生产实例改挂代理网络、不再建 `stock_core_production_net` | 本仓库，契约 0.22 批准后登记任务 | 第 1.2 节第 1 条的 0.7 一项 |
 
 ---
 
@@ -268,7 +290,7 @@ Demo 实例不变（它本来就是演示数据）。
 | P-01 | 生产实例怎么升级：手工触发（选“生产”、填 SHA），还是合并到 main 后自动部署（先 Demo、再生产）？ | **手工触发**。理由：生产里是真实库存，每次合并都自动上生产风险太大；自动连部两个实例时最坏要等两次主机锁，D5 的 30 分钟放不下。代价有两条：生产会落后 main，靠第 1.4 节的升级检查保证跨版本升级安全；生产只能在没有 Demo 部署在跑时触发（第 1.4 节） |
 | P-02 | 生产实例与 Demo 放同一台 VPS 吗？ | **同一台**。契约 §10 第 5 条按同机设计（内部网络不加 TLS）。Core 限 256M 内存；这台机器的内存与磁盘余量**未实测**，上线前核对（第 1.3 节） |
 | P-03 | 心跳检查要 5 个（生产实例 3 个、binlog 传输 1 个、每晚备份 1 个），免费档已满，怎么办？ | **已定（Kelvin 2026-11-21）：只用计费平台腾出的 3 个免费位置。** 生产 `readyz` 并入定时任务状态、生产 `invariants`、`infra_mysql backup`（binlog 与每晚备份，同一个脚本推）；Demo 实例不推心跳。要改契约 §8.5，见契约 0.20。未选：升级付费档 |
-| P-05 | 整机恢复时，重建要用的密钥从哪里来？ | **放进你的密码管理器**（例如 1Password）的一条安全笔记：R2 凭据（现在只在 VPS 的备份目录里）、`vps_infra` 的 `MYSQL_ROOT_PASSWORD`、源站证书、两个 Core 检出与 Demo 网店、Inventory 的 `.env`、心跳地址。**存之前去掉所有令牌那几行**（`CORE_MONITOR_TOKEN`、Inventory 密钥文件里的两个 Core 令牌：业务令牌与对账用的运维令牌），恢复时各在自己的凭据下轮换（第 2.4 节第 7 步）。不进任何仓库与 R2 |
+| P-05 | 整机恢复时，重建要用的密钥从哪里来？ | **放进你的密码管理器**（例如 1Password）的一条安全笔记：R2 凭据（现在只在 VPS 的备份目录里）、`vps_infra` 的 `MYSQL_ROOT_PASSWORD`、源站证书、两个 Core 检出与 Demo 网店、Inventory 的 `.env`、心跳地址。**存之前去掉所有令牌那几行**（`CORE_MONITOR_TOKEN`、Inventory 密钥文件里的两个 Core 令牌：业务令牌与对账用的运维令牌），恢复时各在自己的凭据下轮换（第 2.4 节第 7 步）。不进任何仓库与 R2。（0.7，待 Kelvin 批准：Inventory 不再持有 Core 令牌；清单里的“Inventory 的 `.env`”改为生产 Core 检出里 Inventory 模块的密钥——平台应用凭据与令牌加密主密钥，它们不能靠轮换重建，必须进这条笔记） |
 | P-06 | 演练用的临时机器：哪家、多大、谁开？ | 和现在的 VPS 同一家、同规格，你来开，用完当天删；会话按第 2.4 节陪同、计时 |
 | P-07 | 生产 Core 怎么做到契约 §10 第 5 条的“网络上互不可达”？ | ① **专用数据网络**：生产 Core 不挂 `data_net`，只挂一条只有 infra_mysql 与它的数据网络，加上给 Inventory 的内部网络（第 1.1 节）；要改 `vps_infra`。② 改契约措辞：承认 `data_net` 上可达，隔离只靠凭据。建议 ① |
 | P-08 | 每晚备份怎么支持时间点恢复？ | **另加一份单快照的全量导出**（记 binlog 位置与服务器身份），按库导出保留作单库还原（第 2.3 节）。不选：把现有按库导出直接改成单快照，那样单库还原要从大文件里切 |
@@ -339,3 +361,12 @@ Demo 实例不变（它本来就是演示数据）。
   - P-05 的建议里令牌行写明 Inventory 密钥文件有两个 Core 令牌，恢复时各在自己的凭据下轮换；
   - 按登记前设计预审的两条 `UNDECIDED` 补上：第 2.4 节第 7 步手工部署前怎么登录 GHCR（临时建只读包的令牌，用完删）、镜像为什么还在、拉不到怎么办，Demo 也改用最后一次成功的 Demo 部署的 SHA（按 PR #185 的独立审查：`paths-ignore` 跳过的提交没有镜像）；第 2.5 节演练里第 6 步只导出不上传、第 7 步的轮换不影响线上；
   - 契约 §10 第 2 条“另发一个……运维凭据”随之改措辞，见契约 0.21（同日批准）。
+- **0.7**（2026-11-23，**草案，待 Kelvin 批准**）：Kelvin 2026-11-23 定把 Inventory 并入本仓库（`acuven_hub/DECISIONS.md` C-21），条文见契约 0.22 草案（第 14 节第 104–114 条，Q-81～Q-88）。
+  - 第 0 节、第 1.1 节网络一行：生产 Core 不再建只给 Inventory 的调用方内部网络，改挂 `infra_nginx` 所在的代理网络，vhost 只转发 `/admin/` 与 `/api/`；加“挂上代理网络之后”的暴露、验收改写与内存重估；
+  - 第 1.1 节凭据一行：Inventory 的业务凭据与对账凭据改为一个没有令牌的内部凭据，巡检凭据不变；新增“Inventory 模块”一行（开关与 Inventory 自己的密钥）；“为什么是两个运维凭据”加注；
+  - 第 1.2 节第 1 条：实例片段给生产的调用方网络改为外部的代理网络，仍只由 `CORE_ENV` 决定，另登记任务；
+  - 第 1.3 节：第 5 步改为签发内部凭据与巡检凭据（内部凭据要等实现）；新增第 5b 步开 vhost、配子域名、打开开关与外网核对；
+  - 第 2.4 节第 7、8 步：生产上只轮换巡检令牌；Inventory 随生产 Core 起来，先同键重放、再补拉，映射重读用 Core 的读函数；
+  - 第 2.5 节：演练用的 Inventory 即演练机上打开开关、外发凭据换假值，不开 vhost；
+  - P-05：清单去掉 Inventory 的 Core 令牌，加上 Inventory 模块不能靠轮换重建的密钥；
+  - 第 4 节：加 vhost 与部署脚本两项。
