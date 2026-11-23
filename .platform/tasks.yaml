@@ -2893,10 +2893,10 @@ tasks:
   - id: CORE-TASK-069
     title: 新增生产实例运行手册：首次上线、升级与回滚界线、整机恢复与演练
     purpose: >-
-      按设计 docs/PRODUCTION_AND_RECOVERY.md 0.5 的第 1.2 节第 6 条，新建 docs/PRODUCTION_RUNBOOK.md，把第 1.3 节首次上线、第 1.4 节升级与回滚的界线、第 2.4 节整机恢复与误操作恢复、第 2.5 节演练写成可以照着做的步骤与命令，末尾留演练记录一节（日期、执行人、各步用时、丢失窗口、发现的问题）。
-      照设计写，不改设计内容：首次上线的六步（建生产库与账号、vps_infra 建专用数据网络、生产检出与 .env、手工触发部署选生产、经 instance.sh 找容器开通与签发、真实期初之前的四项核对）；
+      按设计 docs/PRODUCTION_AND_RECOVERY.md 0.6 的第 1.2 节第 6 条，新建 docs/PRODUCTION_RUNBOOK.md，把第 1.3 节首次上线、第 1.4 节升级与回滚的界线、第 2.4 节整机恢复与误操作恢复、第 2.5 节演练写成可以照着做的步骤与命令，末尾留演练记录一节（日期、执行人、各步用时、丢失窗口、发现的问题）。
+      照设计写，不改设计内容：首次上线的六步（建生产库与账号、vps_infra 建专用数据网络、生产检出与 .env、手工触发部署选生产、经 instance.sh 找容器开通与签发：Inventory 的业务凭据，以及用两次 credential issue 分别签发的两个运维凭据，巡检一个、Inventory 每日对账一个，不用 credential rotate 给已有凭据添令牌、真实期初之前的四项核对）；
       升级前列出两个 SHA 之间的迁移并按先加后删核对、没有 Demo 部署在跑时才触发、回滚只能回到上一个好的 SHA 且不早于实例片段进库的提交；
-      整机恢复的九步，含两个实例的库各把 catalog_changes 的自增起点调到最大 id 加 1000000（表为空按 0）且调完不能再重放 binlog、开放写入前先做一次全量导出、令牌丢了在原凭据下重新签发、用最后一次成功的生产手工部署的 SHA；误操作恢复在临时实例上用停止位置或停止时间、mysqlbinlog 设 TZ 为 UTC；
+      整机恢复的九步，含两个实例的库各把 catalog_changes 的自增起点调到最大 id 加 1000000（表为空按 0）且调完不能再重放 binlog、开放写入前先做一次全量导出、令牌丢了每个凭据各在自己下面轮换一次（重叠 0 小时）且不换新凭据、用最后一次成功的生产手工部署的 SHA；误操作恢复在临时实例上用停止位置或停止时间、mysqlbinlog 设 TZ 为 UTC；
       演练在另一台机器上做、用标记表量丢失窗口、演练机不改 DNS、不装 cron、不填心跳地址、外发凭据换假值、读 R2 用只读令牌；核对项照第 2.5 节。
       巡检的装法仍在 docs/OPS_MONITORING.md，手册里只链过去；vps_infra 那边的步骤写成指向 vps_infra 的说明，不抄它的脚本。
       命令里服务器上的目录、账号、主机名、库名与地址一律用占位符；密钥只写从密码管理器取回，不写值。
@@ -2909,7 +2909,7 @@ tasks:
       - 只新增 docs/PRODUCTION_RUNBOOK.md，不改别的文件
       - 手册覆盖设计第 1.3 节的六步、第 1.4 节的三条界线、第 2.4 节的九步与误操作恢复、第 2.5 节的演练做法与核对项，并有演练记录一节；与设计有出入的地方以设计为准，不另立规则
       - 找容器、开通与签发的命令经 deploy/instance.sh 的函数，不用 docker compose exec 或 run；生产部署写成手工触发部署工作流、选生产、填 SHA；巡检只链到 docs/OPS_MONITORING.md
-      - 整机恢复写明 catalog_changes 自增起点的调法与 SHOW CREATE TABLE 核对，以及调完之后不能再重放 binlog；令牌丢了在原凭据下重新签发、不换新凭据
+      - 整机恢复写明 catalog_changes 自增起点的调法与 SHOW CREATE TABLE 核对，以及调完之后不能再重放 binlog；令牌丢了每个凭据各在自己下面用 credential rotate 轮换（重叠 0 小时）、不换新凭据；首次上线的两个运维凭据各用一次 credential issue 签发，手册里没有在同一凭据下并存两个令牌的步骤
       - 手册里没有服务器上的真实目录、账号名、主机名、IP、域名、地址与任何密钥值，都用占位符
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；PR 的必需 CI 检查 unit 与 integration 通过
     allowed_change_paths:
