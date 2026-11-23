@@ -3388,7 +3388,7 @@ tasks:
     depends_on: []
     acceptance_criteria:
       - 新增 app/domain/platform_events.py 与 tests/unit/test_platform_events.py，不改别的文件；测试用 ast 读模块的 import，只有标准库里不做 I/O 的模块（hashlib、re、dataclasses、datetime、typing 之类）与 app.domain 里的纯模块
-      - 引用：契约 5.10 的例子 shp:123456:2611210ABCD 及其 :c、:d:、:r:、:x: 形式原样得出；含空格、中文或斜杠的段换成 h 加 32 位十六进制，同一输入两次结果相同；超长时换段后长度不超过上限；m1、m2 形式正确
+      - 引用：契约 5.10 的例子 shp:123456:2611210ABCD 及其付款引用与三种单据引用（后缀 c、d、r、x）原样得出；含空格、中文或斜杠的段换成 h 加 32 位十六进制，同一输入两次结果相同；超长时换段后长度不超过上限；m1、m2 形式正确
       - 锁名对固定输入得到用 hashlib 独立算出的同一个值；五项任一不同锁名不同
       - payload 校验每种动作各有合格与不合格用例（缺必填键、多出的键、件数为 0 或 1000001、bool 当整数、重复 platform_line_id、101 项、时间不带 Z、sellable 与 unsellable 都为 0）
       - 排序：平台时间不同按平台时间（不论动作先后，例如先取消一行、后待发货的顺序保持）；时间相同按状态链；再相同按 received_at 与 event_row_id；没有平台时间用 received_at
