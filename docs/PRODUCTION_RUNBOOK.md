@@ -178,6 +178,7 @@ core credential list --tenant <租户 ID>
 1. 由 `vps_infra` 给生产实例开 vhost（做法以 `vps_infra` 的说明为准），要求：
    - 只转发 `/admin/` 与 `/api/` 两个前缀到生产 Core 在代理网络上的别名 `stock_core_production` 的 8000 端口，其余路径（含 `/v1`、`/healthz`、`/readyz`）一律 404；
    - `proxy_set_header X-Real-IP $remote_addr`（覆盖，不是追加）；
+   - 对 `/api/v1/platforms/`（平台授权回调与 webhook）关掉访问日志，或整个 vhost 用一个不含查询串的日志格式：回调的查询串里有授权码与 `state`（契约 0.22 §8.6 第 5 条）；
    - TLS 用现有的通配符证书。
 2. 在 Cloudflare 配子域名。
 3. 生产检出的 `.env` 加一行 `CORE_ADMIN_ENABLED=true`（只写这一行，不加引号、空格与注释）；平台应用凭据、令牌加密主密钥与 Telegram 令牌按实现任务写的 secrets 文件放好；按第 1.4 步手工触发一次生产部署。
@@ -188,6 +189,7 @@ core credential list --tenant <租户 ID>
    - `/v1/ops/invariants`、`/healthz`、`/readyz` 都是 404；
    - 带一个伪造的 `X-Real-IP` 头登录失败几次，在库里看 `admin_login_attempts` 的 `source_key` 没有随头变化（[ADMIN_AUTH.md](ADMIN_AUTH.md) 第 5.3 节）。**这项没过，把开关改回 `false` 再部署一次**，修好 vhost 再来。
 6. 在服务器上核对：`docker network inspect <代理网络> --format '{{range .Containers}}{{.Name}} {{end}}'` 里有生产的 `core_api` 容器；`data_net` 里没有。
+7. 从外网访问一次回调路由（带一个假的 `code` 与 `state`），在 `infra_nginx` 的日志里确认看不到这两个值。
 
 ### 1.6 真实期初之前的核对
 
@@ -478,6 +480,16 @@ core credential rotate --credential <凭据 ID> --overlap-hours 0 \
 6. 搬回的是 Core 的库时，第 3.5 步**只对搬回的那个 Core 库做**，并在起它的 Core 之前做：按第 0.2 节找到该实例的容器，`docker stop "$container"`，导入，调自增起点并用 `SHOW CREATE TABLE` 核对，再 `docker start "$container"`。调完之后同样不能再往这个库重放 binlog。
    （0.22，待批准）搬回的是生产 Core 的库时，在导入、调自增起点之后、`docker start` 之前，照第 3.7 步那段 SQL 设上“自动写平台暂停”（平台订单、配额与收件箱随库一起退回了，平台上的显示量没有）；起来之后照第 3.8 步第 1、4 条检查连接、补拉、对账，再由管理员解除。
 7. 用完删掉临时实例。
+
+### 3.11 生产 Core 被攻破之后（0.22，待批准，契约 §8.6 第 6 条）
+
+进程被攻破时，攻击者拿到的是同一个容器里的全部：生产库账号、令牌加密主密钥、平台应用凭据、库里的平台令牌、Telegram 机器人令牌。按这个顺序处置，每一步记时间与执行人：
+
+1. 停掉生产 Core（`docker stop "$container"`，`container` 照第 0.2 节取），平台照常销售。
+2. 在两个平台的卖家后台撤销本应用的授权；到平台开发者后台更换应用密钥。
+3. 更换令牌加密主密钥、Telegram 机器人令牌、生产库的数据库密码（照 `vps_infra` 的做法）与巡检令牌（第 3.7 步的轮换）；新的写回 secrets 文件、`.env` 与 P-05 的那条笔记。库里用旧主密钥加密的平台令牌作废。
+4. 按第 3.10 步用时间点恢复，把生产库退回到攻破之前；在起 Core 之前照第 3.7 步那段 SQL 设上“自动写平台暂停”。
+5. 起生产 Core，在后台重新授权两个平台；在卖家后台核对两个店铺的库存与改动记录，与 Core 的配额对照；照第 3.8 步补拉、对账，差异处理完再解除暂停。
 
 ---
 
