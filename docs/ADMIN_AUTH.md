@@ -1,11 +1,11 @@
 # 后台管理员账号、密码登录与会话
 
-> 版本：**0.3 · 日期：2026-11-23 · 状态：草案，待 Kelvin 批准**（随契约 0.22 一起）。
+> 版本：**0.3 · 日期：2026-11-23 · 状态：Kelvin 2026-11-23 批准**（随契约 0.22 一起）。
 > 出处：原 Inventory 的后台登录设计（`acuven_inventory` 仓库 `docs/ADMIN_AUTH_DESIGN.md` 0.1，Kelvin 2026-11-23 批准全文，含第 7 节的取舍与残余风险）。
 > 2026-11-23 Kelvin 定把 Inventory 并入 Core、而且要深度融合（`acuven_hub/DECISIONS.md` C-21，契约 0.22）：这个后台是 **Core 的后台**，管目录、库存与平台渠道，这套登录是 Core 的管理员登录。
 > 0.3 把 0.1 改到 Core 的约定上；**密码、锁定、会话、CSRF 的规则与例子（P1–P4、L1–L8、S1–S4、A1–A8）没有改；约束的例子 D1、D2、D4–D7 没有改，D3 随 `token_hash` 改用正则检查多了一句（64 个字符但含大写或非十六进制字符的也拒绝，这是 0.2 草案已做的改动），另新增 D8、D9**。改动逐项列在第 0 节，取舍登记为 [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) 的 Q-86、Q-87、Q-91、Q-92、Q-93。
 > 被否决的 0.2 草案（“Inventory 模块的后台登录”，放在 `docs/inventory/`）整体作废。
-> 依据：[CONTRACT_V1.md](CONTRACT_V1.md) 0.22 草案的 §1、§2.2、§6.1、§7.1、§7.2、§8.1、§8.6、§10 第 1、3、4、5 条；原 Inventory 需求（`acuven_inventory` 仓库 `docs/REQUIREMENTS.md` 第 5 节「安全」：独立账号、不与他人共用、登录限流、记录异常尝试、支持立即停用、首期不做双重验证）；本仓库 `CLAUDE.md` 的代码约定。
+> 依据：[CONTRACT_V1.md](CONTRACT_V1.md) 0.22 的 §1、§2.2、§6.1、§7.1、§7.2、§8.1、§8.6、§10 第 1、3、4、5 条；原 Inventory 需求（`acuven_inventory` 仓库 `docs/REQUIREMENTS.md` 第 5 节「安全」：独立账号、不与他人共用、登录限流、记录异常尝试、支持立即停用、首期不做双重验证）；本仓库 `CLAUDE.md` 的代码约定。
 > 取值与做法尽量沿用 acuven-shop 已获批、已上线的管理员登录（同样是标准库 scrypt、按来源与用户名组合锁定、服务端会话），不同处与接受的残余风险在第 7 节列出。设计有改动时，改动部分的批准作废、须重新批准。
 
 分四个任务实现，每个只做一层（原 INVENTORY-TASK-001～004 不在 `acuven_inventory` 执行，批准后在本仓库登记为 `CORE-TASK-NNN`）：
@@ -19,7 +19,7 @@
 
 前置：契约 0.22 的后台开关（`CORE_ADMIN_ENABLED`，§6.1）与操作主体的 `kind` 列（§10 第 4 条）已实现；没实现之前，第 3 节以后的任务不能登记。
 
-## 0. 相对 0.1 的改动（0.3，待 Kelvin 批准）
+## 0. 相对 0.1 的改动（0.3，Kelvin 2026-11-23 批准）
 
 | 项 | 0.1（`acuven_inventory`） | 0.3（Core） | 依据 |
 | --- | --- | --- | --- |
@@ -369,7 +369,7 @@ TLS 在边缘反向代理终止，浏览器看到的是 HTTPS，所以 `Secure` 
 
 - **0.1**（2026-11-23，在 `acuven_inventory` 仓库）：草案；同日按设计预审与独立评审三轮修改，Kelvin 批准全文，包括第 7 节的取舍、没有采用的加固与接受的残余风险。修订细节见那边的修订记录。
 - **0.2**（2026-11-23，PR #189 的 `docs/inventory/ADMIN_AUTH_DESIGN.md`）：按“Inventory 作为 Core 进程内模块”改写；随那一稿一起被 Kelvin 否决，作废。
-- **0.3**（2026-11-23，**草案，待 Kelvin 批准**）：按深度融合改写，放在 `docs/ADMIN_AUTH.md`，是 Core 的后台登录。相对 0.1 的改动见第 0 节，要点：
+- **0.3**（2026-11-23，**Kelvin 2026-11-23 批准**）：按深度融合改写，放在 `docs/ADMIN_AUTH.md`，是 Core 的后台登录。相对 0.1 的改动见第 0 节，要点：
   1. 后台是 Core 的后台；开关是 `CORE_ADMIN_ENABLED`（0.2 是 `CORE_INVENTORY_ENABLED`）；
   2. 每个账号有一个 `admin` 种类的操作主体，建号时同一事务建，账号表加 `credential_id`（唯一）；新增 D9；`ActiveSession` 与 `AdminPrincipal` 带上它；
   3. 每个账号持有 Core 的三个角色，后台按角色表断言（契约 §8.6 第 2 条）；

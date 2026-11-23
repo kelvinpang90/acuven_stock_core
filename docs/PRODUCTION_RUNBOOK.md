@@ -7,7 +7,7 @@
 
 下面的步骤都由人做。
 
-> **（2026-11-23，草案，待 Kelvin 批准）** Inventory 深度融合进 Core（C-21，契约 0.22、设计 0.7、[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)）：生产实例上没有 Inventory 这个调用方，两个平台店铺是 Core 自己的入口，后台在 Core 的进程里。
+> **（2026-11-23，Kelvin 同日批准）** Inventory 深度融合进 Core（C-21，契约 0.22、设计 0.7、[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md)）：生产实例上没有 Inventory 这个调用方，两个平台店铺是 Core 自己的入口，后台在 Core 的进程里。
 > 所以生产实例不再签 Inventory 的业务凭据与对账凭据，只签巡检凭据；生产 Core 改挂代理网络并开 vhost；恢复时起生产 Core 之前先设上“自动写平台暂停”。受影响的步骤下面都加了“（0.22，待批准）”的说明；批准、相应任务实现之前，照原步骤做（Inventory 的两个凭据先不签）。
 
 ## 0. 约定

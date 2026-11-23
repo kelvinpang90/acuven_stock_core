@@ -4,7 +4,7 @@
 > 首个验收目标：支撑 Acuven 自用网店真实经营  
 > 状态：需求已按本轮问答收敛；具体 API 路径、技术选型和上线参数在设计阶段定稿。本文不表示功能已实现或已上线。  
 > **2026-11-10 修订**（Kelvin 逐条答复，见 [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md)）：Kelvin 说明目前所有项目都是 demo、还没有真实经营，所以 V1 的首个接入方改为**公开网店 Demo**，用一个独立的 Demo Core 实例；RPO 放宽为 **≤5 分钟**；Core 不可用时网店**按最后读到的可售量封顶，继续收款**；与网店同机时服务间通信不加 TLS。下文受影响处已逐处标注。真实网店何时接入待定。
-> **2026-11-23 修订（草案，随契约 0.22 待 Kelvin 批准）**：Kelvin 定把 Acuven Inventory 并入 Core，而且要深度融合（`acuven_hub/DECISIONS.md` C-21）：没有单独的 Inventory 系统或模块，Core 自己多出平台渠道能力——生产实例上自营 Shopee 店与 TikTok Shop 店各是 Core 的一个销售入口，配额、安全库存与平台已售未扣是 Core 的状态，平台订单事件在 Core 的事务里处理，Core 有一个给 Acuven 管理员用的后台；生产实例对公网只开放后台与平台回调，`/v1` 不对外。Demo 实例不变。规则见契约 0.22 §3、§3.1、§5.10、§8.6 与 [docs/PLATFORM_CHANNELS.md](docs/PLATFORM_CHANNELS.md)；受影响处标“2026-11-23 修订”。
+> **2026-11-23 修订（随契约 0.22 Kelvin 2026-11-23 批准）**：Kelvin 定把 Acuven Inventory 并入 Core，而且要深度融合（`acuven_hub/DECISIONS.md` C-21）：没有单独的 Inventory 系统或模块，Core 自己多出平台渠道能力——生产实例上自营 Shopee 店与 TikTok Shop 店各是 Core 的一个销售入口，配额、安全库存与平台已售未扣是 Core 的状态，平台订单事件在 Core 的事务里处理，Core 有一个给 Acuven 管理员用的后台；生产实例对公网只开放后台与平台回调，`/v1` 不对外。Demo 实例不变。规则见契约 0.22 §3、§3.1、§5.10、§8.6 与 [docs/PLATFORM_CHANNELS.md](docs/PLATFORM_CHANNELS.md)；受影响处标“2026-11-23 修订”。
 
 ## 1. 目标与依据
 
@@ -90,7 +90,7 @@ Acuven Stock Core（下称 Core）作为**独立常驻服务**，持有商品身
 | API-03 | 明确成功、缺货、版本冲突、过期、幂等冲突、权限错误与服务暂不可用的响应语义；每次请求可用相关 ID 追踪。 | 网店超时后可按原幂等键重试或查询结果，不靠猜测补单。 |
 | API-04 | 保留未来调用方与库存池、销售入口、来源单据字段，不在 V1 实现 Inventory 份额、ERP 采购流程或 POS 离线额度。新增能力应通过兼容版本发布。 | V1 接口文档中明确已实现/保留字段；旧网店客户端在兼容升级后仍可运行。 |
 
-### 4.5 平台渠道（2026-11-23 修订，草案，随契约 0.22 待 Kelvin 批准）
+### 4.5 平台渠道（2026-11-23 修订，随契约 0.22 Kelvin 2026-11-23 批准）
 
 原 Acuven Inventory 最小 V1 设计 0.3（Kelvin 2026-11-21 批准）里与库存账有关的要求，并入 Core 之后写在这里；做法见契约 0.22 的对应章节，与外部平台打交道的细节见 [docs/PLATFORM_CHANNELS.md](docs/PLATFORM_CHANNELS.md)。只在生产实例上用，Demo 实例不受影响。API-04 的“V1 不实现 Inventory 份额”因此对生产实例不再成立。
 
