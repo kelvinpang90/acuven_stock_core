@@ -63,7 +63,8 @@ container="$(core_find_api_containers)"; echo "$container"
 
 ## 2. 签发运维凭据
 
-只在生产实例上签。运维凭据只带 `ops.read`、不带销售入口，只查它所属的租户（V1 一个租户、一个令牌）。在服务器上：
+只在生产实例上签。运维凭据只带 `ops.read`、不带销售入口，只查它所属的租户（V1 一个租户、一个令牌）。
+这是巡检专用的运维凭据；Inventory 每日对账另有自己的运维凭据（契约 §10 第 2 条，`docs/PRODUCTION_AND_RECOVERY.md` 第 1.1 节），两者不共用，不给对账在这个凭据下另签令牌（这里的轮换只是巡检自己换令牌）。在服务器上：
 
 ```bash
 docker exec "$container" python -m app.cli credential issue --tenant ten_… --name "Stock core monitor" \
