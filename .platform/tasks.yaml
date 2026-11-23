@@ -3128,14 +3128,14 @@ tasks:
       一，库存与合并类的命令体改从 execution.context 取租户、入口与池、操作主体、操作者、request_id 与幂等键，不再读 execution.access 与 execution.request：app/services/counts.py、stock.py（含 entry_identity 等被订单类服务共用的函数）、stock_documents.py、stock_imports.py、sku_merges.py。
       二，接口层里在命令中取身份的三个模块改读上下文：app/api/catalog.py 与 app/api/catalog_imports.py 组目录变更的作者（ChangeAuthor）与取租户，app/api/stock_imports.py 的确认与切 live。目录的两个服务本来就收接口层组好的作者，不用改。鉴权依赖、读接口与 HTTP 的各项检查不动。
       三，四个测试里经兼容属性取值的钩子改读上下文：tests/integration/test_corrections_api.py、test_counts_api.py、test_stock_documents_api.py 按 request_id 区分请求的改用 execution.context.request_id；test_stock_imports_api.py 的并发确认钩子现在按 execution.request.path_params 取导入 ID，改为不经请求对象区分两个请求（例如按上下文里的 request_id，测试自己发请求时知道各自的 request_id）。
-      工作包 P1c 原本还含“去掉兼容属性”：加上 idempotency.py 允许路径会到 13 个，超过拆分规则的 12 个，所以拆到 CORE-TASK-079；本任务之后兼容属性仍在、但 app 与 tests 里不再有人用。
+      工作包 P1c 原本还含“去掉兼容属性”：加上 idempotency.py 允许路径会到 13 个，超过拆分规则的 12 个，所以拆到 CORE-TASK-079；本任务之后兼容属性仍在，app 与 tests 里除执行器自己（app/services/idempotency.py，不在本任务的允许路径里，由 079 一并改）之外不再有人用。
       明确不做：去掉兼容属性（079）；判定与写入的任何改动；入口种类的检查；平台事件执行器。
     status: ready
     depends_on:
       - CORE-TASK-074
       - CORE-TASK-075
     acceptance_criteria:
-      - 只改 allowed_change_paths；app 与 tests 目录下没有 execution.access 与 execution.request（app/services/idempotency.py 里兼容属性的定义除外；PR 正文贴出检索命令与结果）
+      - 只改 allowed_change_paths；app 与 tests 目录下除 app/services/idempotency.py 与 tests/integration/test_idempotency.py（执行器与它的测试，由 CORE-TASK-079 改）外没有 execution.access 与 execution.request（PR 正文贴出检索命令与结果）
       - 目录变更记录、流水、盘点单、期初导入、池切 live、SKU 合并单上的 credential_id、actor_ref、actor_role、request_id 与 idempotency_key 与改动前相同（已有测试对这些列的断言照常通过）
       - 全部集成测试照常通过（目录、导入、期初及其并发确认、收货、不可售与报损、更正、盘点、SKU 合并及其并发、幂等执行器，以及 CORE-TASK-075 覆盖的订单类）；除上面四个钩子外测试一字不改，test_stock_imports_api 的并发确认测试仍能让两个请求按原来的先后停住与放行
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
@@ -3238,8 +3238,8 @@ tasks:
     title: 去掉幂等执行器上的兼容属性，命令体只经命令上下文取身份
     purpose: >-
       按契约 docs/CONTRACT_V1.md 0.22 的 5.10 命令体共用与 docs/PLATFORM_CHANNELS.md 第 14 节 P1c 的最后一项（从 CORE-TASK-076 拆出：一起做允许路径会超过 12 个）。纯重构，/v1 的行为一点不变。
-      app/services/idempotency.py 的 Execution 删掉 CORE-TASK-074 暂留的 access 与 request 两个兼容属性，不再持有请求对象，构造时也不收它；命令体只经 execution.context 取身份与入口。核心照旧按请求取连接、作废连接与写响应（074），HTTP 包装与核心的其余行为不变。
-      tests/integration/test_idempotency.py 加一条：Execution 上没有 access 与 request 属性。
+      app/services/idempotency.py 的 Execution 删掉 CORE-TASK-074 暂留的 access 与 request 两个兼容属性，不再持有请求对象，构造时也不收它；命令体只经 execution.context 取身份与入口。执行器自己里经 execution.request 取值的地方（例如执行命令时组响应）改为直接用核心手里的请求或上下文。核心照旧按请求取连接、作废连接与写响应（074），HTTP 包装与核心的其余行为不变。
+      tests/integration/test_idempotency.py：074 加的“兼容属性返回与改动前相同的对象”的测试删掉，改成一条断言 Execution 上没有 access 与 request 属性；这个文件里还有经兼容属性取值的地方一并改读上下文。
       明确不做：服务层与接口层（075、076 已改完，本任务不应再碰它们）；判定与写入的任何改动。
     status: ready
     depends_on:
@@ -3247,7 +3247,7 @@ tasks:
       - CORE-TASK-076
     acceptance_criteria:
       - 只改 allowed_change_paths；Execution 没有 access 与 request 属性、构造参数里没有请求对象；app 与 tests 目录下没有 execution.access 与 execution.request（PR 正文贴出检索命令与结果）
-      - 全部集成测试照常通过（含幂等执行器、订单类、库存与合并类、目录类）；除 test_idempotency.py 新加的那一条外测试一字不改
+      - 全部集成测试照常通过（含幂等执行器、订单类、库存与合并类、目录类）；只有 test_idempotency.py 有改动，且只限上面说的兼容属性测试的删改与改读上下文
       - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
       - app/services/idempotency.py
