@@ -1,6 +1,6 @@
 # 后台前端设计
 
-> 版本：**0.1 · 日期：2026-11-24 · 状态：草案，待 Kelvin 批准**。批准之后才登记前端任务（工作包 P3i 起，[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 14.2 节）；设计有改动时，改动部分的批准作废、须重新批准。
+> 版本：**0.2 · 日期：2026-11-24 · 状态：0.1 经 Kelvin 2026-11-24 批准（PR #195）；0.2 的改动（第 2.2 节“待生效”的判法，随契约 0.24）待批准**。批准之后才登记前端任务（工作包 P3i 起，[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 14.2 节）；设计有改动时，改动部分的批准作废、须重新批准。
 > 依据：[CONTRACT_V1.md](CONTRACT_V1.md) 0.23 的 §3.1、§3.2、§6.2、§6.8、§7.1（后台表单防重复）、§8.1、§8.3、§8.6 第 2 条（后台接口、检查顺序、两种响应形状、页面表）、§10 第 3 条（角色表）；[ADMIN_AUTH.md](ADMIN_AUTH.md) 0.3 第 5 节；[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 0.2 第 4～8 节；[PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 第 1.5b、1.7 节；`.platform/tasks.yaml` 里 CORE-TASK-095～127 写定的后台接口。
 > 本文只定前端怎么做、调哪些接口、后端还缺什么；**不改契约、不改已登记任务**。第 9 节列出的后端缺口要另行登记（要改契约的先改契约）。
 > 2026-11-24 Kelvin 已定的四项取舍：不用 UI 组件库；前端任务一次全部登记；CI 新开 `frontend` job；V1 先不启用浏览器验收（第 10 节）。
@@ -107,7 +107,7 @@ frontend/
 | 页面 | 读 | 写（角色） | 内容要点 |
 | --- | --- | --- | --- |
 | 登录 | `GET /api/v1/admin/session` | `POST`、`DELETE /api/v1/admin/session` | 第 3 节 |
-| 库存总览 | `GET /api/v1/admin/pools`；`GET /api/v1/admin/pools/{pool_id}/stock-overview?after=&limit=` | — | 每个 SKU 一行：`sku_code`、SKU 状态、`stock_balance`、`reserved`、`unavailable`、`paid_pending_dispatch`、`available`、`S`、每个平台入口的 `Q` 与 `pending`（入口按 `channel_id` 升序成列，列头写平台）、`F`（为负标“超额”，红色）、异常标记（某入口 `review_hold` 为真标“待核对”；人工模式下 `manual_confirmed_quota` 与 `quota` 不等标“待生效”，[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节）。平台读数与最近发布结果、本次读取的数据库时间依赖缺口 G1、G2。页内按 `sku_code` 过滤只过滤已载入的这一页 |
+| 库存总览 | `GET /api/v1/admin/pools`；`GET /api/v1/admin/pools/{pool_id}/stock-overview?after=&limit=` | — | 每个 SKU 一行：`sku_code`、SKU 状态、`stock_balance`、`reserved`、`unavailable`、`paid_pending_dispatch`、`available`、`S`、每个平台入口的 `Q` 与 `pending`（入口按 `channel_id` 升序成列，列头写平台）、`F`（为负标“超额”，红色）、异常标记（某入口 `review_hold` 为真标“待核对”；人工模式下 `manual_confirmed_quota` 与 `quota` 不等、或从没确认过而 `quota` 大于 0 时标“待生效”（契约 0.24 §3.2 的判法），[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节）。平台读数与最近发布结果、本次读取的数据库时间依赖缺口 G1、G2。页内按 `sku_code` 过滤只过滤已载入的这一页 |
 | SKU 详情与配额 | 同上（取这个 SKU 那一行，见缺口 G3）；`GET /api/v1/admin/allocation-changes?pool_id=&sku_id=`；`GET /api/v1/admin/listings?sku_id=` | `POST /api/v1/admin/allocations`（`stock_admin`） | 表单：`S` 与每个平台入口的 `Q`，`reason` 必填；只提交改了的入口（`expected_quota` 取页面上读到的值），`expected_version` 取 `allocation_version`。表单旁实时显示按新值算的 `F'`（只是预览，判定以服务端锁内为准，契约 §3.1）。冲突见第 5.3 节 |
 | 商品与 SKU | `GET /api/v1/admin/products/{product_id}`、`GET /api/v1/admin/skus/{sku_id}`、`GET /api/v1/admin/skus?sku_code=&barcode=&ids=`（CORE-TASK-101 沿用 `/v1` 的三个读）；没有分页列表，见缺口 G4 | 新建、修改（带 `expected_version`）、停用、重新启用商品与 SKU（`catalog_admin`） | 首页是按 `sku_code` 或条码查找；缺口 G4 补上之前，另从库存总览列出有余额行的 SKU。停用遇 409 `SKU_HAS_ACTIVE_LISTINGS` 时给出到平台商品页（按这个 SKU 过滤）的链接。不做 SKU 合并（契约 §8.6 第 2 条） |
 | 目录导入 | `GET /api/v1/admin/catalog-imports/{import_id}` | 预览、确认（`catalog_admin`） | 选 CSV 文件，在浏览器里解析成 `{"rows": [...]}`（第 4.6 节），超过 100 行直接提示拆成几次导入，不发请求；预览结果逐行显示状态与原因、汇总；确认只执行合格的行，结果逐行列出。`import_id` 放进页面路径，刷新后能接着确认；过期 409 `IMPORT_EXPIRED` 时提示重新预览 |
@@ -399,3 +399,4 @@ Kelvin 2026-11-24 定**一次全部登记**。下表按依赖排好；“依赖�
 ## 13. 修订记录
 
 - **0.1**（2026-11-24）：草案。Kelvin 同日先定了组件库、登记范围、CI job 与浏览器验收四项。第 1 轮独立评审后改：结果未知后“放弃”保留业务引用、盘点等确认类只许同键重试；Dockerfile 与 CI 改动从 F01 移到 F03，骨架拆成每个不超过 12 个允许路径；期初按编码换 `sku_id`；CSRF 重发前核对用户名；会话依赖的 503 归为确定未生效；G6 改为授权跳转出错回页面（逾期横幅用已有的 `overdue`）；F07 依赖 G2；更正已被更正时链到流水。第 2 轮后改：期初 CSV 的列名例外写进第 4.6 节；F04 起的任务登记后先放「后续计划」，等 `frontend` 成为必需检查再移进「当前计划」；F03 的层改为 CI 与部署。
+- **0.2**（2026-11-24，待批准）：随契约 0.24 第 174 条，第 2.2 节库存总览的“待生效”按新判法。

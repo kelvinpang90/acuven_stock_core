@@ -1,6 +1,7 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.23｜2026-11-24｜状态：**Kelvin 已批准**（2026-11-24；内容先在登记第 4 组的 PR #193 上认可，写法在 PR #194 确认）——第 14 节第 169–173 条：把登记 CORE-TASK-110～127 时补的五条规则写回设计：OAuth `state` 由主密钥现算、接管点的取法、接管点不丢的订单、从人工切到自动时先切模式再补拉与对账、补拉游标与写收件箱不在同一事务。下面 0.23 改动的条文都标“（0.23）”。
+> 版本：0.24｜2026-11-24｜状态：**草案，待 Kelvin 批准**——第 14 节第 174 条：人工模式的“待生效”改判法：平台新订单从 `Q` 扣走多少，`manual_confirmed_quota` 也减多少（§3.1、§3.2）。下面 0.24 改动的条文都标“（0.24）”。
+> 0.23：**Kelvin 已批准**（2026-11-24；内容先在登记第 4 组的 PR #193 上认可，写法在 PR #194 确认）——第 14 节第 169–173 条：把登记 CORE-TASK-110～127 时补的五条规则写回设计：OAuth `state` 由主密钥现算、接管点的取法、接管点不丢的订单、从人工切到自动时先切模式再补拉与对账、补拉游标与写收件箱不在同一事务。下面 0.23 改动的条文都标“（0.23）”。
 > 0.22：**Kelvin 已批准**（2026-11-23；Q-81～Q-102 全部按推荐）——第 14 节第 104–168 条：**深度融合**，Acuven Inventory 不作为模块并入，而是让 Core 自己多出平台渠道能力（`acuven_hub/DECISIONS.md` C-21）。
 > 生产实例的两个平台店铺直接是 Core 的两个销售入口；配额、安全库存与平台已售未扣（pending）是 Core 的状态，随平台订单事件在 Core 的同一个事务里改；平台映射并入商品目录；一个后台、一套管理员登录；“谁做的”改用操作主体。
 > 改到的章节：§0、§1、§2.5、§2.6、§2.7、§2.8、新增 §2.9、§3（重写，新增 §3.1、§3.2）、§4.2、§4.4、§5.5、新增 §5.10、§6.1、§6.2、§7.1、§7.2、§8.1、§8.2、§8.5、新增 §8.6、§9.2、§10 第 1–5 条、§11.4、§12.1、§13；新增 §3.2；取舍见 Q-81～Q-102，均待确认。第 132–149、150–160、161–168 条分别是本稿（深度融合）第 1、2、3 轮独立审查之后补的。
@@ -566,7 +567,7 @@ V1 用拉取，不做推送（Q-08）。
 
 | 事件 | `Q[p]` | `pending[p]` | Core 的账 |
 | --- | --- | --- | --- |
-| 平台新订单（未付款或已付款） | 减 `min(q, Q[p])`，减掉的件数记为这一行的 `quota_taken`（Q-97） | +q | — |
+| 平台新订单（未付款或已付款） | 减 `min(q, Q[p])`，减掉的件数记为这一行的 `quota_taken`（Q-97）；（0.24）`manual_confirmed_quota` 非空时也减去 `quota_taken`，不低于 0（§3.2，Q-103） | +q | — |
 | 订单进入待发货 | — | −（各行剩余件数，预留与确认销售都成功时） | 同一事务里预留并确认销售（§5.10）；被拒则不改，件数留在 `pending` |
 | 付款前取消、超时关闭（整单或某行的部分件数，§5.10） | 满足恢复条件时加回 `min(取消的件数, quota_taken − quota_returned)`，`quota_returned` 随之增加；其余件数进 `F` | −取消的件数 | — |
 | 待处理中的订单（Core 从未扣数）被平台取消 | 不加（照原设计；`quota_taken` 的件数也进 `F`） | −取消的件数 | — |
@@ -641,7 +642,7 @@ V1 用拉取，不做推送（Q-08）。
 | `platform_connections` | 每个 `platform` 入口一行：`mode`（`manual` / `auto`）、`status`（`not_connected`、`active`、`auth_failed`、`revoked`）、能力（JSON）、加密后的访问与刷新令牌及到期时间、补拉游标与 `next_pull_at`、接管点 `takeover_at`（0.23，切到自动时记下）、最近一次刷新与同步的时间 | 后台的授权、断开、切换模式；平台作业（刷新、撤权、补拉） |
 | `platform_write_pause` | 每个租户一行：`paused`、设上的主体、时间、原因，解除的主体、时间、原因 | 后台的设上与解除；恢复时运行手册的 SQL（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 5 节） |
 | `channel_allocations.review_hold`、`review_reason`、`review_since` | 读回不符或对账差异时，暂停这个“SKU × 入口”的发布与回写 | 发布与对账作业设上；后台解除 |
-| `channel_allocations.manual_confirmed_quota`、`manual_confirmed_at` | 人工模式下，管理员确认已在卖家后台设好的显示量；与 `quota` 不等时后台显示“待生效” | 后台的“确认已生效” |
+| `channel_allocations.manual_confirmed_quota`、`manual_confirmed_at` | 人工模式下，管理员确认已在卖家后台设好的显示量。（0.24，Q-103）平台新订单从 `Q` 扣走多少（`quota_taken`），它也减多少、不低于 0（§3.1；平台卖出时卖家后台的显示量自己会减，两边同步），不论入口是什么模式；所以只有管理员改配额、取消加回这类卖家后台不会自己跟着变的改动才让两者不等。人工模式的入口上，两者不等、或从没确认过（为空）而 `quota` 大于 0 时，后台显示“待生效”。确认的值不能大于当前 `quota`（大于会让平台多卖） | 后台的“确认已生效”；平台新订单的事件处理（0.24） |
 | `manual_checks` | 人工核对一次一行：`channel_id`、核对的起止时间（`checked_from`、`checked_until`；检查约束 `checked_from < checked_until`；`checked_until` 不晚于数据库当前时间，由服务层在写入时判，MySQL 的检查约束不能用当前时间）、是否发现差异、说明、操作主体列、`created_at` | 后台的“记人工核对” |
 | `platform_order_lines.known_discrepancy`（布尔）与说明 | 提交到 Core 之后才发现录错、已用库存命令对回实物的订单行（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节） | 后台的“记已知差异” |
 | `platform_alerts` | 严重告警一条一行：类型、对象（入口、SKU、平台订单）、首次发出、最近一次通知、通知次数、确认的主体与时间、转成超时待办的时间 | 作业发出与重复通知；后台确认 |
@@ -669,7 +670,7 @@ V1 用拉取，不做推送（Q-08）。
   | `incident_decision` | `decision`（`continue_selling` / `stop_selling`）、`channel_id`（可空） |
   | `reconciliation_started` | `run_id`、`trigger` |
   | `connection_authorized`、`connection_disconnected`、`connection_mode_changed`、`connection_status_changed` | `channel_id`、`status`、`mode`、`capabilities`（只是能力的名字与可用与否，不含令牌） |
-- 这些操作都不改账面量与流水；改 `Q` 的只有 §3.1 的事件、改配额与人工确认（确认只记 `manual_confirmed_*`，不改 `quota`）。
+- 这些操作都不改账面量与流水；改 `Q` 的只有 §3.1 的事件、改配额与人工确认（确认只记 `manual_confirmed_*`，不改 `quota`）。（0.24）`manual_confirmed_quota` 除了后台的确认，只随平台新订单减少（§3.1），不写 `platform_ops_log`（同 `Q` 随事件的变化，从平台订单与它的事件可以还原）。
 
 ---
 
@@ -3009,3 +3010,14 @@ Kelvin 2026-11-23 定：改成两个运维凭据（本项目记为 Q-80）。
 
 不改：引用格式、去重规则、人工模式下 webhook 只应答不写收件箱、逾期时不能切换、错误码表与角色表、任何 `/v1` 接口。
 对调用方的影响：没有（Demo 实例没有平台入口）。运行手册补了放主密钥与 Telegram 令牌文件、从人工切到自动的步骤（[PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 第 1.5b、1.7 步）。
+
+### 0.24（2026-11-24 起草，待 Kelvin 批准）
+
+来源：登记后台前端（PR #196）时，CORE-TASK-152 的设计预审发现 0.22 的“待生效”判法走不通；Kelvin 2026-11-24 定按建议改契约。
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 174 | §3.2 按 `manual_confirmed_quota` 与 `quota` 是否相等判“待生效”：平台每卖出一件，`Q` 减少、卖家后台的显示量也自己减少，两者都不需要管理员动手，却会让每笔销售都显示“待生效”；卖出后再取消加回时，又可能显示“已生效”而平台上仍是较低的数 | 设计缺陷 | 平台新订单从 `Q` 扣走 `quota_taken` 时，`manual_confirmed_quota` 非空就同样减去它（不低于 0），不论模式；人工模式下两者不等、或从没确认过而 `quota` 大于 0 时显示“待生效”；确认的值不能大于当前 `quota`。只有改配额与取消加回（卖家后台不会自己跟着变的改动）才让两者不等（Q-103；影响已登记的 CORE-TASK-086 与待登记的确认命令） | §3.1 事件表“平台新订单”一行；§3.2 `manual_confirmed_*` 一行与末条；PLATFORM_CHANNELS 6.2 第 3 条 |
+
+不改：表结构（`manual_confirmed_quota` 本来就可空）、`platform_ops_log` 的取值与键、角色表、错误码表、任何 `/v1` 接口。
+对调用方的影响：没有（Demo 实例没有平台入口）。
