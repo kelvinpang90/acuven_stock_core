@@ -1,6 +1,7 @@
 # Acuven Stock Core V1 契约
 
-> 版本：0.22｜2026-11-23｜状态：**Kelvin 已批准**（2026-11-23；Q-81～Q-102 全部按推荐）——第 14 节第 104–168 条：**深度融合**，Acuven Inventory 不作为模块并入，而是让 Core 自己多出平台渠道能力（`acuven_hub/DECISIONS.md` C-21）。
+> 版本：0.23｜2026-11-24｜状态：**待 Kelvin 确认写法**（内容 Kelvin 2026-11-24 已在登记第 4 组的 PR #193 上认可）——第 14 节第 169–172 条：把登记 CORE-TASK-110～127 时补的四条规则写回契约：OAuth `state` 由主密钥现算、接管点的取法、接管点不丢的订单、从人工切到自动时先切模式再补拉与对账。下面 0.23 改动的条文都标“（0.23）”。
+> 0.22：**Kelvin 已批准**（2026-11-23；Q-81～Q-102 全部按推荐）——第 14 节第 104–168 条：**深度融合**，Acuven Inventory 不作为模块并入，而是让 Core 自己多出平台渠道能力（`acuven_hub/DECISIONS.md` C-21）。
 > 生产实例的两个平台店铺直接是 Core 的两个销售入口；配额、安全库存与平台已售未扣（pending）是 Core 的状态，随平台订单事件在 Core 的同一个事务里改；平台映射并入商品目录；一个后台、一套管理员登录；“谁做的”改用操作主体。
 > 改到的章节：§0、§1、§2.5、§2.6、§2.7、§2.8、新增 §2.9、§3（重写，新增 §3.1、§3.2）、§4.2、§4.4、§5.5、新增 §5.10、§6.1、§6.2、§7.1、§7.2、§8.1、§8.2、§8.5、新增 §8.6、§9.2、§10 第 1–5 条、§11.4、§12.1、§13；新增 §3.2；取舍见 Q-81～Q-102，均待确认。第 132–149、150–160、161–168 条分别是本稿（深度融合）第 1、2、3 轮独立审查之后补的。
 > 0.22 早先（PR #189 第 1–3 轮审查时）是“Inventory 作为进程内模块、以内部凭据经进程内入口调 Core”的写法，**Kelvin 2026-11-23 否决**，本版整体替换了它（第 14 节 0.22 的说明）。下面 0.22 改动的条文都标“（0.22）”；没标的条文仍是 0.21 已批准的内容。
@@ -637,7 +638,7 @@ V1 用拉取，不做推送（Q-08）。
 
 | 表或列 | 存什么 | 谁写 |
 | --- | --- | --- |
-| `platform_connections` | 每个 `platform` 入口一行：`mode`（`manual` / `auto`）、`status`（`not_connected`、`active`、`auth_failed`、`revoked`）、能力（JSON）、加密后的访问与刷新令牌及到期时间、补拉游标与 `next_pull_at`、最近一次刷新与同步的时间 | 后台的授权、断开、切换模式；平台作业（刷新、撤权、补拉） |
+| `platform_connections` | 每个 `platform` 入口一行：`mode`（`manual` / `auto`）、`status`（`not_connected`、`active`、`auth_failed`、`revoked`）、能力（JSON）、加密后的访问与刷新令牌及到期时间、补拉游标与 `next_pull_at`、接管点 `takeover_at`（0.23，切到自动时记下）、最近一次刷新与同步的时间 | 后台的授权、断开、切换模式；平台作业（刷新、撤权、补拉） |
 | `platform_write_pause` | 每个租户一行：`paused`、设上的主体、时间、原因，解除的主体、时间、原因 | 后台的设上与解除；恢复时运行手册的 SQL（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 5 节） |
 | `channel_allocations.review_hold`、`review_reason`、`review_since` | 读回不符或对账差异时，暂停这个“SKU × 入口”的发布与回写 | 发布与对账作业设上；后台解除 |
 | `channel_allocations.manual_confirmed_quota`、`manual_confirmed_at` | 人工模式下，管理员确认已在卖家后台设好的显示量；与 `quota` 不等时后台显示“待生效” | 后台的“确认已生效” |
@@ -646,10 +647,10 @@ V1 用拉取，不做推送（Q-08）。
 | `platform_alerts` | 严重告警一条一行：类型、对象（入口、SKU、平台订单）、首次发出、最近一次通知、通知次数、确认的主体与时间、转成超时待办的时间 | 作业发出与重复通知；后台确认 |
 | `reconciliation_runs` | 每次对账一行：触发方式（定时或手动）、发起的主体、起止时间、差异数 | 对账作业；后台的“手动发起对账” |
 | `platform_publishes` | 每次写平台库存一行：入口、SKU、平台商品、目标值、平台确认的值、结果（已确认、明确失败、结果未知、不支持、平台控制）、时间（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 4 节） | 发布与读回作业 |
-| `platform_oauth_states` | 每次发起授权一行：`state` 的 SHA-256（唯一）、入口、平台、发起的管理员主体与会话、`created_at`、`expires_at`（10 分钟）、`used_at`；用过即作废，过期的由清理作业删 | 后台的“授权”；回调 |
+| `platform_oauth_states` | 每次发起授权一行：`oauth_state_id`、`state` 的 SHA-256（唯一）、入口、平台、发起的管理员主体与会话、`created_at`、`expires_at`（10 分钟）、`used_at`；用过即作废，过期的由清理作业删。（0.23）`state` 本身不存：`state = HMAC-SHA256(令牌加密主密钥, oauth_state_id)`，回调时现算比对；发起授权只返回 `oauth_state_id`（库里与幂等记录里只有行 ID 与 SHA-256，所以发起授权能照 §8.6 第 2 条走后台执行器），再由一个只认发起会话的跳转接口 303 到平台授权页 | 后台的“授权”；回调 |
 | `platform_ops_log` | 只追加：上面每一种后台写操作、平台作业对连接状态的改动、“继续销售或手动停售”的决定、两种“结束”；每行记 `action`、对象、前后值（JSON）、原因、`credential_id`、`actor_ref`、`actor_role`、`request_id`、`created_at`。`action` 的取值与前后值的键见下面 | 所有后台写操作与改连接状态的作业，与改动本身同一事务 |
 
-- **从人工切到自动**（第 3 轮审查后补）：这个入口的人工核对已逾期时，切换模式 409 `MANUAL_CHECK_OVERDUE`，先补一次核对再切。这样接管点（最后一次核对的 `checked_until`，[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节）不会太早，补拉要回溯的范围不超过逾期上限（12 小时）。
+- **从人工切到自动**（第 3 轮审查后补）：这个入口的人工核对已逾期时，切换模式 409 `MANUAL_CHECK_OVERDUE`，先补一次核对再切。这样接管点（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节；0.23：接管点取最近一次人工核对的 `checked_until` 与这次进入人工模式的 `mode_changed_at` 两者中较晚的（只算 `mode_changed_at` 之后的核对；切换时存进 `platform_connections.takeover_at`））不会太早，补拉要回溯的范围不超过逾期上限（12 小时）。
 - **人工核对逾期的规则**（Q-99）：`mode` 为 `manual` 的入口，以数据库时间计，距它最近一次核对的 `checked_until` 超过 **12 小时**即为逾期（原设计“每天至少两次”）；切到人工模式之后还没核对过的，从切换时刻算起。逾期只在后台显示、不推送 Telegram；它让 `allocations.update` 拒绝增加**别的**入口的配额（§3.1 第 4 项），并让这个入口的取消加回不满足恢复条件（§3.1）。核对补上之后自动解除。
 - 连接的每次改动（授权、断开、切换模式、作业把状态改为 `auth_failed` 或 `revoked`）都在 `platform_ops_log` 留一条；`platform_connections` 只存当前状态。
 - **`platform_ops_log` 的取值与内容**（第 2 轮审查后补）：`action` 加检查约束，只取下表的值（加值要迁移重建约束）；前后值 `before`、`after` 各是一个 JSON 对象，只能有该动作白名单里的键，由服务层拼出、不直接存请求体；**不得**记令牌（明文或密文）、平台应用凭据、OAuth 的 `code` 与 `state`、顾客资料；`before`、`after` 序列化后各不超过 4 KiB（超过就是程序缺陷，整笔回滚）。
@@ -1311,7 +1312,7 @@ Core 不读网店数据库，也不保存对账结果。账面与流水、订单
 - **人工登记必须填平台的包裹、退款、退货 ID**（卖家后台的订单详情里有）。卖家后台确实没有时，管理员勾选“平台没有给 ID”，Core 用 `m` 加这个订单同一种单据已生效的张数加一（`m1`、`m2`…）作这一段；这只在人工模式下出现。
   不让 `m<n>` 与平台 ID 派生的引用指同一件事两次，靠三条（第 2 轮审查后写死）：
   1. 连接的 `mode` 为 `manual` 时（授权往往早于切到自动），webhook 验签之后只应答、**不写收件箱**，补拉作业不对这个入口运行；所以人工模式下收件箱里只有人工事件；
-  2. 切到自动模式时以最后一次人工核对的 `checked_until` 为接管点，平台时间早于接管点的自动事件不处理（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节）；
+  2. 切到自动模式时记下接管点，平台时间早于接管点的自动事件不处理，webhook 与补拉一样（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节）。（0.23）接管点取最近一次人工核对的 `checked_until` 与这次进入人工模式的 `mode_changed_at` 两者中较晚的（只算 `mode_changed_at` 之后的核对；切换时存进 `platform_connections.takeover_at`）；没有平台时间的事件保留。例外：写这一批事件之前已有自动来源事件、且没有任何人工事件的订单，不按接管点丢——从自动切回人工、再切回自动时，这种订单在人工期里登记不了（第 3 条），人工期里它的事件只能靠切回自动之后补上；
   3. 已有自动来源事件的订单，服务端拒绝**人工登记平台动作**——只限 `created`、`ready_to_ship`、`cancelled`、`shipped` 四种（下面“后台的人工操作”的 `auto_events_exist`）；退货验收（只能后台登记）、待处理重试、映射补上后继续处理、关闭平台已取消的待处理单、第 6 步说的改正事件都不受这一条限制；人工模式下同一订单重复登记“没有 ID”的同类单据时，按订单、动作、平台行、件数、时间提示可能重复（`POSSIBLE_DUPLICATE`）。
 
 **派生的命令正文与请求摘要**（Q-100）
@@ -2992,3 +2993,17 @@ Kelvin 2026-11-23 定：改成两个运维凭据（本项目记为 Q-80）。
 - 在 `vps_infra` 给生产实例开 vhost（只转发 `/admin/`、`/api/`，覆盖设置 `X-Real-IP`），在 Cloudflare 配子域名；真实域名只配在服务器与 GitHub 变量里，不写进仓库。
 - 生产实例的运维照 [PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 的 0.22 说明：只签巡检凭据；开通平台入口与后台入口；建管理员账号。
 - `acuven_inventory` 仓库归档（它的旧需求、规则文档留在那边，只作历史）；工作区的项目总览随之更新。
+
+### 0.23（2026-11-24 起草；内容 Kelvin 同日在 PR #193 上认可，写法待确认）
+
+来源：登记第 4 组任务 CORE-TASK-110～127（PR #193）时，设计预审与独立评审发现契约与 [PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 有四处没写或写法走不通，任务里先写死了规则；Kelvin 2026-11-24 认可这些规则。本版把它们写回设计，任务不变。
+
+| # | 发现 | 类型 | 处理 | 改了哪里 |
+| --- | --- | --- | --- | --- |
+| 169 | 库里只存 `state` 的 SHA-256，发起授权就得把 `state` 原文放进响应与幂等记录，走不了后台执行器的“同键重放得同样的响应” | 设计缺陷 | `state = HMAC-SHA256(令牌加密主密钥, oauth_state_id)`，回调时现算；发起授权只返回 `oauth_state_id`，由只认发起会话的跳转接口 303 到平台授权页（CORE-TASK-111、116、127） | §3.2 `platform_oauth_states`；PLATFORM_CHANNELS 第 2 节 |
+| 170 | 接管点只写了“最后一次核对的 `checked_until`”：没核对过的入口没有接管点；上一段人工期的核对会被当成这一段的 | 未决定 | 取最近一次核对的 `checked_until` 与 `mode_changed_at` 中较晚的，只算 `mode_changed_at` 之后的核对；存进新列 `takeover_at`（CORE-TASK-110、120） | §3.2 `platform_connections` 与“从人工切到自动”；§5.10 引用格式第 2 条；PLATFORM_CHANNELS 6.2 第 5 条 |
+| 171 | 从自动切回人工、再切回自动时，已有自动事件的订单在人工期里登记不了（第 3 条），它在人工期里的事件又早于新接管点，会被丢掉 | 设计缺陷 | 写这一批之前已有自动来源事件、且没有任何人工事件的订单，不按接管点丢；没有平台时间的事件保留；webhook 也按接管点丢（CORE-TASK-117、118） | §5.10 引用格式第 2 条；PLATFORM_CHANNELS 6.2 第 5 条 |
+| 172 | 设计写“补拉、对账，然后改 `mode`”，但人工模式下自动事件不写收件箱、补拉不运行，先补拉什么也拉不进来 | 设计缺陷 | 先改 `mode`、记下接管点，再补拉；切换之后、跑完一次对账之前，不发布这个入口；切换后由管理员手动发起一次对账；接管点之后有人工登记时拒绝切换，先补一次核对（CORE-TASK-120、121、125） | PLATFORM_CHANNELS 6.2 第 5 条；运行手册第 1.7 步 |
+
+不改：引用格式、去重规则、人工模式下 webhook 只应答不写收件箱、逾期时不能切换、错误码表与角色表、任何 `/v1` 接口。
+对调用方的影响：没有（Demo 实例没有平台入口）。运行手册补了放主密钥与 Telegram 令牌文件、从人工切到自动的步骤（[PRODUCTION_RUNBOOK.md](PRODUCTION_RUNBOOK.md) 第 1.5b、1.7 步）。
