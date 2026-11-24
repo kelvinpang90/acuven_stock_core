@@ -191,7 +191,7 @@ core credential list --tenant <租户 ID>
 
    - Telegram 机器人令牌：用编辑器写进 `<宿主机密钥目录>/core_telegram_token`（不要 `echo`），只有令牌这一行。
    - 两个文件都归容器用户（`10001:10001`，见 `Dockerfile`）、权限 `0400`：`sudo chown 10001:10001 <两个文件>`、`sudo chmod 0400 <两个文件>`。不要为了读文件把容器改回 root。
-   - `.env` 加三行：`CORE_TOKEN_KEY_HOST_FILE=<宿主机密钥目录>/core_token_key`、`CORE_TELEGRAM_TOKEN_HOST_FILE=<宿主机密钥目录>/core_telegram_token`、`CORE_TELEGRAM_CHAT_ID=<告警群的 chat ID>`（照 `.env.example`）。没设这两个文件变量时 compose 挂空设备，后台照常起来，但授权接口回 503、刷新作业跳过、告警只记录不推送；配了但不合格时拒绝启动。
+   - `.env` 加三行：`CORE_TOKEN_KEY_HOST_FILE=<宿主机密钥目录>/core_token_key`、`CORE_TELEGRAM_TOKEN_HOST_FILE=<宿主机密钥目录>/core_telegram_token`、`CORE_TELEGRAM_CHAT_ID=<告警群的 chat ID>`（照 `.env.example`）。没设这两个文件变量时 compose 挂空设备，后台照常起来，但授权接口回 503、刷新作业跳过、告警只记录不推送；配了但不合格时拒绝启动；Telegram 令牌与 chat ID 要么都配、要么都不配，只配一个也拒绝启动。
    - 主密钥与 Telegram 令牌存进设计 P-05 的那条安全笔记。主密钥丢了，库里的平台令牌就解不开，只能两个店铺都重新授权。
 4. 建管理员账号（要交互输入密码，所以用 `-it`；`container` 照第 0.2 节取）：
    `docker exec -it "$container" python -m app.cli admin create-account <用户名> --tenant <租户 ID> --actor <操作人引用> --reason "First admin"`（参数以实现它的任务为准，[ADMIN_AUTH.md](ADMIN_AUTH.md) 第 4.6 节）。

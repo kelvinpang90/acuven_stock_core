@@ -647,10 +647,11 @@ V1 用拉取，不做推送（Q-08）。
 | `platform_alerts` | 严重告警一条一行：类型、对象（入口、SKU、平台订单）、首次发出、最近一次通知、通知次数、确认的主体与时间、转成超时待办的时间 | 作业发出与重复通知；后台确认 |
 | `reconciliation_runs` | 每次对账一行：触发方式（定时或手动）、发起的主体、起止时间、差异数 | 对账作业；后台的“手动发起对账” |
 | `platform_publishes` | 每次写平台库存一行：入口、SKU、平台商品、目标值、平台确认的值、结果（已确认、明确失败、结果未知、不支持、平台控制）、时间（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 4 节） | 发布与读回作业 |
-| `platform_oauth_states` | 每次发起授权一行：`oauth_state_id`、`state` 的 SHA-256（唯一）、入口、平台、发起的管理员主体与会话、`created_at`、`expires_at`（10 分钟）、`used_at`；用过即作废，过期的由清理作业删。（0.23）`state` 本身不存：`state = HMAC-SHA256(令牌加密主密钥, oauth_state_id)`，回调时现算比对；发起授权只返回 `oauth_state_id`（库里与幂等记录里只有行 ID 与 SHA-256，所以发起授权能照 §8.6 第 2 条走后台执行器），再由一个只认发起会话的跳转接口 303 到平台授权页 | 后台的“授权”；回调 |
+| `platform_oauth_states` | 每次发起授权一行：`oauth_state_id`、`state` 的 SHA-256（唯一）、入口、平台、发起的管理员主体与会话、`created_at`、`expires_at`（10 分钟）、`used_at`；用过即作废，过期的由清理作业删。（0.23）`state` 本身不存：`state` 为 `HMAC-SHA256(令牌加密主密钥, "oauth_state
+" + oauth_state_id)` 的 32 字节结果编成 URL 安全、无填充的 base64（CORE-TASK-111），回调时现算比对；发起授权只返回 `oauth_state_id`（库里与幂等记录里只有行 ID 与 SHA-256，所以发起授权能照 §8.6 第 2 条走后台执行器），再由一个只认发起会话的跳转接口 303 到平台授权页 | 后台的“授权”；回调 |
 | `platform_ops_log` | 只追加：上面每一种后台写操作、平台作业对连接状态的改动、“继续销售或手动停售”的决定、两种“结束”；每行记 `action`、对象、前后值（JSON）、原因、`credential_id`、`actor_ref`、`actor_role`、`request_id`、`created_at`。`action` 的取值与前后值的键见下面 | 所有后台写操作与改连接状态的作业，与改动本身同一事务 |
 
-- **从人工切到自动**（第 3 轮审查后补）：这个入口的人工核对已逾期时，切换模式 409 `MANUAL_CHECK_OVERDUE`，先补一次核对再切。这样接管点（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节；0.23：接管点取最近一次人工核对的 `checked_until` 与这次进入人工模式的 `mode_changed_at` 两者中较晚的（只算 `mode_changed_at` 之后的核对；切换时存进 `platform_connections.takeover_at`））不会太早，补拉要回溯的范围不超过逾期上限（12 小时）。
+- **从人工切到自动**（第 3 轮审查后补）：这个入口的人工核对已逾期时，切换模式 409 `MANUAL_CHECK_OVERDUE`，先补一次核对再切。这样接管点（[PLATFORM_CHANNELS.md](PLATFORM_CHANNELS.md) 第 6.2 节；0.23：接管点取最近一次人工核对的 `checked_until` 与这次进入人工模式的 `mode_changed_at` 两者中较晚的（只算 `mode_changed_at` 之后的核对；切换时存进 `platform_connections.takeover_at`））不会太早；第一次切到自动时，补拉要回溯的范围不超过逾期上限（12 小时）。（0.23）从自动切回人工、再切回自动时，补拉从人工期开始拉起，回溯范围是整段人工期，可能超过 12 小时；平台订单列表能回溯多久待 V-08 核实。
 - **人工核对逾期的规则**（Q-99）：`mode` 为 `manual` 的入口，以数据库时间计，距它最近一次核对的 `checked_until` 超过 **12 小时**即为逾期（原设计“每天至少两次”）；切到人工模式之后还没核对过的，从切换时刻算起。逾期只在后台显示、不推送 Telegram；它让 `allocations.update` 拒绝增加**别的**入口的配额（§3.1 第 4 项），并让这个入口的取消加回不满足恢复条件（§3.1）。核对补上之后自动解除。
 - 连接的每次改动（授权、断开、切换模式、作业把状态改为 `auth_failed` 或 `revoked`）都在 `platform_ops_log` 留一条；`platform_connections` 只存当前状态。
 - **`platform_ops_log` 的取值与内容**（第 2 轮审查后补）：`action` 加检查约束，只取下表的值（加值要迁移重建约束）；前后值 `before`、`after` 各是一个 JSON 对象，只能有该动作白名单里的键，由服务层拼出、不直接存请求体；**不得**记令牌（明文或密文）、平台应用凭据、OAuth 的 `code` 与 `state`、顾客资料；`before`、`after` 序列化后各不超过 4 KiB（超过就是程序缺陷，整笔回滚）。

@@ -37,7 +37,8 @@
   - 换应用要重新授权、换令牌；平台商品按“入口、平台商品 ID、规格 ID”存（契约 §2.9），不受影响。
 - **存放**（0.1 新）：`platform_connections`，每个 `platform` 入口一行，列见契约 §3.2（`mode`、`status`、能力、加密后的令牌、补拉游标等），另有 `app_profile`。表里只存当前状态；每次授权、断开、切换模式，以及作业把状态改为 `auth_failed` 或 `revoked`，都在 `platform_ops_log` 留一条（契约 §3.2）。
 - **OAuth**：每个平台一个回调路由 `GET /api/v1/platforms/{platform}/oauth/callback`（契约 §8.6 第 3 条）。
-  - 管理员在后台点“授权”时，后端插一行一次性、10 分钟内有效的授权记录（`platform_oauth_states`），绑定管理员会话、目标入口与平台；（0.2）`state` 不随机生成也不存，由主密钥现算：`state = HMAC-SHA256(令牌加密主密钥, oauth_state_id)`，库里只存它的 SHA-256。发起授权只返回 `oauth_state_id`，再由一个只认发起会话的跳转接口 303 到平台授权页（契约 0.23 §3.2）；
+  - 管理员在后台点“授权”时，后端插一行一次性、10 分钟内有效的授权记录（`platform_oauth_states`），绑定管理员会话、目标入口与平台；（0.2）`state` 不随机生成也不存，由主密钥现算：`state` 为 `HMAC-SHA256(令牌加密主密钥, "oauth_state
+" + oauth_state_id)` 的 32 字节结果编成 URL 安全、无填充的 base64（CORE-TASK-111），库里只存它的 SHA-256。发起授权只返回 `oauth_state_id`，再由一个只认发起会话的跳转接口 303 到平台授权页（契约 0.23 §3.2）；
   - 回调先校验 `state`（存在、没用过、没过期、平台一致；用过即作废），再在后端用授权码换令牌，然后跳到不含授权码的结果页（原 DEVELOPMENT 6.2）。
   - 授权码在查询串里：Core 的访问日志只记路径，uvicorn 自带的访问日志两个实例都关掉（契约 §8.6 第 5 条）。
 - **令牌**：应用层加密存储（AES-256-GCM，每次加密一个新的 12 字节随机数；主密钥用 Docker Compose secrets 文件注入，同 `ai_billing_hub` ADR-0004；主密钥不在库里）。
