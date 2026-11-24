@@ -4289,3 +4289,585 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+
+  - id: CORE-TASK-110
+    title: 新增平台授权 state 与平台库存发布两张表，平台连接加接管点一列
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 3.2（platform_oauth_states、platform_publishes 两行）与 docs/PLATFORM_CHANNELS.md 第 2、4 节、6.2 第 5 条（工作包 P4a、P4d 的数据部分；CORE-TASK-081 写明这两张表随授权与发布的任务）。只建表、约束与一列，不写任何读写它们的服务。
+      一，迁移 alembic/versions/20261124_0019_platform_channels.py（revision 0019，down_revision 0018），模型加在 CORE-TASK-081 建的 app/models/platform_ops.py 里（该模块已在 app/models/__init__.py 与 alembic/env.py 里 import，不用再改那两处）。列类型、命名约定、TABLE_OPTIONS 与复合外键写法同 CORE-TASK-081。
+      platform_oauth_states：oauth_state_id 主键（new_id 的 oas 前缀）；state_hash 为 CHAR 64、区分大小写的排序规则，连同检查 64 位小写十六进制的约束都照 app/models/service_auth.py 的 token_digest 写法，唯一；tenant_id、channel_id（复合外键到 sales_channels）；platform 取 shopee、tiktok_shop（同 sales_channels.platform 的取值，检查约束）；credential_id（发起授权的管理员主体，复合外键到 credentials）；admin_session_id（VARCHAR 32，非空，不加外键：state 10 分钟就过期，不该挡住会话表的清理；回调时按它查这个会话是否仍有效，见 CORE-TASK-115）；created_at、expires_at（都非空，检查 expires_at 大于 created_at）、used_at（可空）；普通索引 (expires_at) 供清理作业。
+      platform_publishes：只追加，不改不删。publish_id 主键（new_id 的 ppb 前缀）；tenant_id、channel_id、sku_id（复合外键到 sales_channels、skus）、listing_id（非空，复合外键 (tenant_id, listing_id) 到 sku_listings，照契约 10 第 1 条的租户约定；为此同一条迁移给 sku_listings 加唯一约束 (tenant_id, listing_id)，模型同步改 app/models/platform.py；平台商品只改状态、不删行，所以不会挡住改挂与解除）；kind 取 publish、readback；target_quantity（publish 时为写给平台的 Q，readback 时为比对用的 Q；0 到 1000000）；platform_quantity（平台确认或读到的值，可空，0 到 1000000）；result 按 kind 分两组（检查约束写成 kind 与 result 的组合）：publish 取 confirmed、failed、unknown、unsupported、platform_controlled，readback 取 matched、mismatched、failed；error_code（可空，VARCHAR 64，只存平台的错误码或异常类名，不存平台返回的原文）；created_at（非空，由服务写数据库时间）；普通索引 (tenant_id, channel_id, sku_id, created_at, publish_id) 供“这个 SKU 在这个入口最近的结果”与退避查询。
+      二，platform_connections 加列 takeover_at（DATETIME 微秒精度，可空，默认空）：从人工切到自动时的接管点（PLATFORM_CHANNELS 6.2 第 5 条），值的取法由切换模式的任务（CORE-TASK-120）定、由它写，补拉与 webhook 的任务读；本任务只建列。契约 3.2 的列表没有它，是补的：切到自动之后如果有人再记一次人工核对，按“最近一次核对”现算的接管点会被挪后，所以在切换时存下。
+      downgrade 反向：删这一列与两张表。
+      明确不做：授权、发布、读回的服务（CORE-TASK-115、121、122）。
+    status: ready
+    depends_on:
+      - CORE-TASK-095
+      - CORE-TASK-081
+    acceptance_criteria:
+      - 新增 alembic/versions/20261124_0019_platform_channels.py（down_revision 0018）与 tests/integration/test_platform_channels_schema.py，只改 allowed_change_paths 里的其余文件；upgrade 后 alembic check 无差异；降到 0018 再升回 head 照常（production 测试库，finally 里升回 head）
+      - test_platform_channels_schema 对 purpose 里每一条检查约束、唯一约束与外键各插入一行违反的数据，被预期的那条拒绝；kind 与 result 的八个合法组合都能写入，跨组合（例如 publish 配 matched、readback 配 confirmed）被拒；只用 db 夹具（事务回滚）
+      - 已有的 platform_connections 行在升级后 takeover_at 为空，新插入的行默认为空
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - alembic/versions/20261124_0019_platform_channels.py
+      - app/models/platform_ops.py
+      - app/models/platform.py
+      - tests/integration/test_platform_channels_schema.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-111
+    title: 平台授权规则写成纯函数：令牌加解密、主密钥、授权 state、能力矩阵、作业锁名与退避
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 2 节（state、令牌加密、能力矩阵）、第 3 节（补拉退避）、第 4 节（发布失败退避）、第 8 节（告警种类）与契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 4 条（作业锁名）（工作包 P4a 的规则部分）。新模块 app/domain/platform_auth.py，纯函数：不碰数据库、时钟、网络与文件，时间与随机数由调用方传入。单元测试 tests/unit/test_platform_auth.py（unittest）。
+      一，主密钥：parse_master_key(text) 收 secrets 文件的内容：去掉末尾的换行后为空返回 None（未配置）；否则必须是标准 base64、解出恰好 32 字节，返回这 32 字节；其余报 ValueError，消息里不带输入内容。
+      二，令牌加解密（AES-256-GCM，用 cryptography 的 AESGCM）：encrypt_token(key, nonce, plaintext, *, tenant_id, channel_id, kind) 返回 版本字节 0x01、12 字节 nonce、密文与 16 字节标签依次拼成的 bytes；nonce 必须恰好 12 字节（调用方每次用 secrets.token_bytes(12) 新取，设计“每次加密一个新的 12 字节随机数”）；kind 取 access、refresh；关联数据为 tenant_id、channel_id、kind 三项以换行连接的 UTF-8（补的：密文挪到别的入口或别的令牌种类上解不开）；结果长于 4096 字节（CORE-TASK-081 的列宽）报 ValueError。decrypt_token(key, blob, *, tenant_id, channel_id, kind) 解出原文；版本不对、长度不够、标签或关联数据不符都报 TokenDecryptError，消息里不含密文与原文。
+      三，授权 state：STATE_TTL 为 10 分钟；derive_state(key, oauth_state_id) 为 HMAC-SHA256（密钥为主密钥，消息为字面量 oauth_state 加换行再加 oauth_state_id 的 UTF-8）的 32 字节结果编成 URL 安全、无填充的 base64 文本（补的：state 由主密钥与行 ID 现算，库里与幂等记录里都只有行 ID 与哈希，不存原文，契约 3.2；oauth_state_id 是新 ID 的随机部分，所以 state 仍不可猜）；state_hash(text) 为 UTF-8 的 SHA-256 小写十六进制；check_state(row, *, platform, now) 判回调时读到的 state 行（row 为 None 或带 platform、expires_at、used_at 的只读对象），按先后只报第一个：没有行 unknown、used_at 非空 used、now 不早于 expires_at expired、platform 不一致 platform_mismatch，否则 ok。
+      四，能力矩阵：CAPABILITIES 为 read_models、read_stock、write_stock、read_orders、webhook 五项，取值 available、pending、unavailable；normalize_capabilities(value) 收一个字典：只许这五个键、值只许这三个，缺的键补 unavailable，返回五个键齐全的新字典，不合格报 ValueError。auto_sync_allowed(mode, status, capabilities)：mode 为 auto、status 为 active、write_stock 与 read_orders 都为 available 时为真（设计“缺写库存或缺订单事件时不显示自动同步”；补拉要 read_orders，webhook 不是必需）。pull_allowed(mode, status, capabilities)：auto、active、read_orders 为 available。readback_allowed(mode, status, capabilities)：auto、active、read_stock 为 available。
+      五，作业：PLATFORM_JOBS 列出第 4 组的作业名 platform-token-refresh、platform-oauth-state-purge、platform-inbox、platform-order-pull、platform-publish、platform-readback、platform-reconcile、platform-alert-notify；job_lock_name(database, job) 为 database、字面量 platform_job、job 三项以换行连接后 UTF-8 的 SHA-256 小写十六进制（同 CORE-TASK-083 order_lock_name 的拼法，锁名照契约 7.1 带数据库名）；job 不在 PLATFORM_JOBS 里报 ValueError。
+      六，退避：backoff_minutes(attempts) 为 min(2 的 attempts 次方, 60)，attempts 为 0 得 1，负数报 ValueError（补拉：1 分钟起翻倍、最长 60 分钟；发布失败的重试照同一条，设计第 4 节只写“退避重试”没写数，是补的）。
+      七，告警种类：ALERT_KINDS 为 auth_failed、core_rejected、inbox_stuck、publish_failed、readback_mismatch、over_allocated、reconcile_discrepancy、invariant_violation（设计第 8 节的严重异常；人工核对中发现的冲突由记核对的人当场处理，V1 不自动发告警，登记 PR 列为补的规则）。
+      八，作业周期（设计只写“定时”“每隔几秒”等，数是补的，集中写在这里，之后的任务照用）：JOB_INTERVALS 为 platform-token-refresh 5 分钟、platform-oauth-state-purge 1 小时、platform-inbox 5 秒、platform-order-pull 2 分钟、platform-publish 1 分钟、platform-readback 30 分钟、platform-reconcile 1 分钟（每轮先做管理员请求的对账，定时对账每 24 小时一次，见 CORE-TASK-123）、platform-alert-notify 60 秒；REFRESH_AHEAD 为 30 分钟（访问令牌到期前这么久就刷新）。之后的任务只用这里的值。
+      另：pyproject.toml 的 dependencies 显式加一行 cryptography（下界 42）。它现在随 pymysql[rsa] 间接装上，本模块直接 import，显式列出免得以后换驱动时丢了；不新装依赖。
+      明确不做：读文件、读写数据库、调平台（CORE-TASK-114、115）。
+    status: ready
+    depends_on: []
+    acceptance_criteria:
+      - 新增 app/domain/platform_auth.py 与 tests/unit/test_platform_auth.py，pyproject.toml 只加 cryptography 这一行；测试用 ast 读模块的 import，只有标准库里不做 I/O 的模块（base64、hashlib、dataclasses、datetime、typing 之类）、cryptography 的 AESGCM 与 app.domain 里的纯模块
+      - 加解密往返得原文；同一明文用两个 nonce 得不同密文；改密文任一字节、换 tenant_id、channel_id 或 kind、换密钥都报 TokenDecryptError，消息里没有密文与原文；nonce 不是 12 字节、kind 不认识报 ValueError
+      - 主密钥：32 字节的 base64 带或不带末尾换行都解出同样的 32 字节；空串与只有换行返回 None；31 字节、33 字节与非 base64 报 ValueError，消息里不含输入
+      - derive_state 同密钥同行 ID 得同一文本、换密钥或换行 ID 得不同文本、长 43 且只有 URL 安全字符；check_state 的五种结果各一条用例；恰好在 expires_at 那一刻为 expired；同时已用过且已过期时报 used
+      - 能力矩阵：缺键补 unavailable；多余的键与非法的值报 ValueError；auto_sync_allowed、pull_allowed、readback_allowed 的每个条件各有一条只违反它的用例，全满足为真
+      - job_lock_name 长 64、同输入同输出、作业名不认识报 ValueError；backoff_minutes 对 0、1、5、6、10 分别得 1、2、32、60、60
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/platform_auth.py
+      - tests/unit/test_platform_auth.py
+      - pyproject.toml
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-112
+    title: 平台适配器协议、模拟适配器与合同测试夹具，出站请求的日志与异常脱敏
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 10 节（适配器协议、模拟适配器与合同测试夹具）、第 9 节出站请求脱敏与第 15 节相应的验收（工作包 P4b）。新包 app/platforms/（__init__.py、base.py、mock.py、registry.py），只用标准库；单元测试。
+      一，base.py 定义 PlatformAdapter 协议（typing.Protocol）。设计第 10 节的七个动作，加授权的两个（设计第 2 节要“在后端用授权码换令牌”、发起授权要拼平台的授权地址，第 10 节没列，是补的）：authorize_url(state) 返回平台授权页的地址（回调地址由适配器自己的配置给，随真实适配器的任务定）；exchange_code(code, extra) 返回 TokenGrant，extra 是回调查询串里 code 与 state 以外的参数（字典，平台可能在回调里带店铺 ID 等，换令牌要用）；refresh_token(shop_id, refresh_token) 返回 TokenGrant；以下各动作的第一个参数都是 ShopAuth（shop_id 与 access_token，平台调用多要店铺 ID）：list_models(auth) 返回 PlatformModel 列表；read_stock(auth, models) 返回以 (item_id, model_id) 为键的件数字典；write_stock(auth, item_id, model_id, quantity) 写绝对值，返回 WriteResult；pull_orders(auth, updated_from, updated_to, page_token) 返回 OrderPage；read_order(auth, platform_order_id) 返回 OrderSnapshot 或 None（平台上没有）；parse_webhook(headers, body) 先验签再解析，返回 WebhookBatch，验签不过抛 SignatureInvalid。
+      数据类都是 frozen：ShopAuth（shop_id、access_token）；TokenGrant（access_token、access_expires_at、refresh_token、refresh_expires_at、shop_id、capabilities 字典）；PlatformModel（item_id、model_id、name）；WriteResult（outcome 取 confirmed、unsupported、platform_controlled，confirmed_quantity 可空）；OrderPage（orders、next_page_token 可空）；OrderSnapshot（platform_order_id、shop_id、updated_at（平台记录的订单最近更新时间；pull_orders 返回 updated_from ≤ updated_at < updated_to 的订单，左闭右开）、各状态的平台时间（created、ready_to_ship、return_requested，没有为空）、lines（platform_line_id、platform_item_id、platform_model_id、quantity、cancelled_total）、cancellations（每次取消一项：refund_id 可空、平台时间、各行的 platform_line_id、这一次取消的件数 quantity 与这一次之后的累计 cancelled_total；CORE-TASK-083 的 payload 带 refund_id 时要每行这一次的件数）、packages（package_id、平台时间、各行件数））；WebhookBatch（shop_id、events：每个是 platform_order_id、platform_line_id、action、event_key（平台事件 ID）、payload（CORE-TASK-083 parse_payload 的形状））。时间都是不带时区的 UTC datetime。退货收到不在快照与 webhook 里（return_received 只由后台登记，CORE-TASK-086）。
+      异常：PlatformError 基类带 code（平台错误码，可空）；子类 Rejected（明确失败）、Unknown（结果未知：超时、连接中断）、RateLimited（带 retry_after_seconds）、AuthRevoked（撤权）、AuthFailed（令牌失效或 scope 不足）、SignatureInvalid。异常的 str 只含类名与 code。
+      二，出站脱敏（设计第 9 节）：describe_call(method, url, status) 只留方法、主机之后的路径与状态码（去掉 scheme、用户信息、主机、端口、查询串与片段）；log_call(logger, method, url, status) 用它记一行；describe_error(exc) 只给类名与平台错误码。适配器只经这几个函数记日志、只抛上面的异常（底层异常不带 cause 往外传：raise … from None）。
+      三，mock.py 的 MockPlatform：内存里的一个平台与一个店铺，实现协议的九个动作；构造参数给 platform 名、店铺 ID、webhook 的 HMAC-SHA256 测试密钥；测试可以给某个动作排下一次的结果（成功、Rejected、Unknown、RateLimited、AuthRevoked、AuthFailed），可以设平台上的规格、库存与订单快照；它把访问令牌放进查询串里拼出完整 URL 再经 log_call 记日志，失败时先抛一个 str 里带这个 URL 的底层异常、再包装成上面的异常（用来验脱敏）；记下收到的每次写库存（规格与件数），供之后作业任务的测试断言。
+      四，registry.py 的 build_adapters(settings) 返回 {platform: adapter}；V1 先返回空字典（真实适配器随平台获批的任务加，工作包 P4f、P4g）。之后的接口与作业都从 app.state.platform_adapters 取，测试换成模拟适配器；某个平台没有适配器时怎样表现由用到它的任务写明。
+      五，合同测试夹具 tests/unit/platform_contract.py：PlatformContractTests（unittest 的 mixin），子类给出 make_adapter 与“让下一次调用得到某种结果”的钩子；覆盖九个动作各自的成功、明确失败、结果未知、限流、撤权（设计第 10 节）；令牌在查询串里时，用 assertLogs 收到的全部日志与异常的 str 里都没有访问令牌、查询串与请求体；验签失败抛 SignatureInvalid；写库存是绝对值（同一个数连写两次，平台上就是这个数）。tests/unit/test_mock_platform.py 用模拟适配器跑这套夹具；真实适配器以后照同一套跑。
+      明确不做：真实平台的适配器（P4f、P4g，等平台获批）；作业与接口（CORE-TASK-115 起）。
+    status: ready
+    depends_on:
+      - CORE-TASK-083
+    acceptance_criteria:
+      - 新增文件只限 allowed_change_paths；用 ast 读 app/platforms 下各模块的 import，只有标准库与 app.domain 里的纯模块；测试由 tests.unit 执行
+      - 合同夹具对模拟适配器全绿：九个动作各有成功一条，可失败的动作各有明确失败、结果未知、限流、撤权各一条
+      - describe_call 对带用户信息、端口、查询串与片段的地址只留方法、路径与状态码；模拟平台每种失败时 assertLogs 收到的日志与异常的 str 里都没有访问令牌、查询串与请求体
+      - 每种异常的 str 只含类名与 code；webhook 签名不对、缺签名头都抛 SignatureInvalid
+      - build_adapters 现在返回空字典
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/platforms/__init__.py
+      - app/platforms/base.py
+      - app/platforms/mock.py
+      - app/platforms/registry.py
+      - tests/unit/platform_contract.py
+      - tests/unit/test_mock_platform.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-113
+    title: 补拉拆事件的规则写成纯函数：订单快照拆成通用动作，丢掉接管点之前的，算补拉区间
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 3 节补拉、6.2 第 5 条接管点、第 10 节状态对照与契约 docs/CONTRACT_V1.md 0.22 的 5.10（工作包 P4c 的规则部分）。新模块 app/domain/platform_pull.py，纯函数（可以 import CORE-TASK-112 的 app.platforms.base 里的数据类，它只用标准库），单元测试 tests/unit/test_platform_pull.py。
+      一，snapshot_events(snapshot) 把一个 OrderSnapshot 按它当前的状态拆成通用动作的列表，每个是 (platform_line_id, action, event_key, payload)：created（订单有 created 时间就拆，payload 的 lines 为快照的各行）；ready_to_ship（有进入待发货的时间就拆）；每个取消一个 cancelled（快照的 cancellations 逐个：payload 的各行都带 cancelled_total；带 refund_id 的另带 refund_id 与各行这一次的 quantity，不带的不带 quantity，照 CORE-TASK-083 的形状）；每个包裹一个 shipped（package_id 与各行件数）；有退货申请时间就拆 return_requested。platform_line_id 照 CORE-TASK-086、087 对各动作的约定（订单级动作为空串）。event_key 用平台记录的这个状态的时间（设计第 3 节），写成 RFC 3339 微秒 Z 文本；payload 的 platform_time 取同一个时间。拼单据 ID 由 CORE-TASK-086 的 record_auto_event 做，这里不拼。拆出的每个 payload 都用 CORE-TASK-083 的 parse_payload 校验，不合格报 ValueError（是适配器的缺陷，调用方记日志、跳过这个订单）。快照缺某个状态的时间时这个动作不拆（补的：没有时间就没有稳定的 event_key，下一次补拉再看）。
+      二，drop_before_takeover(events, takeover_at)：takeover_at 为空时原样返回；否则丢掉 platform_time 早于 takeover_at 的动作，等于的保留（设计 6.2 第 5 条：平台记录的时间早于接管点的事件不再处理，适配器拆动作时就丢掉）。
+      三，pull_window(cursor, takeover_at, now, *, lag, max_span)：补拉区间的起点为 cursor；cursor 为空时取 takeover_at；两者都空时取 now 减 12 小时（人工核对的逾期上限，契约 3.2；补的）。终点为 now 减 lag（默认 1 分钟，免得拉到平台还没写完的更新，补的）；区间长于 max_span（默认 24 小时）时终点截到起点加 max_span，剩下的下一轮再拉。返回 (起点, 终点, truncated)，truncated 表示被 max_span 截短；起点不早于终点时返回 None。时间都是不带时区的 UTC datetime，带时区的报 ValueError。
+      明确不做：调平台、写收件箱、推游标（CORE-TASK-118）。
+    status: ready
+    depends_on:
+      - CORE-TASK-112
+    acceptance_criteria:
+      - 新增 app/domain/platform_pull.py 与 tests/unit/test_platform_pull.py，不改别的文件；测试用 ast 读 import，只有标准库里不做 I/O 的模块、app.domain 里的纯模块与 app.platforms.base
+      - 一个已下单、待发货、部分取消一行、两个包裹、有退货申请的快照拆出 purpose 第一条的每种动作各一个，event_key 与 platform_time 是各自状态的时间，每个 payload 都能被 parse_payload 接受
+      - 同一快照拆两次结果相同；缺 ready_to_ship 时间的不拆这一个动作；带 refund_id 的取消与不带的各一条用例；拆出不合格 payload 的快照报 ValueError
+      - drop_before_takeover：早于丢、等于留、为空原样返回
+      - pull_window：cursor、takeover_at 都空时起点为 now 减 12 小时；终点减 lag，lag 为 0 时终点为 now；超过 max_span 截断且 truncated 为真；起点不早于终点返回 None；带时区报 ValueError
+      - 改动只落在 allowed_change_paths；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推
+    allowed_change_paths:
+      - app/domain/platform_pull.py
+      - tests/unit/test_platform_pull.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-114
+    title: 新增令牌加密主密钥与告警机器人的配置，经 compose 的 secrets 文件注入
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 2、8、9 节与契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 6 条：令牌加密主密钥与 Telegram 机器人令牌经 Docker Compose 的 secrets 文件注入，不进库、不进 Git 与日志（同 ai_billing_hub 的 ADR-0004）（工作包 P4a 的配置部分）。
+      一，app/config.py 的 Settings 加 token_key_file（CORE_TOKEN_KEY_FILE，容器里的路径，默认为 compose 文件型 secret 在容器里的默认挂载目录下的 core_token_key）、telegram_token_file（CORE_TELEGRAM_TOKEN_FILE，默认为同一目录下的 core_telegram_token）、telegram_chat_id（CORE_TELEGRAM_CHAT_ID，默认空；不空时只许可选的负号加 1 到 20 位数字）。
+      二，新模块 app/services/platform_config.py 的 load_platform_secrets(settings) 读两个文件，返回不可变的 PlatformSecrets(token_key, telegram_token, telegram_chat_id)：文件不存在或内容为空表示未配置（compose 在没配宿主机文件时挂进 Linux 的空设备，见四），对应项为 None；主密钥用 CORE-TASK-111 的 parse_master_key 解；Telegram 令牌去掉末尾换行后只许 1 到 128 个可打印 ASCII 非空白字符。文件存在却读不出或不合格、或 Telegram 令牌与 chat_id 只配了其中一个时报 ValueError，消息只写键名、不写内容。
+      三，app/main.py 的 create_app 只在后台开关为真时调它：不合格照现有的启动核对拒绝启动（退出码非 0、标准错误一行原因、不带内容）；结果放在 app.state.platform_secrets；开关为假时不读文件，app.state.platform_secrets 三项都为 None（Demo 不受影响）。未配置不拒绝启动（人工模式的 V1a 用不到平台令牌）：用到主密钥的授权与刷新、用到 Telegram 的推送由各自的任务写明未配置时的表现。启动时进程日志记一行主密钥与告警推送各自是否已配置，不记内容。
+      四，docker-compose.yml：顶层 secrets 加 core_token_key 与 core_telegram_token，file 分别取 CORE_TOKEN_KEY_HOST_FILE 与 CORE_TELEGRAM_TOKEN_HOST_FILE（.env 的值），都写成带默认值的 compose 变量，默认取 Linux 的空设备（在 Linux 上文件型 secret 的源不存在会让容器创建失败；默认挂空设备，Demo 与还没配密钥的生产都照常起来，读出为空即未配置）；core_api 引用这两个 secret；environment 加 CORE_TELEGRAM_CHAT_ID（取 .env，默认空）。注释写明：宿主机文件归容器用户、权限 0400，不为了读文件把容器改回 root（compose 的文件型 secret 是绑定挂载，uid、gid、mode 只在 swarm 下生效）。.env.example 的这三项由登记 PR 写好，本任务不改。
+      明确不做：用到主密钥与 Telegram 的服务（CORE-TASK-115、124）；部署脚本与运行手册（建宿主机文件是运维步骤）。
+    status: ready
+    depends_on:
+      - CORE-TASK-111
+      - CORE-TASK-109
+    acceptance_criteria:
+      - tests/integration/test_platform_config.py：两个文件都不存在、都为空、都是空设备时三项为 None；合格的主密钥与令牌读出；主密钥不合格、令牌含空白、只配了令牌没配 chat_id、只配了 chat_id 没配令牌都报 ValueError 且消息里不含文件内容
+      - 同一测试文件：后台开关为真而主密钥文件不合格时 create_app 拒绝启动（照 tests/integration/test_instance_check.py 的写法验退出码与一行原因，原因里没有文件内容）；开关为假时不读这两个文件（文件不合格也照常启动），app.state.platform_secrets 三项为 None
+      - tests/integration/test_deploy_scripts.py 加：compose 配置里两个 secret 的源在没设宿主机变量时都是空设备，core_api 引用它们，environment 里有 CORE_TELEGRAM_CHAT_ID
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI 与部署脚本；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/config.py
+      - app/services/platform_config.py
+      - app/main.py
+      - docker-compose.yml
+      - tests/integration/test_platform_config.py
+      - tests/integration/test_deploy_scripts.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-115
+    title: 平台连接的作业服务：刷新令牌并立即存下、改连接状态、清理授权 state、记严重告警、作业可跳过一轮
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 2 节（令牌刷新、授权失效）与第 8 节、契约 docs/CONTRACT_V1.md 0.22 的 3.2（platform_connections、platform_oauth_states、platform_alerts、platform_ops_log）与 8.6 第 4 条（工作包 P4a 的服务部分之一；第 2 轮预审嫌一个任务太大，发起授权、回调与断开拆到 CORE-TASK-127）。新服务模块 app/services/platform_connections.py 与 app/services/platform_alerts.py；规则调 CORE-TASK-111 的纯函数，平台只经 CORE-TASK-112 的协议调用，且都在事务外（设计第 10 节）；测试用模拟适配器。
+      一，platform_alerts.record_alert(connection, *, tenant_id, kind, channel_id=None, sku_id=None, platform_order_row_id=None, detail=None)：在调用方的事务里写一行 platform_alerts（new_id 的 alr 前缀，kind 只收 ALERT_KINDS，created_at 为数据库时间，发送相关的列为空）；同一个 kind 与同一组对象（三列逐一相等，都为空也算相等）已有未确认的告警时不再写、返回那一条的 ID（补的：同一个问题不刷屏，重复提醒由推送作业每 15 分钟做；去重是普通读，不加锁，两个作业同时记同一个问题可能各写一条，只是多一条提醒，接受）。detail 只放 ID、件数与错误码，不放令牌、平台返回的原文与顾客资料。
+      二，mark_connection_failed(connection, *, tenant_id, channel_id, status, expected_refresh_ciphertext)：在调用方的事务里 FOR UPDATE 连接行，status 仍为 active 且 refresh 密文仍等于 expected（为 None 时不比）才改：status 改为参数的 auth_failed 或 revoked，写 platform_ops_log（connection_status_changed，object_type channel、object_id 为 channel_id，before 与 after 为 channel_id、status、mode、capabilities 四个键，credential_id 为这个租户的 system 主体，actor_ref、actor_role、request_id 为空），record_alert(auth_failed, channel_id)；否则什么也不写（这期间被断开或重新授权了）。之后的补拉、发布、对账任务也用它。
+      三，refresh_tokens(engine, adapters, secrets, *, database) 作业 platform-token-refresh 的一轮：主密钥未配置时记一行日志、正常结束；在一个专用连接上 GET_LOCK(job_lock_name(database, 作业名), 0)，取不到返回 SKIPPED（见五），用完 RELEASE_LOCK，出错作废这个连接，这个连接不用来执行别的语句（契约 8.6 第 4 条）。对 status 为 active、access 到期时间早于数据库时间加 REFRESH_AHEAD 的连接逐个（没有这个平台的适配器的跳过、记一行日志）：记下读到的 refresh 密文，解密（解不开按 auth_failed 处理）；事务外 adapter.refresh_token(platform_shop_id, …)。成功时 TokenGrant 的 shop_id 与入口的 platform_shop_id 不同按 auth_failed 处理；否则先用单独的短事务存下新令牌与到期时间、last_refreshed_at，再做别的（契约 8.6 第 4 条）；之后再看重新 normalize 的 capabilities：原来 available 的某一项不再是 available（获批 scope 不足，设计第 2 节）时，另用一笔事务存下新的 capabilities 并经 mark_connection_failed 改为 auth_failed、告警；没少的只存下新的 capabilities；normalize 不合格时 capabilities 不变、记日志；这个事务先 FOR UPDATE 连接行，只有 status 仍为 active 且 refresh 密文仍是刚才读到的那一份时才写，否则什么也不写（新令牌丢掉无妨，那边已断开或有更新的令牌）。AuthRevoked 改为 revoked，AuthFailed 与 Rejected 改为 auth_failed（都经 mark_connection_failed）；Unknown 与 RateLimited 不改状态、下一轮再试，但 access 已经到期时记一条 auth_failed 告警（不改状态，record_alert 去重；补的：令牌过期了还刷不成，管理员要知道）。
+      四，purge_oauth_states(engine)：删 expires_at 早于数据库时间减 1 天的行（多留一天供排查，补的），一次最多删 1000 行。
+      五，作业可以跳过一轮：app/domain/periodic.py 加常量 SKIPPED；app/services/periodic.py 的 run_once 在作业函数返回 SKIPPED 时这一轮既不记正常结束也不记失败（最近一次正常结束的时间与 last_outcome 不变），所以连续跳过会按契约 8.5 stale 第 3 条报出（契约 8.6 第 4 条）；其他返回值照旧算正常结束。
+      明确不做：发起授权、回调与断开（CORE-TASK-127）；接口与挂作业（CORE-TASK-116、126）；切换模式（CORE-TASK-120）；Telegram 推送（CORE-TASK-124）。
+    status: ready
+    depends_on:
+      - CORE-TASK-110
+      - CORE-TASK-112
+      - CORE-TASK-114
+    acceptance_criteria:
+      - tests/integration/test_platform_connections_service.py 用模拟适配器与 tests/integration/platform_fixtures.py 的租户（连接直接写成 active、令牌用主密钥加密）：快到期的连接刷新后新令牌已存下、能解回；模拟“存下新令牌之后、改能力或状态之前出错”，库里已是新令牌；刷新时平台收窄了能力，capabilities 跟着改且连接改为 auth_failed 并告警
+      - 撤权改为 revoked、令牌失效改为 auth_failed、店铺 ID 不符改为 auth_failed，各写一条 connection_status_changed 与一条 auth_failed 告警；Unknown 不改状态，access 已到期时多记一条 auth_failed 告警且不重复
+      - 刷新拿到新令牌时连接已被断开或令牌已换（在调平台的替身里直接 UPDATE），不写回令牌、不改状态；另一个连接持有作业锁时返回 SKIPPED、不调平台；没有适配器的连接跳过
+      - record_alert：同一 kind 同一组对象未确认时不重复写，确认之后再记会写新的一行；detail 里没有令牌。清理只删过期满 1 天的 state
+      - tests/integration/test_periodic_skip.py：作业返回 SKIPPED 的一轮不改最近一次正常结束的时间与 last_outcome，连续跳过超过 2 个间隔加 300 秒后 stale 为真；返回 None 照旧算正常结束
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_connections.py
+      - app/services/platform_alerts.py
+      - app/services/periodic.py
+      - app/domain/periodic.py
+      - tests/integration/platform_fixtures.py
+      - tests/integration/test_platform_connections_service.py
+      - tests/integration/test_periodic_skip.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-127
+    title: 平台授权的服务：发起授权、跳转到平台授权页、回调换令牌并立即存下、断开连接
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 2 节（OAuth、state、令牌）、契约 docs/CONTRACT_V1.md 0.22 的 3.2 与 8.6 第 2、3、4 条（工作包 P4a 的服务部分之二，第 2 轮预审后从 CORE-TASK-115 拆出）。加在 CORE-TASK-115 的 app/services/platform_connections.py；规则调 CORE-TASK-111，平台只经 CORE-TASK-112 的协议在事务外调用；测试用模拟适配器，新测试文件 tests/integration/test_platform_authorization_service.py（夹具用 CORE-TASK-115 之后的 tests/integration/platform_fixtures.py，本任务不改它）。
+      一，发起授权分两步，都不改连接、不写 platform_ops_log：
+      start_authorization(execution, *, channel_id, key, admin_session_id)：给 run_admin 用的命令体（契约 8.6 第 2 条：后台写操作都走后台执行器）；channel_id 来自接口的路径参数，主密钥 key 与适配器是否存在由接口在调执行器之前判。命令体在事务里 FOR SHARE 读入口行，不再是本租户 active 的 platform 入口时 409 STATE_CONFLICT（{"reason": "channel_not_active"}，预检之后被停用的竞态）；否则写一行 platform_oauth_states：oauth_state_id 用 new_id 的 oas 前缀，state_hash 为 state_hash(derive_state(key, oauth_state_id))，platform 取入口的，credential_id 取上下文，admin_session_id 取参数，expires_at 为数据库时间加 STATE_TTL；返回 oauth_state_id 与 expires_at（响应与幂等记录里都没有 state 原文）。
+      authorize_redirect(connection, adapters, key, *, tenant_id, admin_session_id, oauth_state_id) 按先后只给第一个结果：这一行不存在、属于别的租户、或 admin_session_id 不是当前会话为 not_found（只许发起的那个会话跳转，补的）；check_state（platform 取行上的）为 used 或 expired 时为 used 或 expired；key 为 None 为 token_key_missing；没有行上那个平台的适配器为 adapter_missing；否则为 ok 与 adapter.authorize_url(derive_state(key, oauth_state_id))。
+      二，complete_authorization(engine, adapters, secrets, *, platform, code, state, extra, request_id) 返回 authorized、failed 或 expired（只给回调跳转用）：
+      第 1 步，短事务按 state_hash(state) FOR UPDATE 读 state 行；行存在且 used_at 为空时不论之后结果如何都把 used_at 设为数据库时间（用过即作废）。结果按先后只取第一个：check_state 为 expired 得 expired；为 unknown、used、platform_mismatch 得 failed；这一行的 admin_session_id 对应的会话已无效得 failed（本模块自己写这个按会话 ID 的只读查询，有效条件照 CORE-TASK-096 resolve_session 的：未撤销、未过期、账号未停用；会话 cookie 是 SameSite=Strict，平台跳回来的请求不带它，所以“绑定管理员会话”在这里按 state 行上的会话 ID 查，管理员退出或会话过期都让未完成的授权作废，是补的）；code 为 None（平台带回 error、用户拒绝授权、或接口判 code 不合格）得 failed；主密钥未配置或没有这个平台的适配器得 failed。
+      第 2 步，事务外 adapter.exchange_code(code, extra)；任何 PlatformError 得 failed，进程日志只记 describe_error。TokenGrant 的 shop_id 与入口的 platform_shop_id 不同得 failed（补的：防把别的店铺授权到这个入口）；capabilities 用 normalize_capabilities，不合格得 failed。
+      第 3 步，平台返回令牌后立即用一个单独的短事务存下（契约 8.6 第 4 条）：FOR UPDATE 入口行与连接行；入口已不是 active 的 platform 入口，或这个入口在 state 的 created_at 之后有 connection_disconnected 的日志（发起授权之后被停用或断开了）时不存、得 failed（补的）；否则 access 与 refresh 各用一个新 nonce 加密，写两列密文与到期时间、status 改为 active、capabilities、last_refreshed_at；同一事务写一条 platform_ops_log（action connection_authorized，object_type channel、object_id 为 channel_id，before 与 after 为 channel_id、status、mode、capabilities 四个键，credential_id 为 state 行上的管理员主体，actor_ref 为这个会话的管理员账号 ID，actor_role 为 stock_admin，request_id 为本次回调的）；得 authorized。
+      三，disconnect_connection(execution, body)：给 run_admin 用的命令体（正文 channel_id 与 reason，已由接口校验）。事务里 FOR UPDATE 连接行（入口 inactive 的也可以断开，免得停用的入口留着令牌）；status 已是 not_connected 时 409 STATE_CONFLICT（{"reason": "not_connected"}），active、auth_failed、revoked 都可以断开；清空两列密文与到期时间、status 改为 not_connected、capabilities 改为空对象，mode 不变，并把这个入口 used_at 为空的 platform_oauth_states 都设上 used_at（未完成的授权作废）；写 platform_ops_log（connection_disconnected，键同上，reason 为正文的，操作主体列取上下文）。不去平台撤销授权（平台未必提供，运行手册写明到卖家后台撤销）。
+      明确不做：接口（CORE-TASK-116、126）；切换模式（CORE-TASK-120）。
+    status: ready
+    depends_on:
+      - CORE-TASK-115
+      - CORE-TASK-099
+    acceptance_criteria:
+      - tests/integration/test_platform_authorization_service.py：发起授权的命令体只存 oauth_state_id 与哈希；authorize_redirect 的五种拒绝各一条（别的会话、别的租户、过期、用过、没有适配器），对发起的会话返回带 derive_state 文本的地址
+      - 回调成功后连接为 active、两列密文能用同一主密钥解回模拟平台发的令牌、写了一条 connection_authorized 且前后值里没有令牌与 code、state
+      - 回调的每种失败各一条用例（state 不存在、用过、过期、平台不符、会话已撤销、code 为空、没有适配器、换令牌时平台报错、店铺 ID 不符、能力矩阵不合格、发起之后入口被停用），都不改连接；凡是读到了没用过的 state 行的，used_at 都被设上；过期且 code 为空得 expired；同一个 state 回调两次，第二次为 failed
+      - 断开：清空令牌、status 为 not_connected、mode 不变、写一条 connection_disconnected、未用的 state 都作废；inactive 入口也能断开；已断开的再断开 409 STATE_CONFLICT；发起授权之后断开、再回调得 failed 且连接不变
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_connections.py
+      - tests/integration/test_platform_authorization_service.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-116
+    title: 后台的平台连接列表、发起授权、跳转到平台授权页与断开接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条（连接页、写接口的检查顺序、后台写操作走后台执行器）与 docs/PLATFORM_CHANNELS.md 第 2 节（工作包 P4a 的后台接口部分；第 1 轮预审嫌一个任务太大，回调与作业拆到 CORE-TASK-126）。新接口模块 app/api/admin_connections.py，在 app/main.py 只在后台开关为真时挂上；读查询加在 app/services/admin_queries.py。
+      一，接线：create_app 在后台开关为真时把 app.state.platform_adapters 设为 build_adapters(settings)（CORE-TASK-112；测试替换成模拟适配器），开关为假时为空字典。
+      二，GET /api/v1/admin/connections：只要求登录（CORE-TASK-099 的读依赖）；列这个租户全部 platform 入口（含 inactive）的连接，按 channel_id 升序、不分页（V1 一个租户两个）：channel_id、platform、platform_shop_id、channel_status、mode、mode_changed_at、takeover_at、status、app_profile、capabilities（normalize 后的五项）、auto_sync（auto_sync_allowed）、has_token（布尔）、access_expires_at、refresh_expires_at、last_refreshed_at、last_synced_at、pull_cursor、inbox_backlog（这个入口 applied_at 为空的收件箱事件数）、oldest_pending_received_at（其中最早的 received_at，没有为空）。不出任何令牌（明文与密文）。时间按 app/api/catalog.py 的 RFC 3339 微秒 Z 格式。
+      三，POST /api/v1/admin/connections/{channel_id}/authorize：经 CORE-TASK-099 的依赖与 run_admin（operation platform_connections.authorize，角色 stock_admin，上下文的入口与池为空），命令体为 CORE-TASK-127 的 start_authorization（channel_id 取路径参数，admin_session_id 取当前会话，key 取 app.state.platform_secrets）；正文为空对象（有键 422）。在调执行器之前用本请求的连接普通读预检，不合格的都在这里拒绝、什么也不写：channel_id 格式按 is_admin_id，入口不存在 404 NOT_FOUND，属于别的租户经 admin_not_found 记 cross_tenant 后同样 404；不是 platform 入口或不是 active 422 INVALID_REQUEST；主密钥未配置 503 UNAVAILABLE（details {"reason": "token_key_missing"}）；没有这个平台的适配器 503 UNAVAILABLE（{"reason": "adapter_missing"}）。成功 201，data 为 oauth_state_id、expires_at 与 redirect_path（四的路径加查询参数）；响应在交给 run_admin 的命令里拼好（本模块包一层 CORE-TASK-127 的命令体，加上 redirect_path），这样重放与第一次一字不差；同键同正文重放得同样的响应（响应里没有 state 原文，所以可以照常存幂等记录）。
+      四，GET /api/v1/admin/connections/authorize-redirect?oauth_state_id=：要求登录（同站点的页面跳转会带会话 cookie）；oauth_state_id 恰好一个且符合 is_admin_id，否则 422；调 CORE-TASK-127 的 authorize_redirect（结果的先后由它定）；ok 时 303 跳到平台授权页地址，响应带 Cache-Control: no-store 与 Referrer-Policy: no-referrer；not_found 404 NOT_FOUND；expired 与 used 409 STATE_CONFLICT（{"reason": "state_expired"} 或 {"reason": "state_used"}）；token_key_missing 与 adapter_missing 503 UNAVAILABLE，details 同三。进程日志不记跳转地址（里面有 state）。
+      五，POST /api/v1/admin/connections/{channel_id}/disconnect：经 run_admin（operation platform_connections.disconnect，角色 stock_admin，上下文的入口与池为空），命令体为 CORE-TASK-127 的 disconnect_connection；正文只有 reason（同契约 2.6 的 reason 惯例）；入口的预检只做三里的格式、不存在、别的租户与不是 platform 入口四项（inactive 的 platform 入口也可以断开；断开用不到主密钥与适配器，所以不判那两个 503）；200 返回这个连接在二里的表示，同样在交给 run_admin 的命令里、断开之后在同一事务里读出拼好。
+      明确不做：授权回调与作业（CORE-TASK-126）；切换模式（CORE-TASK-120）；前端的连接页。
+    status: ready
+    depends_on:
+      - CORE-TASK-127
+    acceptance_criteria:
+      - tests/integration/test_admin_connections_api.py：列表的每个字段如 purpose 所写、没有令牌字段、别的租户的入口不出现、inbox_backlog 与 oldest_pending_received_at 跟未处理事件一致；未登录 401
+      - 同一文件：发起授权成功 201，库里与幂等记录里都没有 state 原文；同键同正文重放得同样的响应、不多写 state 行；未登录、CSRF 不符、缺 Idempotency-Key、正文有键、入口不存在、别的租户（同时记了 cross_tenant）、不是 platform、主密钥未配置、没有适配器各一条，状态码与错误码如 purpose 所写，被拒的都不写 state
+      - 同一文件：跳转接口对发起的会话 303 到模拟平台的授权页、地址里的 state 的哈希等于库里那一行的；换一个会话 404、过期与用过的 409、没有适配器 503、未登录 401
+      - 同一文件：断开成功一条（含 inactive 的入口、主密钥未配置时也能断开）、已断开再断开 409 一条；同键同正文重放得同样的响应
+      - 后台开关为假时这些路由都不挂（404）
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_connections.py
+      - app/services/admin_queries.py
+      - app/main.py
+      - tests/integration/test_admin_connections_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-126
+    title: 公网的平台授权回调路由，刷新令牌与清理授权 state 两个作业挂进进程
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 3 条（授权回调）、第 4 条（作业）、第 5 条（回调的查询串不进日志），docs/PLATFORM_CHANNELS.md 第 2 节（工作包 P4a 的回调与作业部分，从 CORE-TASK-116 拆出）。新接口模块 app/api/platforms.py（公网平台路由），在 app/main.py 只在后台开关为真时挂上。
+      一，GET /api/v1/platforms/{platform}/oauth/callback：公网路由，不要求登录（会话 cookie 是 SameSite=Strict，不随平台的跳转带来，会话的绑定在 CORE-TASK-115 的服务里按 state 行上的会话 ID 查）；platform 只收 shopee、tiktok_shop，其余 404。查询参数 state 必须恰好一个、1 到 512 个字符，不合格直接得 failed、不进服务（这时没有可作废的行）。code 恰好一个、1 到 512 个字符时传给服务；缺、多于一个或超长时传 None（服务得 failed 并作废 state）。其余查询参数作为 extra 传给服务（平台可能在回调里带店铺 ID）：按查询串里的先后取前 10 个不同的参数名（error 之类也算在内），同名的只取第一个值；名或第一个值超过 512 个字符的，这个参数名整个丢掉、不计入 10 个。调 complete_authorization（没有这个平台的适配器时它得 failed 并作废 state，见 CORE-TASK-127）；一律 303 跳到 /admin/connections?oauth=<结果>（authorized、failed、expired），响应不带 code、state 与 extra，带 Cache-Control: no-store 与 Referrer-Policy: no-referrer；数据库不可用回 503（不跳转；第 1 步之后出的错，state 可能已作废，管理员重新发起授权即可）。进程日志只记平台与结果，不记查询串。
+      二，作业：create_app 在后台开关为真时建两个定时任务放进 periodic_tasks：platform-token-refresh（周期取 CORE-TASK-111 的 JOB_INTERVALS，调 refresh_tokens，数据库名照现有锁名的取法）与 platform-oauth-state-purge（调 purge_oauth_states）；lifespan 与现有任务一起启动、一起并行停止，就绪检查列出它们。开关为假时不建、就绪检查不列。
+      明确不做：webhook（CORE-TASK-119）；其余平台作业（CORE-TASK-119、122、125）。
+    status: ready
+    depends_on:
+      - CORE-TASK-116
+    acceptance_criteria:
+      - tests/integration/test_platform_callback_api.py 用模拟适配器：先经 CORE-TASK-116 的接口发起授权，再带模拟平台给的 code 与 derive_state 的文本回调，303 跳到 oauth=authorized、连接为 active
+      - 同一文件：state 缺或超长、过期、用过、路径里的平台不是 shopee 或 tiktok_shop（404）、state 是给另一个平台发的（failed）、缺 code、code 有两个各一条，跳转目标与状态码如 purpose 所写；缺 code 与 code 有两个时 state 已作废；extra 原样传到模拟平台的 exchange_code
+      - 响应头与 Location 里都没有 code、state 与 extra；捕获的进程日志里没有 code 与 state
+      - 后台开关为真时就绪检查的 periodic 列出 platform-token-refresh 与 platform-oauth-state-purge，为假时不列，回调路由不挂（404）
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/platforms.py
+      - app/main.py
+      - tests/integration/test_platform_callback_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-117
+    title: 收事件的服务：webhook 验签后写收件箱，收件箱处理作业的一轮，事件积压与被拒告警
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 3 节（webhook、处理）与第 8 节（严重异常）、契约 docs/CONTRACT_V1.md 0.22 的 5.10 与 8.6 第 3 条（工作包 P4c 的一部分）。新服务模块 app/services/platform_intake.py；写收件箱与处理订单都调 CORE-TASK-086 起的 app/services/platform_events.py，不在这里重写。
+      一，handle_webhook(engine, adapters, platform, headers, body) 返回 not_found、rejected、ignored、acknowledged 或 accepted：没有这个平台的适配器得 not_found（接口回 404）；adapter.parse_webhook 抛 SignatureInvalid 得 rejected（接口回 401，不写收件箱）；按 batch.shop_id 找 platform 与 platform_shop_id 都相等的 active platform 入口，找不到或多于一个得 ignored（应答成功、不写，进程日志记平台与店铺 ID；平台重发也找不到它，补的）；连接 mode 为 manual 得 acknowledged、不写（设计第 3 节）；否则先丢掉 payload 的 platform_time 早于连接 takeover_at 的事件（契约 5.10 引用格式第 2 条：平台时间早于接管点的自动事件不处理，webhook 与补拉一样；没有 platform_time 的事件保留，它按 received_at 排序，而 received_at 总晚于接管点；这一条是补的），再对每个事件调 record_auto_event(source 为 webhook)；但这个订单在写这一批之前，收件箱里已有 source 为 webhook 或 pull 的事件、且没有任何 source 为 manual 的事件时不丢（这样的订单在人工期里登记不了，CORE-TASK-105，没有被人工记过一次的风险；从自动切回人工再切回自动时，它们在人工期间的事件靠这一条不丢；偏离契约 5.10 引用格式第 2 条，补的，登记 PR 单列请 Kelvin 认可），单个事件报 ValueError（形状不合格，适配器的缺陷）时记一行日志、跳过这一个，数据库错误往外抛（接口回 503，平台重发）；得 accepted。
+      二，InboxRunner.run_round(engine, settings)：作业 platform-inbox 的一轮（不取作业锁，按订单取锁，契约 8.6 第 4 条）。orders_with_pending_events(engine, 500)，跳过上一轮没处理完就停下的订单一次（不论停下的原因是锁忙、出错、blocked 还是 missing_prior；CORE-TASK-086 留给作业定：用 InboxRunner 对象上的内存集合，跳过一次后移出，补的；一直停下的订单隔轮才占一次名额，而且由四的积压告警报出），其余逐个 process_order(…, reservation_ttl_seconds 取 settings)。
+      三，被拒告警：每轮在处理之后扫一遍 applied_at 在数据库时间减 24 小时之内、满足下面之一的事件：result 为 held 或 attention 且 result_code 不在普通原因表里；或 result_code 为 defect（CORE-TASK-088、089 的重新判定成功时 result 为 applied、result_code 为 defect，设计第 8 节把引用冲突类的缺陷列为严重异常）。这个订单已有 created_at 不早于这个事件 applied_at 的 core_rejected 告警（不论确认与否）就跳过，否则记一条 core_rejected 告警（record_alert，platform_order_row_id 为这个订单，detail 为 event_row_id 与 result_code）。这样扫不靠“这一轮处理了哪些”，发布、对账与后台人工操作里处理的事件、以及上一轮中途出错没扫到的，都在下一轮扫到，重扫也不重复记（补的写法）。普通原因表为 unmapped、unknown_line、cancel_exceeds_remaining、refund_id_missing、cancel_lines_missing、missing_platform_id、line_not_committed（CORE-TASK-087 列的原因里只在后台显示的那些，V-07）；STATE_CONFLICT 不在表里：已确认之后 Core 拒绝的错误码也可能是它，result_code 区分不了，宁可多报。
+      四，积压告警：每轮找出 received_at 早于数据库时间减 15 分钟仍未处理的事件（设计第 8 节）：有平台订单的按订单记 inbox_stuck 告警（platform_order_row_id 为这个订单）；还没有平台订单的，每个入口汇总记一条（platform_order_row_id 为空、channel_id 为这个入口，detail 为这样的订单数与最早一个的 platform_order_id；没有地方按订单去重，所以按入口汇总，补的）。已有 created_at 不早于其中最新那个积压事件的 received_at 加 15 分钟的同一 inbox_stuck 告警（不论确认与否）就不再记（同三的截止写法：管理员确认之后，同一批积压不再每轮重报；有新的事件积压满 15 分钟才再报）。
+      明确不做：webhook 路由与挂作业（CORE-TASK-119）；补拉（CORE-TASK-118）。
+    status: ready
+    depends_on:
+      - CORE-TASK-115
+      - CORE-TASK-089
+    acceptance_criteria:
+      - tests/integration/test_platform_intake.py 用模拟适配器：签名对、auto 模式的入口，事件进收件箱、得 accepted；同一批再送一次不多写；签名不对得 rejected 且不写；manual 模式得 acknowledged 且不写；店铺 ID 找不到得 ignored；没有适配器得 not_found；一个事件形状不合格时其余照写
+      - 同一文件：数据库不可用时 handle_webhook 抛出异常（用替换引擎的方式模拟），不返回 accepted
+      - 收件箱一轮处理完已到的新订单与待发货；某订单的锁被别的连接持有时这一轮停在锁忙、下一轮跳过它一次、再下一轮处理它
+      - 告警：待发货被 Core 拒绝预留（库存不够）记一条 core_rejected，连跑两轮仍只有一条；找不到平台商品（unmapped）不记；不经收件箱作业、直接调 process_order 处理出的被拒事件下一轮也记上；超过 15 分钟没处理的事件记 inbox_stuck，没超过的不记，两个还没有平台订单的积压订单在同一入口只记一条且 detail 的订单数为 2（received_at 用直接 UPDATE 调早）
+      - webhook 里平台时间早于连接 takeover_at 的事件不写，等于与晚于的写，没有平台时间的写
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_intake.py
+      - tests/integration/platform_fixtures.py
+      - tests/integration/test_platform_intake.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-118
+    title: 补拉的服务：按更新时间补拉各入口的订单并推进游标，逐单补拉越阶段的订单并退避
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 3 节补拉、6.2 第 5 条接管点，契约 docs/CONTRACT_V1.md 0.22 的 5.10 第 4 步越阶段补拉（工作包 P4c 的一部分）。新服务模块 app/services/platform_pull.py；拆动作调 CORE-TASK-113，写收件箱调 record_auto_event（source 为 pull），平台只在事务外调。
+      一，pull_channel(engine, adapters, secrets, tenant_id, channel_id, *, to_now=False) 返回 pulled、partial、not_allowed 或 failed：连接不满足 pull_allowed、没有适配器或主密钥未配置得 not_allowed；解密 access 令牌，解不开按 CORE-TASK-115 的 mark_connection_failed 改为 auth_failed、得 failed（这里与下面调 mark_connection_failed 时，expected_refresh_ciphertext 都传开始时读到的 refresh 密文，免得把这期间重新授权的连接标成失败）；区间用 pull_window（cursor 为连接的 pull_cursor，takeover_at 为连接的同名列，now 为数据库时间；平常 lag 为默认的 1 分钟，to_now 为真时 lag 为 0，供发布前“补拉到当前时刻”用），区间为 None 得 pulled；分页调 adapter.pull_orders(ShopAuth(…), …)，每个快照 snapshot_events 再 drop_before_takeover（不丢的例外与 CORE-TASK-117 相同：写这一批之前已有自动事件、且没有人工事件的订单不丢），逐个 record_auto_event；某个快照拆不开（ValueError）记日志、跳过这个订单。整个区间都写完之后（record_auto_event 返回假，即这期间连接被切回人工或入口停用，就停下、不推游标），用一个单独的短事务 FOR UPDATE 连接行，mode 仍为 auto、pull_cursor 仍是开始时读到的值才推进（否则这期间切换过模式，不推），把 pull_cursor 推到区间终点与数据库时间减 1 分钟两者中较早的那个，但不早于原游标（为空时不早于区间起点），游标不往回走（to_now 拉到的最后一分钟下一轮再拉一遍，免得漏掉平台晚写进来的更新，重复的被去重键挡住），last_synced_at 设为数据库时间。区间被 max_span 截短时得 partial（没拉到当前时刻），否则得 pulled。设计第 3 节写的是游标与写收件箱同一事务；record_auto_event 每个事件自己一笔短事务、按去重键幂等，所以改为先写事件后推游标，中途被杀只会重拉一遍（补的写法）。AuthRevoked 与 AuthFailed 按 mark_connection_failed 改状态并告警、得 failed；Unknown、RateLimited、Rejected 不推游标、得 failed，下一轮从原游标重拉。
+      二，pull_due_orders(engine, adapters, secrets, memo, *, limit=50)：逐单补拉。对象有两种：(a) platform_orders 里 next_pull_at 不晚于数据库时间的订单；(b) 收件箱里有未处理事件、却还没有平台订单的订单（CORE-TASK-087 留的找法），它们没有地方存退避，用 memo（作业对象上的内存字典，键为租户、入口与平台订单号）记下次时间，进程重启后从头算（补的）。先列出满足 pull_allowed、有适配器的入口，只在这些入口里查：(a) 按 next_pull_at 升序、(b) 按最早未处理事件的 received_at 升序，(a) 取至多 limit 个；(b) 先取至多 500 个、去掉 memo 里还没到下次时间的、再取前 limit 个（这样不合格入口的订单与在退避中的订单都不占名额）。memo 的值为已试次数与下次时间；订单有了平台订单或没有未处理事件时从 memo 里删掉，memo 超过 10000 项时删最早的（补的）。逐个事务外 adapter.read_order，有快照时 snapshot_events、drop_before_takeover、record_auto_event；之后对 (a) 用短事务 FOR UPDATE 这个平台订单，next_pull_at 仍非空时才把 pull_attempts 加 1、next_pull_at 设为数据库时间加 backoff_minutes(加 1 之前的 pull_attempts) 分钟（这期间收件箱作业已把缺的动作补齐、由 CORE-TASK-087 清零了的，不再设回去）；平台上没有这个订单（None）或调平台失败（Unknown、RateLimited、Rejected）也照此退避，(b) 照同一条退避记在 memo 里；访问令牌解不开、AuthRevoked、AuthFailed 时按 mark_connection_failed 处理并停止这个入口这一轮的逐单补拉（同 pull_channel）。
+      三，PullRunner.run_round(engine, adapters, secrets)：作业 platform-order-pull 的一轮：对每个租户每个满足 pull_allowed 的 platform 入口调 pull_channel，再调 pull_due_orders。不取作业锁（契约 8.6 第 4 条只给刷新令牌与发布取锁；补拉重复只会被去重键挡住）。周期取 CORE-TASK-111 的 JOB_INTERVALS（设计第 3 节“周期按平台限流定”，V-08 核实前先定 2 分钟，补的）。
+      明确不做：挂作业（CORE-TASK-119）；切换模式时写接管点与游标（CORE-TASK-120）；发布前的补拉由发布作业调 pull_channel(to_now 为真)（CORE-TASK-121）。
+    status: ready
+    depends_on:
+      - CORE-TASK-117
+      - CORE-TASK-113
+      - CORE-TASK-110
+    acceptance_criteria:
+      - tests/integration/test_platform_pull.py 用模拟适配器：auto 模式的入口补拉一个区间，订单的各动作进收件箱、游标推到区间终点、last_synced_at 有值；再拉一遍同一区间不多写
+      - takeover_at 之前的动作不进收件箱、之后的进；pull_cursor 为空时从 takeover_at 拉起；区间超过 24 小时时得 partial；to_now 为真时拉到数据库当前时刻、游标只推到当前时刻减 1 分钟
+      - 逐单补拉写完事件之后、加退避之前订单的 next_pull_at 已被清空（在替身里模拟收件箱作业补齐），不再设回去
+      - 平台报 Unknown 时游标不动；报 AuthRevoked 时连接改为 revoked、写了 connection_status_changed 与 auth_failed 告警；manual 模式、缺 read_orders 能力、主密钥未配置都得 not_allowed 且不调平台
+      - 逐单补拉：next_pull_at 到期的订单被读一次、事件进收件箱、pull_attempts 加 1、next_pull_at 按 1、2、4 分钟退避（数据库时间用直接 UPDATE 调整）；没有平台订单而收件箱有未处理事件的订单也被读，第二次在 memo 的下次时间之前不读
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_pull.py
+      - tests/integration/platform_fixtures.py
+      - tests/integration/test_platform_pull.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-119
+    title: 公网 webhook 路由，收件箱处理与补拉两个作业挂进进程
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 3 条（webhook）、第 4 条（作业），docs/PLATFORM_CHANNELS.md 第 3 节（工作包 P4c 的接口与作业部分）。
+      一，POST /api/v1/platforms/{platform}/webhook，加在 CORE-TASK-126 的 app/api/platforms.py：公网，不要求登录、不查 CSRF；platform 只收 shopee、tiktok_shop，其余 404；请求体超过 128 KiB 回 413（同后台的上限），读原始字节交给 handle_webhook（CORE-TASK-117），不先按 JSON 解析（验签用原文）；not_found 404、rejected 401、ignored、acknowledged、accepted 都回 200，正文 {"status": "ok"}（平台要求的应答形状随真实适配器的任务再定）；数据库错误回 503。响应不回显请求的任何内容；进程日志只记平台与结果，不记请求头与正文（签名与订单内容不进日志）。
+      二，作业：create_app 在后台开关为真时再建两个定时任务：platform-inbox（调 InboxRunner.run_round）与 platform-order-pull（调 PullRunner.run_round），周期取 CORE-TASK-111 的 JOB_INTERVALS，两个 Runner 对象各建一个、跨轮保留（内存里的跳过集合与 memo 在里面）；lifespan 与现有任务一起启动、并行停止，就绪检查列出它们。开关为假时不建、不列。
+      明确不做：切换模式（CORE-TASK-120）；发布与对账的作业（CORE-TASK-122、125）。
+    status: ready
+    depends_on:
+      - CORE-TASK-126
+      - CORE-TASK-118
+    acceptance_criteria:
+      - tests/integration/test_platform_webhook_api.py 用模拟适配器：签名对时 200 且事件进收件箱；签名不对 401 且不写；平台名不认识 404；没有适配器 404；请求体超过 128 KiB 413；数据库不可用 503；响应正文不含请求的内容，捕获的进程日志里没有签名头与正文
+      - tests/integration/test_platform_jobs.py：后台开关为真时就绪检查列出 platform-inbox 与 platform-order-pull，为假时不列；直接调 InboxRunner 与 PullRunner 的一轮各一条冒烟用例（模拟适配器）
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/platforms.py
+      - app/main.py
+      - tests/integration/test_platform_webhook_api.py
+      - tests/integration/test_platform_jobs.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-120
+    title: 平台连接在人工与自动之间切换模式的命令与后台接口，切到自动时记下接管点
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 6.2 第 5 条、契约 docs/CONTRACT_V1.md 0.22 的 3.2（逾期时不能从人工切到自动）与 10 第 3 条的角色表（切换模式要 stock_admin）（工作包 P4c 之后，Kelvin 2026-11-24 定放在第 4 组）。
+      一，命令体 switch_mode(execution, body)，加在 app/services/platform_connections.py（正文 channel_id、mode、reason，已由接口校验）：事务里 FOR UPDATE 连接行，再普通读这个入口 manual_checks 里 checked_until 的最大值；目标与当前相同 409 STATE_CONFLICT（details {"reason": "mode_unchanged"}）。
+      切到 auto，按先后只报第一个：status 不是 active 409 STATE_CONFLICT（{"reason": "not_connected"}）；pull_allowed 按目标模式 auto 与当前 status、capabilities 判，不满足 409 STATE_CONFLICT（{"reason": "capability_missing"}）；manual_check_overdue（CORE-TASK-082，mode 传当前的 manual，mode_changed_at 取连接行，now 为数据库时间）为真 409 MANUAL_CHECK_OVERDUE（契约 3.2）；接管点取逾期判定的起点（最近一次核对的 checked_until 与 mode_changed_at 中较晚的那个；没核对过就是 mode_changed_at；契约只写了“最后一次核对的 checked_until”，这样取是为了与逾期规则的“切换之前的核对不算数”一致，补的）；这个入口有 source 为 manual、action 为 created、ready_to_ship、cancelled 或 shipped（契约 5.10 第 3 条人工登记的四种；退货验收不算；后台的待处理重试、继续处理与关闭写的也是这几种动作，收件箱分不出来，一并算上，宁可多要求补一次核对）、received_at 晚于接管点的收件箱事件时 409 STATE_CONFLICT（{"reason": "manual_events_after_check"}）：接管点之后的人工登记（尤其用 m<n> 派生引用的交运）会被补拉再记一次，要先补一次核对把接管点推到它们之后（补的）。这一项是在连接行锁下的普通读，挡不住切换同一刻才提交的人工登记；运行手册写明切换前先停止人工登记（另行补上），残余风险列进登记 PR。都通过时 takeover_at 设为接管点；pull_cursor 在这个入口第一次切到自动时（原 takeover_at 为空）设为接管点，从自动切回人工再切回自动时设为原 pull_cursor 与原 mode_changed_at（这段人工期的开始）两者中较早的那个（原游标为空时取后者；人工期里补拉不运行，游标可能落后于人工期的开始）：已有自动事件的订单在人工期里不能人工登记（CORE-TASK-105），它们的事件不按接管点丢（CORE-TASK-117、118），要从人工期开始拉起才补得上（补的；人工期长于平台订单列表能回溯的范围时补拉会一直失败，要等 V-08 核实回溯范围后再定怎么办，登记 PR 列为待定）；mode 改为 auto，mode_changed_at 设为数据库时间。设计写的是“向前补拉、去重、对账，然后把 mode 改为 auto”；CORE-TASK-086 的 record_auto_event 在人工模式下不写收件箱，所以改为先切模式、由补拉作业从接管点拉起；切换之后、这个租户跑完一次对账之前，发布作业不写这个入口（CORE-TASK-121），对账跑完前的事件照常处理（补的写法）。切换之后由管理员在后台手动发起一次对账（CORE-TASK-125），不等每天一次的定时对账；运行手册的这一步另行补上。
+      切到 manual：任何 status 都可以；mode 改为 manual，mode_changed_at 设为数据库时间，takeover_at 与 pull_cursor 不动（下次切到自动时重算）。
+      两种切换都写 platform_ops_log（connection_mode_changed，object_type channel、object_id 为 channel_id，before 与 after 为 channel_id、status、mode、capabilities，reason 为正文的，操作主体列取上下文）。返回连接在 CORE-TASK-116 列表里的表示。
+      二，POST /api/v1/admin/connections/{channel_id}/mode，加在 app/api/admin_connections.py：经 run_admin（operation platform_connections.mode，角色 stock_admin，上下文的入口与池为空）；正文 mode（manual 或 auto）与 reason（同 reason 惯例），多出来的键或 null 422；入口的预检做 CORE-TASK-116 三里的格式、不存在、别的租户与不是 platform 入口四项；切到 auto 时入口还须 active（否则 422 INVALID_REQUEST），切到 manual 时 inactive 的也可以；不判主密钥与适配器（切换用不到）；200。
+      明确不做：人工模式下的其余运营操作（第 3 组待登记）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-119
+    acceptance_criteria:
+      - tests/integration/test_admin_connection_mode_api.py：人工模式、active、有 read_orders 能力、核对未逾期的入口切到 auto 成功，takeover_at 等于最近一次核对的 checked_until、pull_cursor 等于 takeover_at、写了一条 connection_mode_changed
+      - 没核对过的入口切到 auto 时 takeover_at 等于原 mode_changed_at；切换之前（mode_changed_at 之前）的核对不算数
+      - 逾期 409 MANUAL_CHECK_OVERDUE、未连接 409 STATE_CONFLICT、缺能力 409 STATE_CONFLICT、接管点之后有人工登记 409 STATE_CONFLICT、目标与当前相同 409 STATE_CONFLICT，details 如 purpose 所写，被拒的都不改连接、不写日志；补记一次核对之后再切换成功
+      - 切到 manual 在 auth_failed 状态下也成功，takeover_at 与 pull_cursor 不变；切到 manual 之后补拉作业不再拉这个入口（调一次 PullRunner 的一轮，模拟平台没有收到读订单的调用）
+      - 未登录、CSRF 不符、正文多键、入口属于别的租户各一条；同一 Idempotency-Key 同正文重放得同样的响应
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_connections.py
+      - app/api/admin_connections.py
+      - tests/integration/test_admin_connection_mode_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-121
+    title: 库存发布的服务：先补拉再按配额写平台绝对值，逐个 SKU 记结果，失败退避，遵守写入暂停
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 4 节（只写绝对值、什么时候写、发布前先补拉、逐个 SKU 记结果）与第 5 节（自动写平台暂停、待核对），契约 docs/CONTRACT_V1.md 0.22 的 3.1 与 3.2（工作包 P4d 的发布部分）。新服务模块 app/services/platform_publish.py。
+      一，什么时候写（不建队列表，每轮从现状算出，补的）。平台卖出时自己会扣展示量，Core 不再写一次（设计第 4 节），所以不拿“Q 与上次写的值不等”当触发。对象是“SKU × 入口”，满足全部前提：入口的连接 auto_sync_allowed；这个租户已有一次 started_at 晚于这个入口的 mode_changed_at、finished_at 非空的 reconciliation_runs（从人工切到自动之后先对账再写，设计 6.2 第 5 条，CORE-TASK-120）；SKU 在这个入口有 active 平台商品；channel_allocations 的 review_hold 为假。“上次落定的发布”指这条平台商品（按 listing_id）最近一条 result 为 confirmed、unsupported 或 platform_controlled 的 publish。触发有三种，满足其一就写：(a) 这条平台商品在这个入口最近一次切到自动（mode_changed_at）之后还没有落定的发布（刚切到自动，包括从人工切回自动，人工期间平台显示量可能已与 Q 不同；或新挂上的平台商品）；(d) 这条平台商品有晚于上次落定的发布的 catalog_changes（object_type listing；改挂与解除后再挂沿用同一个 listing_id，契约 2.9，靠这一条触发）；(b) 这个池这个 SKU 有晚于上次落定的发布的 allocation_changes（管理员改了配额或安全库存，设计“改配额后排进发布”；只改 S 也算，多写一次无妨）；(c) 这个入口这个 SKU 有晚于上次落定的发布的 review_hold_cleared 日志（按 object_type sku、object_id 为 sku_id、after 里的 channel_id 为这个入口找，同 CORE-TASK-122 写 review_hold_set 的形状；写它的“解除待核对”在第 3 组其余运营操作里，登记时照这个形状）（管理员核对后解除了待核对，按解除时的 Q 写一次；“恢复了 Q 而平台没有自动加回”由读回发现、设上待核对，管理员核对解除后走这一条，设计“先核对，再写绝对目标”）。退避与下面三的连续失败都按 listing_id 算：这条平台商品最近连续 n 条 publish 是 failed 或 unknown（n 大于 0，在上次落定的发布之后）的，在最后一条的 created_at 加 backoff_minutes(n 减 1) 分钟之前不写（设计“失败或结果未知时保留差距、不叠加、退避重试”）。
+      二，PublishRunner.run_round(engine, adapters, secrets, settings, *, database)：作业 platform-publish 的一轮。在专用连接上取作业锁（job_lock_name，取不到返回 SKIPPED，用法同 CORE-TASK-115 的刷新作业）。按租户：这个租户 platform_write_pause.paused 为真时整个租户跳过（不写平台，设计第 5 节；读与补拉由别的作业照常做）。按入口，有要写的 SKU 时：先 pull_channel(…, to_now 为真)（CORE-TASK-118），不是 pulled（partial、failed）就这一轮跳过这个入口；再对这个入口有未处理事件的订单（按最早 received_at 升序，至多 500 个）逐个 process_order，有任何一个返回锁忙也这一轮跳过这个入口（别的路径正在处理它，Q 还没定）；停在 blocked、missing_prior 或出错的订单不挡发布（它们由收件箱作业的积压告警报出）。然后逐个 SKU：在一个短事务里对这个 SKU 的 pool_allocations 行与这个入口的 channel_allocations 行 FOR SHARE（等正在改配额的事务提交），拿到之后读 quota、review_hold、platform_write_pause.paused 与数据库时间，读完即提交（不在持有行锁时调平台）；此时已设上待核对或写入暂停就跳过；事务外 adapter.write_stock(ShopAuth(…), 平台商品与规格 ID, quota)；用短事务追加一行 platform_publishes（kind publish，target_quantity 为写的值，listing_id 为这条平台商品，created_at 取读 quota 那个事务里拿到行锁之后读到的数据库时间，而不是写这一行的时间：改配额要先锁这两行，所以读 Q 之后才开始的配额变更 created_at 一定晚于它，仍会触发下一次写，补的）：WriteResult 的 confirmed、unsupported、platform_controlled 照记，platform_quantity 取平台确认的值，平台没给时取写的值；Rejected 记 failed、error_code 取平台错误码；Unknown 先 adapter.read_stock 读回这一个规格（设计“结果未知时先读回再决定”），读到的等于写的值记 confirmed（platform_quantity 为读到的），否则或读失败记 unknown；RateLimited 记 unknown、这个入口这一轮停下（限流按店铺算，补的）；AuthRevoked 与 AuthFailed 按 mark_connection_failed 改状态并告警，这个入口这一轮停下。
+      三，连续失败告警：一个“SKU × 入口”最近连续 3 条 publish 都是 failed 或 unknown 时记 publish_failed 告警（channel_id、sku_id，detail 为最后一条的 result 与 error_code；门槛 3 是补的），未确认的不重复（record_alert）。
+      四，访问令牌解不开时按 mark_connection_failed 处理，这个入口这一轮停下。主密钥未配置或没有适配器的入口跳过（记一行日志）。
+      明确不做：读回比对与设上待核对（CORE-TASK-122）；挂作业（CORE-TASK-122）；解除写入暂停与待核对的后台操作（第 3 组其余运营操作，它写的 review_hold_cleared 日志就是上面的触发 (c)）。
+    status: ready
+    depends_on:
+      - CORE-TASK-118
+      - CORE-TASK-090
+    acceptance_criteria:
+      - tests/integration/test_platform_publish.py 用模拟适配器：切到自动并跑完一次对账之后，有平台商品的 SKU 第一次写入当前 Q、记一条 confirmed；对账跑完之前不写；平台卖出一件（经补拉处理、Q 减 1）之后不再写；改了配额（经 CORE-TASK-090 的服务）之后写新值；改挂到新的平台商品之后写一次；模拟平台记下的写入都是绝对值
+      - 发布前先补拉到当前时刻：模拟平台上有一张新订单，这一轮写给平台的是处理完这张订单之后的 Q；补拉得 partial 或有订单锁忙时这个入口这一轮不写
+      - 写入暂停设上时整个租户不写、不记 publish；待核对设上的 SKU 不写，同入口别的 SKU 照写
+      - Rejected 记 failed 并按 1、2、4 分钟退避；连续 3 条失败记一条 publish_failed 告警且不重复；Unknown 而读回等于写的值记 confirmed，不等记 unknown；unsupported 与 platform_controlled 之后在没有新的触发时不再写
+      - 另一个连接持有作业锁时一轮返回 SKIPPED、不调平台
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_publish.py
+      - tests/integration/platform_fixtures.py
+      - tests/integration/test_platform_publish.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-122
+    title: 读回比对：写入后与定时读平台库存，读数不符设上待核对并告警；发布与读回作业挂进进程
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 4 节读回比对与第 5 节“SKU × 入口待核对”，契约 docs/CONTRACT_V1.md 0.22 的 3.2（review_hold 三列、platform_ops_log 的 review_hold_set）（工作包 P4d 的读回部分）。在 CORE-TASK-121 的 app/services/platform_publish.py 上补。
+      一，哪些 SKU 拿来比（补的，免得把“还没写过去的新 Q”当成平台不符）：这个 SKU 在这个入口上次落定的发布（CORE-TASK-121 的定义）是 confirmed，而且没有 CORE-TASK-121 一里的待写触发、也没有在退避中的失败。不满足的这一次不比，等发布作业先写过去。
+      二，readback(engine, adapters, secrets, tenant_id, channel_id, skus)：解密访问令牌（解不开、AuthRevoked、AuthFailed 都按 mark_connection_failed 处理、这次不比）；先 pull_channel(…, to_now 为真) 并处理这个入口有未处理事件的订单（同 CORE-TASK-121 二的做法；补拉不是 pulled 或有订单锁忙就这次不比），再按 CORE-TASK-121 二的读法（FOR SHARE 两行、读完即提交）读各自当前的 quota，并在同一事务里重新判一（不满足的、没有 active 平台商品的这次不比，返回 skipped），再事务外 adapter.read_stock 读这些 SKU 当前 active 的平台商品（两次读之间的销售可能让两边差几件，所以下面复核）。读平台失败记一行 readback（target_quantity 为读到的 quota）、result 为 failed、error_code，不设待核对。读到的与 quota 相同记 matched。不同的先复核一次：再补拉、处理，再照上面先读 quota 并重新判一（已不满足就这次不比）、后读平台，仍不同才记 mismatched 并设待核对，复核时相同记 matched（补的：缩小设计第 4 节说的那个窗口带来的误报）。
+      设待核对在一笔事务里：FOR UPDATE 这一行 channel_allocations，review_hold 为假时设 review_hold 为真、review_reason 为 readback_mismatch、review_since 为数据库时间，写 platform_ops_log（review_hold_set，object_type sku、object_id 为 sku_id，before 与 after 为 channel_id、sku_id、review_hold、review_reason 四个键，credential_id 为这个租户的 system 主体，actor_ref、actor_role、request_id 为空），同一事务 record_alert(readback_mismatch, channel_id, sku_id，detail 为两个数)；已设上的不改原因与时间、不再告警（同设计第 5 节“已设上时再设不改原来的原因”；告警只在新设上时记一次）。不用 Q 覆盖平台，也不把平台读数当成新的实物（设计第 4 节）。readback 返回每个 SKU 的结果（matched、mismatched、failed 或 skipped），供对账（CORE-TASK-123）计差异。
+      三，写入之后读回：CORE-TASK-121 的一轮里，每个入口写完之后，对这一轮记了 confirmed 的 SKU 调一次 readback。
+      四，ReadbackRunner.run_round：作业 platform-readback 的一轮（周期取 JOB_INTERVALS；设计“以及定时”没写周期，补的）：对每个满足 readback_allowed（CORE-TASK-111）、有适配器、主密钥已配置的入口，对满足一的 SKU 调 readback。写入暂停设上时照常读与比对（设计第 5 节：读平台库存照常；停的只是往平台写数）。不取作业锁（只读平台，设上待核对在行锁下做、是幂等的；补的）。
+      五，app/main.py：create_app 在后台开关为真时再建两个定时任务 platform-publish（调 PublishRunner.run_round）与 platform-readback（调 ReadbackRunner.run_round），周期取 JOB_INTERVALS，与现有任务一起启动、并行停止，就绪检查列出它们；开关为假时不建、不列。
+      明确不做：解除待核对（第 3 组其余运营操作）；对账作业里的库存比对调本任务的 readback（CORE-TASK-123）。
+    status: ready
+    depends_on:
+      - CORE-TASK-121
+      - CORE-TASK-120
+    acceptance_criteria:
+      - tests/integration/test_platform_readback.py 用模拟适配器：已写过去的 SKU 读数与 Q 相同记 matched、不设待核对；模拟平台自己改了显示量时复核后仍不同，记 mismatched、设上 review_hold 与原因和时间、写一条 review_hold_set 与一条 readback_mismatch 告警；再比对一次不改原来的原因与时间、不再告警
+      - 第一次读平台时不同、复核时相同（替身在两次之间改回）记 matched、不设待核对
+      - 改了配额还没写过去的 SKU、刚切到自动还没写过的 SKU 都不比；平台卖出一件（经补拉处理、Q 减 1）之后照常比、得 matched；补拉没拉完时这次不比
+      - 写入后读回：写入之后模拟平台改了显示量，这一轮之后这个 SKU 在这个入口已设上待核对，下一轮不再写它，同一 SKU 在别的入口照写；读回不符之后模拟平台没有收到新的写入
+      - 写入暂停设上时定时读回照常比对并设上待核对，但不写平台；读平台失败记 failed、不设待核对
+      - tests/integration/test_platform_jobs.py 加：后台开关为真时就绪检查列出 platform-publish 与 platform-readback，为假时不列
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_publish.py
+      - app/main.py
+      - tests/integration/platform_fixtures.py
+      - tests/integration/test_platform_publish.py
+      - tests/integration/test_platform_readback.py
+      - tests/integration/test_platform_jobs.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-123
+    title: 对账的服务：补拉核对未结订单与平台库存，查超额与不变量自查，差异记告警不自动修
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 7 节（三项对账、差异进待处理不自动修、恢复后的第一次对账手动发起）与第 5 节（对账差异设上待核对），契约 docs/CONTRACT_V1.md 0.22 的 3.2（reconciliation_runs）、3.1（F 与超额）与 4.4（不变量自查第 6 项）（工作包 P4e 的对账部分）。新服务模块 app/services/platform_reconcile.py。
+      一，execute_run(engine, adapters, secrets, run)：执行一行已存在、finished_at 为空的 reconciliation_runs（行由二或后台接口 CORE-TASK-125 插入），调用方已持有对账的作业锁。
+      第 1 步，平台订单（只对这个租户满足 pull_allowed 的入口）：先 pull_channel（CORE-TASK-118）；之后重新读连接，status 已不是 active（补拉时撤权、令牌失效）的这个入口跳过第 1、2 步；补拉得 failed（暂时性的）或 partial 的照常做逐单核对；再对这个入口未结的平台订单（stage 为 unpaid 或 held，或 committed 而还有未交运也未取消的件数）逐个事务外 adapter.read_order：有快照就照补拉写进收件箱（snapshot_events、drop_before_takeover、record_auto_event）并 process_order；Unknown、RateLimited、Rejected 记为这次没核对上（只计数、写日志，不算差异）；AuthRevoked、AuthFailed 按 mark_connection_failed 处理并停止这个入口。有任一行记了 known_discrepancy 的订单整单不比（管理员已认定的差异，契约 3.2）；process_order 返回锁忙的订单这次不比（计入没核对上）。之后下面任一算这个订单的一条差异（每个订单最多记一条，代码取第一个）：仍有 received_at 早于这次 process_order 之前读到的数据库时间的未处理事件（pending_events；之后才到的不算）；订单为 unpaid 或 held 时快照里某行的 cancelled_total 与 Core 的 cancelled_qty 不等（cancelled_mismatch；已确认之后的取消在 Core 里不记 cancelled_qty，CORE-TASK-089，所以 committed 的不比）；committed 的订单按 CORE-TASK-083 的行合并（同一 SKU 的平台行合并成一个 Core 订单行）把快照各包裹的件数按 platform_order_lines 上已存的 sku_id 汇总（不按当前的平台商品映射），与对应 Core 订单行的累计交运量不等（shipped_mismatch）；平台上没有这个订单（missing_on_platform）。每条差异计入差异数；这个订单已有 detail 里差异代码相同的 reconcile_discrepancy 告警（不论确认与否）时只计数，不再告警、不再设待核对（管理员处理过、解除了的不每天重设；新出现的别种差异照常报，补的）；否则记 reconcile_discrepancy 告警（platform_order_row_id，detail 带差异代码），并把这个订单有 SKU 的各行在这个入口的 channel_allocations 设上待核对（review_reason 为 reconcile_discrepancy，做法同 CORE-TASK-122 的设待核对，已设上的不改；设计第 5 节“对账发现差异时由对账作业设上”）。差异都不自动修，平台订单的阶段与数量不动（设计第 7 节的“进待处理”在这里落为告警加待核对，补的）。
+      第 2 步，平台库存（只对满足 readback_allowed 的入口）：对满足 CORE-TASK-122 一的 SKU 调它的 readback，mismatched 的各算一条差异（那里已设上待核对并告警）。
+      第 3 步，配额约束：在一个只读事务里（一致性快照，所以各数取自同一时刻）读这个租户每个有 platform 入口配额行的池与 SKU 的 available、S、各入口 Q 与 pending，用 CORE-TASK-082 的 unallocated 算 F，小于 0 的各算一条差异、记 over_allocated 告警（sku_id，detail 为 F）；超额不设待核对、不写 0、不停售（契约 3.1）。
+      第 4 步，Core 自查：在进程内调 app/services/invariants.py 里给 GET /v1/ops/invariants 用的那个读函数（CORE-TASK-091 加了第 6 项），有违反时算一条差异、记一条 invariant_violation 告警（detail 为 violation_count、返回的违反里出现的检查名，以及是否被截断）。
+      时间预算：一次执行的第 1、2 步合计最多 4 分钟（就绪检查的停转判定是 2 个周期加 300 秒，作业一轮不能跑太久，补的）；到了预算就停下，剩下的订单与 SKU 这次不核对（计入没核对上、写日志），照常做第 3 到 5 步。
+      第 5 步，用短事务写 finished_at 与 discrepancy_count。中途出了程序异常时记日志、finished_at 留空（后台显示为未完成）、不往外抛。manual 模式的入口只做第 3、4 步涉及它的部分（没有令牌，读不了平台）。
+      二，ReconcileRunner.run_round(engine, adapters, secrets, *, database)：作业 platform-reconcile 的一轮（周期取 JOB_INTERVALS，1 分钟）。在专用连接上取作业锁 job_lock_name(database, platform-reconcile)，取不到返回 SKIPPED（契约 8.6 第 4 条只给刷新令牌与发布取锁；对账也取，免得手动与定时的两次同时跑、重复设待核对，补的）。一轮只执行一行 run（免得两次对账相加超过停转判定）：有 trigger 为 manual、finished_at 为空、started_at 在 24 小时之内、本进程还没试过的行时，执行其中 started_at 最早的一行（试过的 run_id 记在 Runner 对象上，出了异常的不反复重试）就结束这一轮；没有时，找第一个满足下面条件的有 platform 入口的租户（按 tenant_id 升序）：24 小时之内没有 trigger 为 scheduled 的行、且 platform_write_pause.paused 为假时，插入一行 scheduled（new_id 的 rcn 前缀，started_at 为数据库时间，credential_id 为空）并执行，然后结束这一轮。写入暂停设上时不跑定时对账：整机恢复之后的第一次对账由管理员手动发起（设计第 7 节），暂停在那之前一直设着，这样定时的不会抢先。用完 RELEASE_LOCK，出错作废这个连接。
+      明确不做：后台接口与挂作业（CORE-TASK-125）；告警推送（CORE-TASK-124）。
+    status: ready
+    depends_on:
+      - CORE-TASK-122
+      - CORE-TASK-091
+    acceptance_criteria:
+      - tests/integration/test_platform_reconcile.py 用模拟适配器：一切一致时定时的一轮插入并执行一行 scheduled，差异数 0、finished_at 有值、没有新告警；24 小时之内再跑一轮不再插入
+      - 模拟平台上一个订单多了一次取消而收件箱漏了（直接删去那条事件），对账补拉后处理掉，不算差异；平台上订单不存在记 missing_on_platform；unpaid 订单 Core 的 cancelled_qty 被直接改大记 cancelled_mismatch；有退款取消的 committed 订单不记 cancelled_mismatch；订单差异把它各行的 SKU 在这个入口设上待核对
+      - 平台库存读数与 Q 不同计一条差异并设上待核对；F 为负的 SKU 记 over_allocated 且不设待核对；不变量自查有违反时记 invariant_violation（用直接改 pending 的方式造违反）
+      - 管理员请求的 manual 行（直接插入）在下一轮被执行；写入暂停设上时不插入 scheduled 行但照样执行 manual 行；另一个连接持有对账锁时返回 SKIPPED、不插 run 行；read_order 报 Unknown 时不算差异
+      - manual 模式的入口不调平台，第 3、4 步照做
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_reconcile.py
+      - tests/integration/platform_fixtures.py
+      - tests/integration/test_platform_reconcile.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-124
+    title: 严重告警推送到 Telegram：首次发出，未确认每 15 分钟重复，满 1 小时转为超时待办
+    purpose: >-
+      按 docs/PLATFORM_CHANNELS.md 第 8 节（只推严重异常、15 分钟重复、1 小时超时、两条告警链路的区分）与第 9 节（令牌不进日志），契约 docs/CONTRACT_V1.md 0.22 的 3.2（platform_alerts 的列）（工作包 P4e 的推送部分）。在 CORE-TASK-115 的 app/services/platform_alerts.py 上补，发送放新模块 app/services/telegram.py。
+      一，TelegramSender(token, chat_id).send(text)：用标准库 urllib.request 调 Telegram Bot API 的 sendMessage 方法（地址的常量写在代码里），POST 表单，超时 10 秒，HTTP 状态 200 且响应 JSON 的 ok 为真才算成功；地址里带机器人令牌，所以任何失败只记并抛出不带地址、不带响应原文的异常（类名与 HTTP 状态码），日志同样只记这两项（同 CORE-TASK-112 的出站脱敏）。
+      二，notify_round(engine, sender, *, limit=20)：作业 platform-alert-notify 的一轮（sender 为空即 Telegram 未配置：不发送、记一行警告，只做下面的转超时待办）。按 created_at、再按 alert_id 升序取未确认的告警：first_sent_at 为空的，或 last_notified_at 早于数据库时间减 15 分钟的，至多 limit 条（一轮最多推 20 条，补的：防止积压时把机器人刷到限流）；逐条发送，成功后用短事务写 first_sent_at（为空时）、last_notified_at、notify_count 加 1；一条失败就不改它、结束这一轮的发送，下一轮再试（Telegram 多半整个不通，免得一轮 20 次超时拖过关停的截止时间，补的）。然后把首次发出的时间（没发出过的用 created_at）早于数据库时间减 1 小时、仍未确认、escalated_at 为空的告警设上 escalated_at（设计“发出满 1 小时仍未确认，记一条超时待办”：超时待办就是这一列，后台告警列表按它显示；Telegram 不通或没配时一直没发出的告警也照 created_at 转成超时待办，免得后台看不到，补的落法；sender 为空时也做这一步），之后照常每 15 分钟提醒。
+      三，正文：第一行固定为 Core 平台告警（与巡检那条链路区分，设计第 8 节），之后每行一项：告警种类、入口的 platform 与 channel_id、sku_id、平台订单的 order_ref、detail（按 CORE-TASK-115 的规则只有 ID、件数与错误码，整个对象写成紧凑的 JSON）、是否已超时、alert_id；不含令牌、平台返回的原文与顾客资料；超过 1000 个字符截断。
+      四，build_sender(secrets)：telegram_token 与 telegram_chat_id 都有时返回 TelegramSender，否则返回 None。
+      明确不做：挂作业与告警的后台接口（CORE-TASK-125）。
+    status: ready
+    depends_on:
+      - CORE-TASK-115
+      - CORE-TASK-114
+    acceptance_criteria:
+      - tests/integration/test_platform_alert_notify.py 用替身 sender：新告警第一轮发出并写 first_sent_at、last_notified_at、notify_count 为 1；15 分钟内不再发，满 15 分钟再发、notify_count 为 2（时间用直接 UPDATE 调早）
+      - 已确认的不发；发送失败不改任何列、这一轮不再发后面的，下一轮再发；一轮最多 20 条，按 created_at、alert_id 升序
+      - 首次发出满 1 小时仍未确认的设上 escalated_at，之后照常提醒；不满 1 小时的不设；sender 为空时创建满 1 小时的也设上
+      - 正文第一行为固定前缀，含种类、入口、SKU、order_ref 与 alert_id，没有 detail 以外的平台原文；超过 1000 个字符截断
+      - TelegramSender 用本地替换的 urlopen 模拟失败时，异常的 str 与捕获的日志里都没有机器人令牌与地址；sender 为空时只记一行警告、不改发送相关的列
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_alerts.py
+      - app/services/telegram.py
+      - tests/integration/test_platform_alert_notify.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-125
+    title: 后台的告警列表与确认、继续销售或停售的决定、手动对账与对账记录接口，对账与推送作业挂进进程
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条（后台的运营操作、对账与自查页）、3.2（platform_alerts、reconciliation_runs、platform_ops_log 的 alert_acknowledged、incident_decision、reconciliation_started）、10 第 3 条的角色表，docs/PLATFORM_CHANNELS.md 第 7、8 节（工作包 P4e 的接口与作业部分；Kelvin 2026-11-24 定这几个后台接口随第 4 组登记）。接口加在 CORE-TASK-109 的 app/api/admin_platform_ops.py，命令体加在 app/services/platform_alerts.py（确认告警、记决定）与 app/services/platform_reconcile.py（请求对账），读查询加在 app/services/admin_queries.py。
+      一，GET /api/v1/admin/alerts?acked=&after=&limit=：只要求登录；acked 取 true 或 false（不带为 false），其余值 422；按 created_at 倒序、再按 alert_id 倒序，分页照 CORE-TASK-100 的后台列表规则，游标文本为 created_at 的 RFC 3339 微秒 Z 文本加竖线再加 alert_id；每条为 alert_id、kind、channel_id、platform、sku_id、platform_order_row_id、order_ref、detail、created_at、first_sent_at、last_notified_at、notify_count、escalated_at、acked_at、acked_actor_ref（确认的管理员账号 ID，从 platform_ops_log 的 alert_acknowledged 取，没有为空）。
+      二，POST /api/v1/admin/alerts/{alert_id}/ack：经 run_admin（operation platform_alerts.ack，角色 stock_operator 与 stock_admin，断言 stock_admin，上下文的入口与池为空），正文为空对象；alert_id 按 is_admin_id 判格式，不存在 404 NOT_FOUND，别的租户经 admin_not_found；命令体 acknowledge_alert(execution, alert_id) 在事务里 FOR UPDATE 这一行，已确认 409 STATE_CONFLICT（{"reason": "already_acked"}），否则写 acked_credential_id 与 acked_at（数据库时间）和一条 platform_ops_log（alert_acknowledged，object_type alert、object_id 为 alert_id，after 为 alert_id、kind、acked_at）；200 返回这条告警在一里的表示。
+      三，POST /api/v1/admin/incident-decisions：经 run_admin（operation platform_ops.incident_decision，角色同二，上下文的入口与池为空），正文 decision（continue_selling 或 stop_selling）、channel_id（可选；给了就须是本租户的 platform 入口，inactive 的也可以，只是一条记录；格式、不存在、别的租户的判定同 CORE-TASK-116）、reason（同 reason 惯例）；命令体只写一条 platform_ops_log（incident_decision，object_type channel 或为空，after 为 decision 与 channel_id），不改任何别的东西（设计第 8 节：Core 故障时记下继续销售或手动停售的决定）；201 返回这条日志的 id、decision、channel_id、reason、actor_ref、created_at。
+      四，POST /api/v1/admin/reconciliations：经 run_admin（operation platform_ops.reconcile，角色 stock_admin，上下文的入口与池为空），正文为空对象（契约 8.6 第 2 条：后台写操作都走后台执行器）。命令体 request_reconciliation(execution) 在事务里先 FOR UPDATE 这个租户的 platform_write_pause 行（两个不同幂等键的请求同时来时串行；没有这一行即租户没有平台入口，422 INVALID_REQUEST），再判：这个租户已有 trigger 为 manual、finished_at 为空、started_at 在 15 分钟之内的行时 409 STATE_CONFLICT（{"reason": "reconcile_pending"}）（作业每分钟取一次、一次对账有 5 分钟的预算，15 分钟还没完成的多半是出错了，不再挡管理员重新发起，补的）；否则插入一行 reconciliation_runs（new_id 的 rcn 前缀，trigger manual，credential_id 取上下文，started_at 为数据库时间）并写 platform_ops_log（reconciliation_started，object_type reconciliation、object_id 为 run_id，before 为空，after 为 run_id 与 trigger，操作主体列取上下文）；202 返回 run_id 与 started_at。对账本身由 CORE-TASK-123 的作业在一分钟内执行（对账要在事务外调平台，放不进执行器的一笔事务，也不该让一个 HTTP 请求等它跑完，补的做法）；前端按 run_id 在列表里看结果。
+      GET /api/v1/admin/reconciliations?after=&limit=：只要求登录；按 started_at 倒序、再按 run_id 倒序，分页照 CORE-TASK-100 的后台列表规则，游标文本为 started_at 的 RFC 3339 微秒 Z 文本加竖线再加 run_id；每条为 run_id、trigger、actor_ref（发起的管理员账号 ID，从 reconciliation_started 的日志取，定时的为空）、started_at、finished_at、discrepancy_count。
+      五，作业：create_app 在后台开关为真时再建两个定时任务 platform-reconcile（调 ReconcileRunner.run_round）与 platform-alert-notify（调 notify_round，sender 由 build_sender(app.state.platform_secrets) 得出），周期取 JOB_INTERVALS；与现有任务一起启动、并行停止，就绪检查列出它们；开关为假时不建、不列。
+      明确不做：解除写入暂停、解除待核对等其余运营操作（第 3 组待登记）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-123
+      - CORE-TASK-124
+    acceptance_criteria:
+      - tests/integration/test_admin_alerts_api.py：列表默认只列未确认的、acked=true 只列已确认的、按 created_at 倒序、分页与游标照后台列表规则、别的租户的不出现；确认成功写 acked_at 与一条 alert_acknowledged，已确认再确认 409，别的租户 404 并记 cross_tenant；未登录 401、CSRF 不符 403
+      - 同一文件：继续销售或停售的决定写一条 incident_decision 且不改别的表；channel_id 不是本租户的 platform 入口时被拒；decision 取值不对 422
+      - tests/integration/test_admin_reconciliations_api.py：手动对账 202、插入一行 manual 并写一条 reconciliation_started；同键同正文重放得同样的响应、不多插行；15 分钟之内有未完成的 manual 行时 409、超过 15 分钟的不挡；接着调一次 ReconcileRunner 的一轮（模拟适配器），这一行有了 finished_at；列表按 started_at 倒序、手动的带 actor_ref、定时的为空
+      - tests/integration/test_platform_jobs.py 加：后台开关为真时就绪检查列出 platform-reconcile 与 platform-alert-notify，为假时不列
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_platform_ops.py
+      - app/services/platform_alerts.py
+      - app/services/platform_reconcile.py
+      - app/services/admin_queries.py
+      - app/main.py
+      - tests/integration/test_admin_alerts_api.py
+      - tests/integration/test_admin_reconciliations_api.py
+      - tests/integration/test_platform_jobs.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
