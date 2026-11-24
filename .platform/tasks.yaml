@@ -3569,7 +3569,7 @@ tasks:
       第 4 步：开事务，按契约 5.10 第 4 步的锁序加锁，用不到的层跳过：收件箱行 FOR UPDATE（applied_at 已有值就提交空事务，下一个）→ 平台订单行 FOR UPDATE（没有就留到动作里插入）→ 本任务的 created 只再锁这个入口在这些 SKU 上的 channel_allocations 行（按 sku_id 升序 FOR UPDATE）→ 平台商品 FOR SHARE 重新解析 created 各行的 SKU，与第 3 步不同就回滚、从第 3 步重做一次，再不同就回滚、这个订单这一轮停下。然后 classify：ignored 记 ignored、不改任何量；created 的 apply 照下面第四条；本任务还没有处理办法的情形（其余动作，以及 missing_prior、blocked、attention）回滚、这个订单这一轮停下、不改任何东西（CORE-TASK-087 到 089 逐个补上）。
       第 7 步：写收件箱行的 applied_at（数据库时间）与 result，与改动一起提交。这一轮结束（处理完或停下）时在同一连接上 RELEASE_ALL_LOCKS() 并用 SET SESSION transaction_isolation = DEFAULT 复原隔离级别，出错就作废这个连接（照 app/services/idempotency.py 的 _release_locks）。
       第 8 步：数据库错误或程序异常时整笔回滚，收件箱行仍未处理，这个订单这一轮停下；异常不向外抛，记一行进程日志（不含 payload），返回原因。
-      四，created：插入平台订单（new_id 的 pfo 前缀，order_ref 由 order_ref(入口的 platform, platform_shop_id, platform_order_id) 得出，stage unpaid）与各行（sku_id 取重新解析的结果，找不到为空）。按 platform_line_id 升序逐行，对有 SKU 的行用 take_quota 从这个入口这个 SKU 的 quota 扣走、记 quota_taken，pending 加这一行的件数。有行找不到生效平台商品时订单设为 held、attention 为 unmapped、attention_code 为空，那些行不计 pending、不扣配额，result 记 held、result_code 记 unmapped；否则 result 记 applied、result_code 为空。result 记 ignored 时 result_code 为空。（CORE-TASK-093 的约束：held 与 attention 时 result_code 非空、ignored 时为空；完整的通用规则见 CORE-TASK-087。）
+      四，created：插入平台订单（new_id 的 pfo 前缀，order_ref 由 order_ref(入口的 platform, platform_shop_id, platform_order_id) 得出，stage unpaid）与各行（sku_id 取重新解析的结果，找不到为空）。按 platform_line_id 升序逐行，对有 SKU 的行用 take_quota 从这个入口这个 SKU 的 quota 扣走、记 quota_taken，pending 加这一行的件数；（契约 0.24 的 3.1、3.2）这一行 channel_allocations 的 manual_confirmed_quota 非空时同时减去 min(这一行的件数, manual_confirmed_quota)，不论入口模式，不写 platform_ops_log。有行找不到生效平台商品时订单设为 held、attention 为 unmapped、attention_code 为空，那些行不计 pending、不扣配额，result 记 held、result_code 记 unmapped；否则 result 记 applied、result_code 为空。result 记 ignored 时 result_code 为空。（CORE-TASK-093 的约束：held 与 attention 时 result_code 非空、ignored 时为空；完整的通用规则见 CORE-TASK-087。）
       record_auto_event 收到 source 为 manual 或 action 为 return_received 时报 ValueError（调用方的程序缺陷），入口不对或人工模式时返回假。测试要在第 3、4 步之间插入动作（改挂用直接 UPDATE sku_listings，本任务不依赖平台商品命令）、让某条语句失败：模块里设一个默认为空的模块级钩子 _between_prepare_and_lock(connection)，第 3 步之后、开事务之前调它，测试用 monkeypatch 设它；失败用 monkeypatch 替换本模块里写平台订单的那个函数。
       五，测试辅助模块 tests/integration/platform_fixtures.py：建租户、池、SKU、platform 与 backoffice 入口（直接插行，含 system 主体与连接行）、平台商品，提交；purge_tenant(engine, tenant_id) 在一个连接上 SET SESSION foreign_key_checks = 0，删掉这个租户在所有带 tenant_id 列的表里的行，在 finally 里设回 1、设不回就作废这个连接（use_alter 的外键让按表排序删不干净，例如池行上的 went_live_credential_id；只给测试用）。之后的平台事件任务复用它。
       明确不做：取消、待发货、交运、退货的处理（CORE-TASK-087 到 089）；补拉与退避（087）；作业、webhook、告警（第 4 组）；后台的人工登记（第 3 组）。
@@ -3580,7 +3580,7 @@ tasks:
       - CORE-TASK-083
     acceptance_criteria:
       - 新增 app/services/platform_events.py、tests/integration/platform_fixtures.py 与 tests/integration/test_platform_events_created.py，不改别的文件；每个测试用自己的租户，在 finally 里 purge_tenant，会话结束时 migrated_engine 降到 base 照常成功
-      - 契约 5.10 例子第 1 种的前一半：created 2 件、Q 为 10 时 Q 变 8、pending 变 2、quota_taken 2、stage unpaid、result applied；契约 3.1 例子一第 8 步：16 件而 Q 为 14 时 Q 变 0、quota_taken 14、pending 加 16
+      - 契约 5.10 例子第 1 种的前一半：created 2 件、Q 为 10 时 Q 变 8、pending 变 2、quota_taken 2、stage unpaid、result applied；契约 3.1 例子一第 8 步：16 件而 Q 为 14 时 Q 变 0、quota_taken 14、pending 加 16；manual_confirmed_quota 为 20 时这 16 件之后为 4、为 3 时为 0、为空时仍为空（契约 0.24）
       - 一行找不到生效平台商品：订单 held、attention unmapped，那一行 sku_id 为空、不计 pending、不扣配额，别的行照常；result held、result_code unmapped
       - 例子第 2 种：同一去重键 record_auto_event 两次只有一行；同一事件处理之后再 process_order 不改任何量；例子第 3 种的 created 版：pull 来源以另一个 event_key 再写一个 created，处理得 ignored、不改任何量
       - 连接为 manual 时 record_auto_event 返回假、不写；source 为 manual、payload 不合格、入口不是 platform 时不写
@@ -4205,7 +4205,7 @@ tasks:
       三种操作都照 CORE-TASK-105 的人工路径做（第 1、2 步的订单锁与提交键去重、第 7、8 步的事务、预建、撞唯一约束时的重读与“不留给下一轮”），写一条 source 为 manual 的收件箱行；不经 classify，不受 auto_events_exist 限制（契约 5.10 引用格式第 3 条），只受 events_pending 限制（这个订单有别的未处理事件时仍 409 events_pending）；但锁下按当前订单状态用 classify 判为 blocked 的未处理事件不算（held 订单在 ready_at 已记时收到的 shipped、return_received 会被作业判 blocked 留着不处理；算进去订单就永远解不开），它们在订单离开 held 之后由下一轮作业照常处理。CORE-TASK-083 说这两种“不是收件箱事件、不经 classify”，这里按契约 8.6 第 2 条“都写成收件箱里的一条事件”记一行以便去重与审计，处理仍不经 classify。
       新函数 process_held_operation(engine, *, tenant_id, platform_order_row_id, operation, manual_key, request_hash, credential_id, actor_ref, actor_role, reservation_ttl_seconds)，operation 取 retry、resume、close，与 process_manual_event 共用内部的锁、去重与事务部分（可以提成模块内的私有函数），返回值与 ManualRejected 同 105；由平台订单行 ID 指定订单：先在没有打开事务的连接上普通读这一行（不存在或属于别的租户 404 PLATFORM_ORDER_NOT_FOUND，在取锁之前判出），读完结束事务，再用它的入口与平台订单号算 order_lock_name 取订单锁（105 第 1 步），锁下做提交键去重并重新读订单判各操作的前提（订单的状态以锁下读到的为准）；收件箱行的 action 与 payload 如下。
       一，retry（待处理重试）：订单须为 held、ready_at 已记、attention 不是 unmapped，否则 409 STATE_CONFLICT，details 为 {"reason": "not_retryable", "stage", "attention"}。收件箱行 action 为 ready_to_ship、payload 为空对象。照 CORE-TASK-088 再做一次待发货：一个保存点里预留并确认销售，成功则 committed、pending 照减、清空 attention；再被拒则留在 held、attention 与 attention_code 照 088 改写。result 与 result_code 照 088。
-      二，resume（映射补上后继续处理）：订单须为 held 且 attention 为 unmapped，否则 409 STATE_CONFLICT，details 为 {"reason": "not_unmapped", "stage", "attention"}。照 CORE-TASK-086 的做法，开事务之前先普通读解析、按结果预建，锁住 channel_allocations 之后再用 FOR SHARE 读平台商品复核（与预建时不同就照 105 第 8 步重做一次、再不同 503），解析的对象是 sku_id 为空、且剩余件数（quantity 减 cancelled_qty）大于 0 的各行（剩余为 0 的行已全部取消，不要求映射、sku_id 留空，补的：否则这种单永远继续不了）；仍有解析不到的 409 STATE_CONFLICT，details 为 {"reason": "still_unmapped", "platform_line_ids": 按升序}，什么也不写。都解析到时：写这些行的 sku_id，对它们按剩余件数做 CORE-TASK-086 的 created 记账（take_quota 的件数与 pending 的增量都是剩余件数，quota_taken 记扣走的），清空 attention 与 attention_code、stage 改回 unpaid；ready_at 已记的再照一做一次待发货：成功时收件箱行 result 为 applied，被拒时订单留在 held、attention 与 attention_code 照 CORE-TASK-088 改写、result 为 held、result_code 照 088；ready_at 未记的 result 为 applied。锁按全局锁序一次取齐两段要用的行：收件箱行 → 平台订单行 → 池行 FOR SHARE → 余额行 → pool_allocations 行 → channel_allocations 行（按 sku_id、再按 channel_id 升序）→ 平台商品 → SKU → 商品，与 CORE-TASK-088 待发货的锁序一致，created 要锁的配额行含在其中。收件箱行 action 为 created、payload 为这个订单各行的 created 形状（platform_line_id、platform_item_id、platform_model_id、quantity）。
+      二，resume（映射补上后继续处理）：订单须为 held 且 attention 为 unmapped，否则 409 STATE_CONFLICT，details 为 {"reason": "not_unmapped", "stage", "attention"}。照 CORE-TASK-086 的做法，开事务之前先普通读解析、按结果预建，锁住 channel_allocations 之后再用 FOR SHARE 读平台商品复核（与预建时不同就照 105 第 8 步重做一次、再不同 503），解析的对象是 sku_id 为空、且剩余件数（quantity 减 cancelled_qty）大于 0 的各行（剩余为 0 的行已全部取消，不要求映射、sku_id 留空，补的：否则这种单永远继续不了）；仍有解析不到的 409 STATE_CONFLICT，details 为 {"reason": "still_unmapped", "platform_line_ids": 按升序}，什么也不写。都解析到时：写这些行的 sku_id，对它们按剩余件数做 CORE-TASK-086 的 created 记账（take_quota 的件数与 pending 的增量都是剩余件数，quota_taken 记扣走的；manual_confirmed_quota 非空时照 CORE-TASK-086 减去 min(剩余件数, manual_confirmed_quota)，契约 0.24），清空 attention 与 attention_code、stage 改回 unpaid；ready_at 已记的再照一做一次待发货：成功时收件箱行 result 为 applied，被拒时订单留在 held、attention 与 attention_code 照 CORE-TASK-088 改写、result 为 held、result_code 照 088；ready_at 未记的 result 为 applied。锁按全局锁序一次取齐两段要用的行：收件箱行 → 平台订单行 → 池行 FOR SHARE → 余额行 → pool_allocations 行 → channel_allocations 行（按 sku_id、再按 channel_id 升序）→ 平台商品 → SKU → 商品，与 CORE-TASK-088 待发货的锁序一致，created 要锁的配额行含在其中。收件箱行 action 为 created、payload 为这个订单各行的 created 形状（platform_line_id、platform_item_id、platform_model_id、quantity）。
       三，close（关闭平台已取消的待处理单）：订单须为 held，否则 409 STATE_CONFLICT，details 为 {"reason": "not_held", "stage", "attention"}。收件箱行 action 为 cancelled、payload 为空对象（取消全部剩余件数），照 CORE-TASK-087 扣数之前的取消处理；同一事务里写一条 platform_ops_log，action 为 held_order_closed，object_type 为 platform_order、object_id 为 platform_order_row_id，before 与 after 为 {"platform_order_row_id", "stage"}（stage 为 held 与 cancelled），reason 为空，credential_id、actor_ref、actor_role 取参数（actor_role 为调用方断言的角色），request_id 为这一行的 event_row_id。
       明确不做：接口（CORE-TASK-108）；清除已确认单的待处理标记、记已知差异（以后与其余运营操作一起登记）。
     status: ready
@@ -4214,7 +4214,7 @@ tasks:
     acceptance_criteria:
       - 只改 allowed_change_paths；集成测试写在 tests/integration/test_platform_events_manual_ops.py，数据用 platform_fixtures 建、每个测试用自己的租户并在 finally 里 purge_tenant
       - 重试：待发货因库存不足进 held 后补货再重试，订单 committed、pending 减到 0、Core 有预留与确认销售；仍不足时留在 held、attention_code 为 Core 的错误码；对 unpaid 或 unmapped 的订单重试 409 not_retryable
-      - 继续处理：一行找不到平台商品而 held 的订单，挂上平台商品后继续，那一行有了 sku_id、quota_taken 与 pending 照 created 的规则、订单回到 unpaid；ready_at 已记的直接走到 committed；还有一行挂不上时 409 still_unmapped、什么也不写；没映射的那一行已全部取消时继续处理照常成功；之前已取消的件数不扣配额
+      - 继续处理：一行找不到平台商品而 held 的订单，挂上平台商品后继续，那一行有了 sku_id、quota_taken 与 pending 照 created 的规则、订单回到 unpaid；ready_at 已记的直接走到 committed；还有一行挂不上时 409 still_unmapped、什么也不写；没映射的那一行已全部取消时继续处理照常成功；之前已取消的件数不扣配额；manual_confirmed_quota 非空时按剩余件数照 086 减（契约 0.24）
       - 关闭：held 的订单关闭后为 cancelled，pending 减去剩余件数、按 CORE-TASK-087 的规则不加回配额（held 的订单不加回），platform_ops_log 多一条 held_order_closed；对 unpaid 的订单关闭 409 not_held
       - 三种操作在订单已有 webhook 事件时照样可做；ready_at 已记的 held 订单收到被判 blocked 留着的 webhook shipped 时，重试不回 events_pending、照常成功，之后作业处理那条 shipped；同一提交键同内容再交 replayed、不再处理，换内容 409 IDEMPOTENCY_CONFLICT；另一个连接持有订单锁时 503、什么也不写
       - 105 的人工登记与 process_order 的已有测试照常通过
@@ -4677,7 +4677,7 @@ tasks:
       按 docs/PLATFORM_CHANNELS.md 6.2 第 5 条、契约 docs/CONTRACT_V1.md 0.22 的 3.2（逾期时不能从人工切到自动）与 10 第 3 条的角色表（切换模式要 stock_admin）（工作包 P4c 之后，Kelvin 2026-11-24 定放在第 4 组）。
       一，命令体 switch_mode(execution, body)，加在 app/services/platform_connections.py（正文 channel_id、mode、reason，已由接口校验）：事务里 FOR UPDATE 连接行，再普通读这个入口 manual_checks 里 checked_until 的最大值；目标与当前相同 409 STATE_CONFLICT（details {"reason": "mode_unchanged"}）。
       切到 auto，按先后只报第一个：status 不是 active 409 STATE_CONFLICT（{"reason": "not_connected"}）；pull_allowed 按目标模式 auto 与当前 status、capabilities 判，不满足 409 STATE_CONFLICT（{"reason": "capability_missing"}）；manual_check_overdue（CORE-TASK-082，mode 传当前的 manual，mode_changed_at 取连接行，now 为数据库时间）为真 409 MANUAL_CHECK_OVERDUE（契约 3.2）；接管点取逾期判定的起点（最近一次核对的 checked_until 与 mode_changed_at 中较晚的那个；没核对过就是 mode_changed_at；契约只写了“最后一次核对的 checked_until”，这样取是为了与逾期规则的“切换之前的核对不算数”一致，补的）；这个入口有 source 为 manual、action 为 created、ready_to_ship、cancelled 或 shipped（契约 5.10 第 3 条人工登记的四种；退货验收不算；后台的待处理重试、继续处理与关闭写的也是这几种动作，收件箱分不出来，一并算上，宁可多要求补一次核对）、received_at 晚于接管点的收件箱事件时 409 STATE_CONFLICT（{"reason": "manual_events_after_check"}）：接管点之后的人工登记（尤其用 m<n> 派生引用的交运）会被补拉再记一次，要先补一次核对把接管点推到它们之后（补的）。这一项是在连接行锁下的普通读，挡不住切换同一刻才提交的人工登记；运行手册写明切换前先停止人工登记（另行补上），残余风险列进登记 PR。都通过时 takeover_at 设为接管点；pull_cursor 在这个入口第一次切到自动时（原 takeover_at 为空）设为接管点，从自动切回人工再切回自动时设为原 pull_cursor 与原 mode_changed_at（这段人工期的开始）两者中较早的那个（原游标为空时取后者；人工期里补拉不运行，游标可能落后于人工期的开始）：已有自动事件的订单在人工期里不能人工登记（CORE-TASK-105），它们的事件不按接管点丢（CORE-TASK-117、118），要从人工期开始拉起才补得上（补的；人工期长于平台订单列表能回溯的范围时补拉会一直失败，要等 V-08 核实回溯范围后再定怎么办，登记 PR 列为待定）；mode 改为 auto，mode_changed_at 设为数据库时间。设计写的是“向前补拉、去重、对账，然后把 mode 改为 auto”；CORE-TASK-086 的 record_auto_event 在人工模式下不写收件箱，所以改为先切模式、由补拉作业从接管点拉起；切换之后、这个租户跑完一次对账之前，发布作业不写这个入口（CORE-TASK-121），对账跑完前的事件照常处理（补的写法）。切换之后由管理员在后台手动发起一次对账（CORE-TASK-125），不等每天一次的定时对账；运行手册的这一步另行补上。
-      切到 manual：任何 status 都可以；mode 改为 manual，mode_changed_at 设为数据库时间，takeover_at 与 pull_cursor 不动（下次切到自动时重算）。
+      切到 manual：任何 status 都可以；mode 改为 manual，mode_changed_at 设为数据库时间，takeover_at 与 pull_cursor 不动（下次切到自动时重算）；从 auto 切到 manual 时，同一事务把这个入口全部 channel_allocations 行的 manual_confirmed_quota 与 manual_confirmed_at 清空（契约 0.24 的 3.2：自动期间写到平台的值不经确认；不另记日志，由 connection_mode_changed 的 mode 可知）。
       两种切换都写 platform_ops_log（connection_mode_changed，object_type channel、object_id 为 channel_id，before 与 after 为 channel_id、status、mode、capabilities，reason 为正文的，操作主体列取上下文）。返回连接在 CORE-TASK-116 列表里的表示。
       二，POST /api/v1/admin/connections/{channel_id}/mode，加在 app/api/admin_connections.py：经 run_admin（operation platform_connections.mode，角色 stock_admin，上下文的入口与池为空）；正文 mode（manual 或 auto）与 reason（同 reason 惯例），多出来的键或 null 422；入口的预检做 CORE-TASK-116 三里的格式、不存在、别的租户与不是 platform 入口四项；切到 auto 时入口还须 active（否则 422 INVALID_REQUEST），切到 manual 时 inactive 的也可以；不判主密钥与适配器（切换用不到）；200。
       明确不做：人工模式下的其余运营操作（第 3 组待登记）；前端。
@@ -4688,7 +4688,7 @@ tasks:
       - tests/integration/test_admin_connection_mode_api.py：人工模式、active、有 read_orders 能力、核对未逾期的入口切到 auto 成功，takeover_at 等于最近一次核对的 checked_until、pull_cursor 等于 takeover_at、写了一条 connection_mode_changed
       - 没核对过的入口切到 auto 时 takeover_at 等于原 mode_changed_at；切换之前（mode_changed_at 之前）的核对不算数
       - 逾期 409 MANUAL_CHECK_OVERDUE、未连接 409 STATE_CONFLICT、缺能力 409 STATE_CONFLICT、接管点之后有人工登记 409 STATE_CONFLICT、目标与当前相同 409 STATE_CONFLICT，details 如 purpose 所写，被拒的都不改连接、不写日志；补记一次核对之后再切换成功
-      - 切到 manual 在 auth_failed 状态下也成功，takeover_at 与 pull_cursor 不变；切到 manual 之后补拉作业不再拉这个入口（调一次 PullRunner 的一轮，模拟平台没有收到读订单的调用）
+      - 切到 manual 在 auth_failed 状态下也成功，takeover_at 与 pull_cursor 不变，这个入口各配额行的 manual_confirmed_quota 与 manual_confirmed_at 清空、别的入口不变（契约 0.24）；切到 manual 之后补拉作业不再拉这个入口（调一次 PullRunner 的一轮，模拟平台没有收到读订单的调用）
       - 未登录、CSRF 不符、正文多键、入口属于别的租户各一条；同一 Idempotency-Key 同正文重放得同样的响应
       - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
@@ -5046,7 +5046,7 @@ tasks:
   - id: CORE-TASK-134
     title: 后台库存总览页与单个 SKU 的配额页：四个量、配额、未分配、读取时间与改配额
     purpose: >-
-      按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节库存总览与 SKU 详情两行、第 5.3 节的配额冲突，契约 3.1（改配额、两种冲突自动重读、读取时间）。调 CORE-TASK-100 的 GET pools、stock-overview、allocation-changes 与 POST allocations，CORE-TASK-149 加的 as_of 与 sku_ids，CORE-TASK-102 的 GET listings。 新页面 pages/stock/StockOverviewPage.tsx（/admin/stock，也是 /admin/ 的落点）与 pages/stock/SkuAllocationPage.tsx（/admin/stock/{sku_id}）。总览每行显示 sku_code、状态、四个量与 available、S、各平台入口的 Q 与 pending、F（为负标超额）、待核对标记（设计第 2.2 节的待生效标记先不做：契约 3.2 的判定在平台卖出时会误报，待契约改好另行登记）；顶部显示读取时间 as_of。 配额页：S 与各入口 Q 的表单、reason 必填、只提交改了的入口、expected_version 取 allocation_version、expected_quota 取页面上的值；表单旁按新值算 F 撇的预览（纯函数）；VERSION_CONFLICT 与 QUOTA_CHANGED 用 sku_ids 只重读这一个 SKU、并排标出新旧值、管理员确认后换新键再交；其余 409 按设计第 5.3 节给下一步链接；下方列配额变更记录与这个 SKU 的平台商品。 上线后人工点检（不挡合并）：总览能翻页、某个 SKU 改一次配额成功并出现在变更记录里。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
+      按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节库存总览与 SKU 详情两行、第 5.3 节的配额冲突，契约 3.1（改配额、两种冲突自动重读、读取时间）。调 CORE-TASK-100 的 GET pools、stock-overview、allocation-changes 与 POST allocations，CORE-TASK-149 加的 as_of 与 sku_ids，CORE-TASK-102 的 GET listings。 新页面 pages/stock/StockOverviewPage.tsx（/admin/stock，也是 /admin/ 的落点）与 pages/stock/SkuAllocationPage.tsx（/admin/stock/{sku_id}）。总览每行显示 sku_code、状态、四个量与 available、S、各平台入口的 Q 与 pending、F（为负标超额）、待核对标记与待生效标记（契约 0.24 3.2：人工模式的入口上 manual_confirmed_quota 与 quota 不等、或它为空而 quota 大于 0，判断写成纯函数）；顶部显示读取时间 as_of。 配额页：S 与各入口 Q 的表单、reason 必填、只提交改了的入口、expected_version 取 allocation_version、expected_quota 取页面上的值；表单旁按新值算 F 撇的预览（纯函数）；VERSION_CONFLICT 与 QUOTA_CHANGED 用 sku_ids 只重读这一个 SKU、并排标出新旧值、管理员确认后换新键再交；其余 409 按设计第 5.3 节给下一步链接；下方列配额变更记录与这个 SKU 的平台商品。 上线后人工点检（不挡合并）：总览能翻页、某个 SKU 改一次配额成功并出现在变更记录里。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
       - CORE-TASK-133
@@ -5055,7 +5055,7 @@ tasks:
       - CORE-TASK-149
     acceptance_criteria:
       - api/stock.ts 的测试：总览响应解析成行（没有配额行的入口 Q 与 pending 为 0），F 为负时标超额；改配额的正文只含改了的入口且带 expected_quota
-      - F 撇的预览用契约 3.1 例子一第 6 步得 2、第 6 撇步得负 1，各一条测试
+      - F 撇的预览用契约 3.1 例子一第 6 步得 2、第 6 撇步得负 1，各一条测试；待生效的判断四种情形（auto 入口、相等、不等、为空而 quota 大于 0）各一条测试
       - 两种冲突的处理写成纯函数并有测试：重读后新旧值并排，确认后换新提交键
       - ALLOCATION_EXCEEDS_UNALLOCATED 显示 details 的五个数；NO_ACTIVE_LISTING 与 MANUAL_CHECK_OVERDUE 给到平台商品页与人工核对页的链接（链接的生成有测试）
       - 改动只落在 allowed_change_paths；不改 frontend/package.json 与 frontend/package-lock.json、.platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；前端检查（lint、类型检查、vitest、构建与产物检查）由 PR 的必需 CI 检查 frontend 执行并通过
@@ -5402,9 +5402,9 @@ tasks:
     creates_branch: true
     creates_pull_request: true
   - id: CORE-TASK-147
-    title: 后台其余运营操作的按钮：写入暂停、解除待核对、清除待处理标记与记已知差异
+    title: 后台其余运营操作的按钮：写入暂停、解除待核对、确认人工配额生效、清除标记与记已知差异
     purpose: >-
-      按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节连接、库存总览与平台订单详情三行里依赖缺口 G5 的按钮，第 2.1 节横幅区的自动写平台已暂停，PLATFORM_CHANNELS 第 5 节（已设上时设上不可用）与第 6.2 节第 3、4 条。调 G5 的后端任务登记的接口（见 depends_on）。 新组件 pages/ops/WritePauseCard.tsx（放在连接页：当前状态、设上与解除，原因必填；解除前用确认对话框提醒先确认恢复后的对账已跑完、差异已处理，服务端不判这一条，CORE-TASK-151）与 pages/ops/OpsButtons.tsx（解除待核对按钮放在 SKU 的配额页对应入口旁，带页面上看到的 review_since；确认人工配额已生效不在本任务，待契约 3.2 改好另行登记；清除已确认单的待处理标记、记已知差异放在平台订单详情）；横幅区加写入暂停一条。 上线后人工点检（不挡合并）：写入暂停的状态显示正确（不操作）。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
+      按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节连接、库存总览与平台订单详情三行里依赖缺口 G5 的按钮，第 2.1 节横幅区的自动写平台已暂停，PLATFORM_CHANNELS 第 5 节（已设上时设上不可用）与第 6.2 节第 3、4 条。调 G5 的后端任务登记的接口（见 depends_on）。 新组件 pages/ops/WritePauseCard.tsx（放在连接页：当前状态、设上与解除，原因必填；解除前用确认对话框提醒先确认恢复后的对账已跑完、差异已处理，服务端不判这一条，CORE-TASK-151）与 pages/ops/OpsButtons.tsx（解除待核对、确认人工配额已生效两个按钮放在 SKU 的配额页对应入口旁：前者带页面上看到的 review_since，后者只在人工模式的入口显示、默认值为当前 quota、不能大于它；清除已确认单的待处理标记、记已知差异放在平台订单详情）；横幅区加写入暂停一条。 上线后人工点检（不挡合并）：写入暂停的状态显示正确（不操作）。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
       - CORE-TASK-146
@@ -5413,10 +5413,11 @@ tasks:
       - CORE-TASK-151
       - CORE-TASK-152
       - CORE-TASK-153
+      - CORE-TASK-154
       - CORE-TASK-134
       - CORE-TASK-145
     acceptance_criteria:
-      - api/ops.ts 的测试：四种操作（设上与解除写入暂停、解除待核对、清除待处理标记、记已知差异）的正文与 G5 后端任务写定的一致，结果按设计第 5 节分类
+      - api/ops.ts 的测试：五种操作（设上与解除写入暂停、解除待核对、确认人工配额已生效、清除待处理标记、记已知差异）的正文与 G5 后端任务写定的一致，结果按设计第 5 节分类
       - 设上按钮在已设上时不可用、解除在未设上时不可用，判断在纯函数里并有测试
       - 横幅的写入暂停一条按读到的状态显示，有测试
       - 改动只落在 allowed_change_paths；不改 frontend/package.json 与 frontend/package-lock.json、.platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；前端检查（lint、类型检查、vitest、构建与产物检查）由 PR 的必需 CI 检查 frontend 执行并通过
@@ -5583,6 +5584,32 @@ tasks:
       - app/api/admin_platform_orders.py
       - tests/integration/platform_fixtures.py
       - tests/integration/test_admin_platform_order_marks_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+  - id: CORE-TASK-154
+    title: 确认人工配额已生效：命令与后台接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.24 的 3.2（channel_allocations 的 manual_confirmed_quota 与 manual_confirmed_at 代表卖家后台此刻应有的显示量；确认的值不能大于当前 quota；platform_ops_log 的 manual_quota_confirmed 及前后值的键；确认只记这两列、不改 quota）、8.6 第 2 条与 10 第 3 条的角色表（只接受 stock_admin），docs/PLATFORM_CHANNELS.md 6.2 第 1、3 条，docs/ADMIN_FRONTEND.md 第 9 节缺口 G5 的第三项。随平台新订单减少与切回人工时清空不在本任务（CORE-TASK-086、107、120）。 一，命令体 confirm_manual_quota(execution, body) 加在 CORE-TASK-090 的 app/services/allocations.py：正文 channel_id、sku_id、manual_confirmed_quota（0 到 1000000 的整数，bool 不算），已由接口校验并预检。事务里先 FOR SHARE 这个入口的 platform_connections 行（与 CORE-TASK-120 切换模式串行），再 FOR UPDATE 这一行 channel_allocations（契约 3.1 锁序里用不到的层跳过）。按先后只报第一个：没有连接行或 mode 不是 manual 409 STATE_CONFLICT（{"reason": "not_manual"}）（只有人工模式要确认，补的）；没有这一行 channel_allocations 409 STATE_CONFLICT（{"reason": "no_allocation"}）（补的）；manual_confirmed_quota 大于当前 quota 409 STATE_CONFLICT（{"reason": "exceeds_quota", "quota": 当前值}）（契约 3.2）；否则写 manual_confirmed_quota 与 manual_confirmed_at（数据库时间），与原值相同也照写、刷新时间（补的：重新核对过就是一次新的确认），同一事务写一条 platform_ops_log：action manual_quota_confirmed，object_type sku、object_id 为 sku_id，before 与 after 为 channel_id、sku_id、manual_confirmed_quota 三个键（before 里原值可为 null），reason 为空，操作主体列取上下文。不改 quota、pending、review_hold，不写 allocation_changes，不调平台。返回这一行的表示：channel_id、sku_id、quota、pending、review_hold、review_reason、review_since、manual_confirmed_quota、manual_confirmed_at（时间用 app/api/catalog.py 的 RFC 3339 微秒 Z，同 CORE-TASK-152），在同一事务里读出拼好，200。 二，接口加在 app/api/admin_allocations.py：POST /api/v1/admin/channel-allocations/confirm-manual-quota，经 CORE-TASK-099 的依赖与 run_admin（operation allocations.confirm_manual_quota，角色 stock_admin，上下文的入口与池为空）。正文如上，多出来的键或值为 null 都 422；channel_id 与 sku_id 按 is_admin_id 判形状。调执行器之前的预检同 CORE-TASK-152（入口不存在 404 NOT_FOUND，别的租户经 admin_not_found 记 cross_tenant 后同样 404；不是 platform 入口 422；SKU 不存在 404 SKU_NOT_FOUND，别的租户同样经 admin_not_found）。 明确不做：随平台新订单减少（CORE-TASK-086、107）；切回人工时清空（CORE-TASK-120）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-153
+      - CORE-TASK-120
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_manual_quota_api.py，用后台开关为真的生产应用、真实登录，数据用 tests/integration/platform_fixtures.py 建、finally 里 purge_tenant
+      - manual 入口确认等于 quota 的值 200，两列照写、quota 与 pending 不变、没有 allocation_changes，一条 manual_quota_confirmed（三个键、object_type sku、actor_role 为 stock_admin、actor_ref 为账号 ID）；确认小于 quota 的值同样 200
+      - 用新提交键再确认同值时 manual_confirmed_at 更新、多一条日志；大于 quota 409 exceeds_quota、details 带当前 quota；auto 入口 409 not_manual；没有配额行 409 no_allocation；被拒的都不改行、不写日志
+      - 预检：不存在的入口 404、别的租户的入口与别的租户的 SKU 各 404 并各多一条 cross_tenant、backoffice 入口 422、ID 形状不对 422、数量为负或为 true 422；没有会话 401、CSRF 不符 403、缺提交键 400；都不写日志与幂等记录
+      - 同一提交键重放得原响应；后台开关为假的生产应用上这个路径是 404
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/allocations.py
+      - app/api/admin_allocations.py
+      - tests/integration/platform_fixtures.py
+      - tests/integration/test_admin_manual_quota_api.py
     allowed_commands:
       - tests.unit
       - lint.check
