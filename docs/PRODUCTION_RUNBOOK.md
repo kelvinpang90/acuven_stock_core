@@ -181,7 +181,18 @@ core credential list --tenant <租户 ID>
    - 对 `/api/v1/platforms/`（平台授权回调与 webhook）关掉访问日志，或整个 vhost 用一个不含查询串的日志格式：回调的查询串里有授权码与 `state`（契约 0.22 §8.6 第 5 条）；
    - TLS 用现有的通配符证书。
 2. 在 Cloudflare 配子域名。
-3. 生产检出的 `.env` 加一行 `CORE_ADMIN_ENABLED=true`（只写这一行，不加引号、空格与注释）；平台应用凭据、令牌加密主密钥与 Telegram 令牌按实现任务写的 secrets 文件放好；按第 1.4 步手工触发一次生产部署。
+3. 生产检出的 `.env` 加一行 `CORE_ADMIN_ENABLED=true`（只写这一行，不加引号、空格与注释）；平台应用凭据按实现任务写的 secrets 文件放好；令牌加密主密钥与 Telegram 令牌照下面第 3a 步放好；按第 1.4 步手工触发一次生产部署。
+   3a. **放主密钥与 Telegram 令牌文件**（契约 0.23，CORE-TASK-114）。两个文件放在生产检出目录之外的 `<宿主机密钥目录>`，经 compose 的文件型 secret 挂进容器：
+   - 主密钥：32 个随机字节的标准 base64。用下面这句直接写进文件，不在命令行或终端上显示它：
+
+     ```bash
+     head -c 32 /dev/urandom | base64 > <宿主机密钥目录>/core_token_key
+     ```
+
+   - Telegram 机器人令牌：用编辑器写进 `<宿主机密钥目录>/core_telegram_token`（不要 `echo`），只有令牌这一行。
+   - 两个文件都归容器用户（`10001:10001`，见 `Dockerfile`）、权限 `0400`：`sudo chown 10001:10001 <两个文件>`、`sudo chmod 0400 <两个文件>`。不要为了读文件把容器改回 root。
+   - `.env` 加三行：`CORE_TOKEN_KEY_HOST_FILE=<宿主机密钥目录>/core_token_key`、`CORE_TELEGRAM_TOKEN_HOST_FILE=<宿主机密钥目录>/core_telegram_token`、`CORE_TELEGRAM_CHAT_ID=<告警群的 chat ID>`（照 `.env.example`）。没设这两个文件变量时 compose 挂空设备，后台照常起来，但授权接口回 503、刷新作业跳过、告警只记录不推送；配了但不合格时拒绝启动；Telegram 令牌与 chat ID 要么都配、要么都不配，只配一个也拒绝启动。
+   - 主密钥与 Telegram 令牌存进设计 P-05 的那条安全笔记。主密钥丢了，库里的平台令牌就解不开，只能两个店铺都重新授权。
 4. 建管理员账号（要交互输入密码，所以用 `-it`；`container` 照第 0.2 节取）：
    `docker exec -it "$container" python -m app.cli admin create-account <用户名> --tenant <租户 ID> --actor <操作人引用> --reason "First admin"`（参数以实现它的任务为准，[ADMIN_AUTH.md](ADMIN_AUTH.md) 第 4.6 节）。
 5. 从外网核对：
@@ -212,6 +223,21 @@ core credential list --tenant <租户 ID>
    ```
 
    记下结果；余量不够就停下，先定扩容。
+
+### 1.7 平台入口从人工切到自动（契约 0.23，PLATFORM_CHANNELS 6.2 第 5 条）
+
+平台应用获批、适配器上线之后，每个平台入口各做一次；以后从人工切回自动也照这一步做。前提：这个入口已授权（`status` 为 `active`），能力里有读订单。
+
+1. **先停止人工登记**：通知所有做人工登记的人停手，已经录了、还没提交的登记先提交或作废。切换会拒绝“接管点之后有人工登记”，但挡不住在切换同一刻才提交的登记，所以要先停。
+2. **补一次人工核对**：在卖家后台核对到当前时刻，在后台记一次核对（`checked_until` 写到当前）。核对已逾期（距上次超过 12 小时）时不补就切不了。
+3. **切换模式**：在后台把这个入口切到“自动”（`stock_admin`；接口 `POST /api/v1/admin/connections/{channel_id}/mode`，CORE-TASK-120）。
+   - 409 `MANUAL_CHECK_OVERDUE`：回第 2 步。
+   - 409 `STATE_CONFLICT`，`reason` 为 `manual_events_after_check`：核对之后又有人工登记，回第 1、2 步。
+   - 其他 409（未连接、缺能力）：先修授权或能力，不要重试切换。
+   - 成功后记下响应里的接管点 `takeover_at`。
+4. **马上手动发起一次对账**（接口 `POST /api/v1/admin/reconciliations`，CORE-TASK-125）。切换之后、这次对账跑完之前，这个入口不发布库存；定时对账不会替你发起这一次。
+5. **看对账结果**：对账记录里这一行有了结束时间、没有差异，就完成。有差异的按告警处理（差异只告警并设待核对，不改订单）；对账没跑完或报补拉没拉完的，等下一轮补拉之后再发起一次。
+6. 之后对已有自动事件的订单，后台不再允许人工登记；人工登记只用于还没有自动事件的旧订单。
 
 ---
 
