@@ -3769,3 +3769,482 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+
+  # ── 第 3 组：后台（docs/PLATFORM_CHANNELS.md 第 14.2 节 P3a～P3h；后台前端 P3i 起待前端设计批准后另登记）──
+  # 后台登录四层按 docs/ADMIN_AUTH.md 0.3（Kelvin 2026-11-23 批准）。
+  - id: CORE-TASK-095
+    title: 新增管理员账号、后台会话与登录尝试三张表，安全事件加四种账号操作类型
+    purpose: >-
+      按 docs/ADMIN_AUTH.md 0.3 第 3 节（登录一，数据层）与契约 docs/CONTRACT_V1.md 0.22 的 7.2（Q-91、Q-92）。工作包 P3a。
+      一，模型 app/models/admin_auth.py（AdminAccount、AdminSession、AdminLoginAttempt）：三张表 admin_accounts、admin_sessions、admin_login_attempts 的列、类型、可空、主键、唯一约束、检查约束、外键与索引逐项照设计第 3 节的三张表；ID 列与时间列照 app/models/catalog.py 的 ID 与 TIMESTAMP 写法，token_hash 照 app/models/service_auth.py 的 token_digest 写法（CHAR 64、区分大小写的排序规则）；指向账号的外键 ON DELETE RESTRICT；约束与索引名与设计一致。时间都由应用写，不加数据库默认值（设计第 3 节“时间”一段）。
+      app/models/__init__.py 与 alembic/env.py 照现有写法 import admin_auth 模块（本仓库 import 模块、不逐个导出类，设计里“导出三个类”按这个惯例做）。
+      二，安全事件：app/models/service_auth.py 的 EVENT_TYPES 末尾加 admin_account_created、admin_password_reset、admin_account_disabled、admin_account_enabled 四个值（契约 7.2 的 0.22 一条）。
+      三，迁移 alembic/versions/20261124_0018_admin_auth.py（revision 0018，down_revision 0017）：upgrade 建三张表、逐个写出上面的约束与索引名，并重建 security_events 的 event_type 检查约束（先删后建，同名）收这四个值；downgrade 先把这条约束恢复成原来的取值（库里有这四种事件时降级失败，降级只用于 CI 与开发库），再按依赖反序删三张表。
+      四，app/db.py 的 make_engine 加 hide_parameters=True，保留 pool_pre_ping 与把会话时区固定为 UTC 的 connect_args（设计第 3 节）。
+      明确不做：密码哈希、锁定规则、会话签发、账号命令与接口（CORE-TASK-096 到 098）；建 admin 主体（096 的建号服务做）。
+    status: ready
+    depends_on:
+      - CORE-TASK-077
+      - CORE-TASK-081
+    acceptance_criteria:
+      - 只改 allowed_change_paths；迁移为 alembic/versions/20261124_0018_admin_auth.py、down_revision 为 0017；upgrade 后 alembic check 无差异；降到 0017 再升回 head 照常，照 tests/integration/test_demo_reset_schema.py 的先例在 production 测试库上做，无论成败都在 finally 里升回 head
+      - 约束测试写在 tests/integration/test_admin_auth_schema.py，对迁移建出的表（不用 create_all）逐条验证设计第 3 节的例子 D1 至 D9，每条各被预期的那条约束、唯一约束或外键拒绝，合法的值能写入；例子要用的租户、admin 主体（直接插入 kind 为 admin、scopes 为空数组的 credentials 行）与账号由测试自己插入
+      - 同一文件验证安全事件的四个新类型能写入、表外的类型仍被 event_type 检查约束拒绝；原有的安全事件测试照常通过
+      - make_engine 开了 hide_parameters：测试用这个函数建的引擎执行一条带绑定参数、违反唯一约束的插入，捕获的异常文本里没有那个参数值
+      - 测试提交的行（含 credentials 与 security_events）都在测试自己的 finally 里按外键先后删掉，会话结束时 conftest 的 migrated_engine 降到 base 照常成功
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/models/admin_auth.py
+      - app/models/__init__.py
+      - app/models/service_auth.py
+      - alembic/env.py
+      - alembic/versions/20261124_0018_admin_auth.py
+      - app/db.py
+      - tests/integration/test_admin_auth_schema.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-096
+    title: 管理员密码哈希、登录锁定、后台会话与账号变更的规则和服务
+    purpose: >-
+      按 docs/ADMIN_AUTH.md 0.3 第 4.1 到 4.5 节（登录二，规则与服务）。工作包 P3b。
+      一，app/domain/pw_hash.py：用户名规范化与合法判定（整串匹配）、密码规则、标准库 scrypt 的哈希与校验（参数、盐长、摘要长、maxmem、存储格式与越界处理照 4.1）、DUMMY_PASSWORD_HASH。它要加载 _hashlib，测试放 tests/integration/test_pw_hash.py（pytest，不需要数据库）。
+      二，app/domain/login_throttle.py：normalize_source（IPv4、IPv4 映射的 IPv6 取其中的 IPv4、其他 IPv6 取所在 /64 网段的规范文本、其余原样）、throttle_key、source_key（无法按 UTF-8 编码的用户名按 errors=replace 编码）与窗口、两道上限的判定（4.2），纯函数、只用标准库的 hashlib.sha256 与 ipaddress；单元测试 tests/unit/test_login_throttle.py（unittest）。
+      三，app/services/admin_auth.py：utc_now（截到整秒、不带时区）；authenticate（4.3 的六步，在给的连接上完成并提交一个事务、恰好写一条登录尝试、查账号 SELECT … FOR UPDATE、数据库出错回滚后原样抛出；LoginResult 不可变、repr 不含 token）；resolve_session、revoke_session、csrf_token_for（HMAC 常量 b"core-admin-csrf"）、csrf_token_matches（4.4，ActiveSession 带 tenant_id 与 credential_id）；create_account、reset_password、disable_account、enable_account、account_exists 与 AccountError（4.5 的检查顺序与错误码）。
+      create_account 在同一事务里先在 credentials 建一个 kind 为 admin 的主体（name 为规范用户名、scopes 为空数组、channel_id 为空、status active，ID 用 new_id 的 cred 前缀），再建账号行（new_id 的 adm 前缀）指向它（契约 10 第 4 条，CORE-TASK-077 的约束）；撞唯一约束回滚并转成 already_exists。disable_account 不吊销账号的主体。所有收 now 的函数对带时区或带小数秒的 now 报 ValueError。
+      密码、哈希、会话令牌、CSRF 令牌、throttle_key 与 source_key 不进日志与异常消息。
+      明确不做：账号命令（CORE-TASK-097）、接口与 cookie（098）、登录尝试的清理作业与查看（设计第 6 节，以后另登记）。
+    status: ready
+    depends_on:
+      - CORE-TASK-095
+    acceptance_criteria:
+      - 只改 allowed_change_paths；tests/integration/test_pw_hash.py 覆盖设计例子 P1 至 P4，另有用户名以换行结尾、含大写或非 ASCII 字符、孤立代理项密码各一条
+      - tests/unit/test_login_throttle.py 覆盖窗口的上下界（下界严格大于、上界含等于、晚于现在的不算）、locked 与 success 不算失败、两道上限的先后、规范来源的四种情形；测试用 ast 读 login_throttle 的 import，只有标准库里不做 I/O 的模块
+      - 集成测试 tests/integration/test_admin_auth_service.py 对真 MySQL 覆盖例子 L1 至 L8 与 S1 至 S4，时间都由参数传入且是整秒；登录的五种结果各有一条，每次调用恰好写一条登录尝试，锁定与用户名不合法时不查账号、不做 scrypt（测试替换校验函数断言没有被调用）
+      - 建号在 credentials 里多一个 kind 为 admin、scopes 为空数组、没有入口的主体，账号的 credential_id 指向它，resolve_session 返回的 ActiveSession 带这个 credential_id 与账号的 tenant_id；租户不存在或停用得 invalid_tenant，检查顺序照 4.5 各有一条
+      - 并发：一个连接对账号 SELECT … FOR UPDATE 不提交时，另一个连接的 disable_account 等它提交（照现有并发测试用两个连接与线程的写法）；停用之后旧会话都被撤销
+      - 测试提交的数据（租户、主体、账号、会话、登录尝试）在 finally 里按外键先后删掉，会话结束时 migrated_engine 降到 base 照常成功；异常消息与日志里不出现测试用的密码与令牌原文
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；单元测试由必需 CI 检查 unit、集成测试由 integration 执行并通过
+    allowed_change_paths:
+      - app/domain/pw_hash.py
+      - app/domain/login_throttle.py
+      - app/services/admin_auth.py
+      - tests/integration/test_pw_hash.py
+      - tests/unit/test_login_throttle.py
+      - tests/integration/test_admin_auth_service.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-097
+    title: 运维命令行加管理员账号的建号、改密、停用与恢复子命令
+    purpose: >-
+      按 docs/ADMIN_AUTH.md 0.3 第 4.6 节（登录三）与契约 docs/CONTRACT_V1.md 0.22 的 7.2（Q-92）。工作包 P3c。
+      新模块 app/cli/admin.py，照 app/cli/service_auth.py 的写法接进 app/cli/__main__.py：python -m app.cli admin 下 create-account（必填 --tenant）、reset-password、disable-account、enable-account 四个子命令，都要 --actor 与 --reason（格式与校验同 credential issue）。
+      只在 CORE_ENV 为 production 且后台开关为真（CORE-TASK-073 交给子命令的开关值）时可用，否则以退出码 2、标准错误一行原因结束、不碰库；判定顺序照 4.6（argparse → 实例与开关 → 用户名合法 → 查库与提示输入密码）。
+      密码只经 getpass 不回显地输入两次，不接受命令行参数或环境变量；create-account 在提示输入之前用 account_exists 查重，reset-password 在提示之前查账号存在。命令只调 CORE-TASK-096 的服务函数与 utc_now，不另写规则或查询。
+      退出码照 Core 命令行（app/cli/__init__.py）：0 成功（含两种“已是……状态”）；2 参数或校验错误（参数不对、AccountError、两次输入不一致、实例或开关不对、输入时 EOF 或 Ctrl+C 输出“已取消”）；1 其他失败（SQLAlchemyError 只输出异常类名，不输出连接串）。成功结果写标准输出、错误写标准错误；输出只有规范用户名、账号 ID 与结果，不打印密码或哈希。
+      审计：成功（“已是……状态”除外）后在提交之后照 Core 命令行的做法记一条安全事件，类型 admin_account_created、admin_password_reset、admin_account_disabled、admin_account_enabled，tenant_id 为账号的租户、credential_id 为空（运维命令行没有操作主体，同 credential issue 的事件），actor_ref 为 --actor，details 写 reason、目标账号 ID、它的主体 credential_id 与规范用户名；事件写入失败时操作照样生效、标准错误多一行警告。
+      明确不做：接口（CORE-TASK-098）；登录尝试的查看与清理。
+    status: ready
+    depends_on:
+      - CORE-TASK-096
+      - CORE-TASK-073
+    acceptance_criteria:
+      - 只改 allowed_change_paths；测试写在 tests/integration/test_cli_admin.py，照 Core 命令行测试的写法直接调 main（参数列表、Settings、两个输出流），替换 getpass.getpass 提供输入
+      - 四个子命令各有成功一条与至少一种失败一条，退出码与输出去向照 4.6；输出含规范用户名（输入大写用户名时输出小写），不含密码、哈希、连接串，测试不逐字比对措辞
+      - CORE_ENV 为 demo、或 production 而开关为假时，四个子命令都以退出码 2 结束、库里没有变化（测试用不存在的库连接串也得同样结果，证明判在连库之前）
+      - 两次输入不一致、EOF、KeyboardInterrupt 都以退出码 2 结束、什么也不写；create-account 遇到已有用户名时 getpass 没有被调用
+      - 成功的四种操作各多一条对应类型的安全事件，details 含 reason、账号 ID、主体 ID 与规范用户名、不含密码；“已是停用状态”“已是启用状态”不记；让事件写入失败（monkeypatch 写事件的函数抛异常）时操作照样生效、退出码 0、标准错误有一行警告
+      - 测试提交的数据在 finally 里按外键先后删掉，会话结束时 migrated_engine 降到 base 照常成功
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/cli/admin.py
+      - app/cli/__main__.py
+      - tests/integration/test_cli_admin.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-098
+    title: 管理员登录、取当前会话与退出接口，后台接口共用的登录与 CSRF 依赖
+    purpose: >-
+      按 docs/ADMIN_AUTH.md 0.3 第 5 节（登录四）与契约 docs/CONTRACT_V1.md 0.22 的 8.1 的 0.22 一条（Q-93）、8.6 第 2 条的两个响应头。工作包 P3d。
+      一，app/api/admin_session.py 导出 router：POST、GET、DELETE /api/v1/admin/session，请求、响应、状态码与 detail 照 5.1 的表；登录接口是 async def，按 5.1 第 2 到 7 步判定（跨站 403、媒体类型 415、请求体 4096 字节与解析 422 不回显提交内容、进行中满 10 个 503 login_busy、经模块级 anyio.CapacityLimiter(2) 放进线程池调 authenticate、成功时撤销请求带来的旧会话且这一步出错不改变回答）；GET 与 DELETE 与依赖写成普通 def。会话 cookie 照 5.2（名字 __Host-core_admin_session）；来源地址照 5.3（X-Real-IP 恰好一个且是合法地址才用，不读 X-Forwarded-For）。5.1 列出的全部响应带 Cache-Control no-store；处理中 SQLAlchemyError 回 503 database_unreachable。
+      数据库连接用新依赖 get_connection(request)：从 request.app.state.engine 取连接、请求结束归还；登录接口在线程里自己从 engine 取连接。require_admin 与 require_admin_csrf 照 5.4（Annotated 写法，AdminPrincipal 带 account_id、username、session_id、tenant_id、credential_id），之后的后台接口都用它们。
+      二，app/main.py 的 create_app 只在后台开关为真时 include_router（CORE-TASK-073 记在 app.state 上的开关）。
+      三，app/api/requests.py 的请求中间件按路径前缀 /api/ 与 /admin/ 判断（与路由挂没挂上无关）：X-Request-ID 一律不用调用方给的值、总是生成，也不因它不合格回 400；路由 404、405 与 128 KiB 的 413 照用、格式同 /v1；这两个前缀下的每个响应都加 Content-Security-Policy 为 frame-ancestors 'none' 与 X-Frame-Options 为 DENY（契约 8.6 第 2 条）。/v1、/healthz、/readyz 的行为不变。
+      明确不做：后台执行器与业务接口（CORE-TASK-099 起）；登录页前端；登录尝试的查看与清理。
+    status: ready
+    depends_on:
+      - CORE-TASK-096
+      - CORE-TASK-073
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试 tests/integration/test_admin_session_api.py 用后台开关为真的生产应用（照 tests/integration/test_production_routes.py 建生产应用的写法）与 https 的 base URL，覆盖设计例子 A1 至 A8，A3 的两个来源用文档保留网段里的地址，A8 把模块级计数设为 10 并在 finally 里复原
+      - 三种凭据失败的响应体完全相同；422 的响应不含提交的用户名或密码；跨站、媒体类型、请求体与 busy 四种拒绝都不写登录尝试；5.1 列出的每种响应都带 Cache-Control no-store
+      - Set-Cookie 带 5.2 的全部属性；退出时以同名同属性、Max-Age 为 0 清除；X-Real-IP 出现两次或不合法时用连接对端地址，X-Forwarded-For 不影响来源
+      - 后台开关为假的生产应用与 Demo 应用上这三个路径都是 404 NOT_FOUND（Core 格式）
+      - 中间件测试写在 tests/integration/test_request_middleware.py（文件已有则加在里面，没有就新建）：/api/ 与 /admin/ 下的请求带合格或不合格的 X-Request-ID 都不回 400、响应里的 ID 是新生成的 req 前缀 ID 而不是调用方的；这两个前缀下的 404 与 200 都带两个防嵌入的响应头；/v1 与 /healthz 照旧回显合格的 ID、不带这两个头
+      - 测试提交的数据在 finally 里按外键先后删掉，会话结束时 migrated_engine 降到 base 照常成功
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_session.py
+      - app/api/requests.py
+      - app/main.py
+      - tests/integration/test_admin_session_api.py
+      - tests/integration/test_request_middleware.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  # 后台接口（工作包 P3e～P3g）：路径一律在 /api/v1/admin 下；与 /v1 对应的命令沿用 /v1 的路径（去掉开头的 /v1）、请求模型、判定与响应形状，只换身份、入口与幂等键的来源（契约 8.6 第 2 条）。
+  - id: CORE-TASK-099
+    title: 后台执行器与后台写接口的公共检查：会话、CSRF、提交键、角色、本租户与后台入口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条（写接口的检查顺序、角色、后台发起的库存管理命令）、5.10 命令体共用（后台执行器一行与入口检查）与 7.1 的后台表单防重复（Q-84、Q-86）。工作包 P3e 的前一半。只写公共部分，不挂业务路由。
+      新模块 app/api/admin_executor.py，给之后的后台接口用：
+      一，写接口的依赖按检查顺序组合：会话与 CSRF 用 CORE-TASK-098 的 require_admin_csrf（③④，拒绝时是 {"detail"} 形状）→ Idempotency-Key 用现有的 parse_idempotency_key 判格式，缺或不合格 400 INVALID_REQUEST（⑤，/v1 的错误形状）→ 请求体用现有的 json_body（⑥，同样的 422 与批量上限 413）→ 角色（⑦）→ 本租户（⑧，由各接口给出池或对象）。读接口的依赖只做 require_admin 与本租户。
+      二，角色：ADMIN_ROLES 为 catalog_admin、stock_admin、stock_operator 三个（V1 每个管理员都持有，契约 8.6 第 2 条）；assert_role(accepted) 按 Q-86 的写死规则得出断言的角色（只接受一个的断言它；接受 stock_operator 与 stock_admin 的断言 stock_admin；不要求角色的订单命令断言 stock_admin），它不在 ADMIN_ROLES 里时 403 FORBIDDEN（V1 不会发生，测试替换 ADMIN_ROLES 验证）。
+      三，backoffice_entry(connection, tenant_id, pool_id)：普通读；池不存在或属于别的租户 404 POOL_NOT_FOUND（两种的错误码与 message 完全相同），池没有 active 的 backoffice 入口 422 INVALID_REQUEST（契约没写，补的：只有组合 2 的池有后台入口）；返回入口 ID。池属于别的租户时照现有库存命令记 cross_tenant 安全事件。
+      四，admin_context(request, principal, *, role, idempotency_key, channel_id, pool_id)：组 CORE-TASK-074 的命令上下文：租户取 principal.tenant_id，入口与池取参数（目录、平台商品类命令两者都为空），操作主体取 principal.credential_id，操作者为 (principal.account_id, 断言的角色)，request_id 取中间件生成的，预留有效期为空，HTTP 三项取请求。
+      五，run_admin(request, context, operation, command, **执行器选项)：入口是 backoffice、而 operation 是契约 5 的七个订单命令之一（预留、释放、确认销售、发货、退款回库、退货验收、待审结案；取各服务模块里这七个命令的操作类型常量）时 403 FORBIDDEN，在调执行器之前判出、不取锁、不保存（契约 5.10）；否则调 CORE-TASK-074 的执行器核心，幂等作用域、重放与冲突、安全事件全照执行器。
+      明确不做：任何业务路由（CORE-TASK-100 起）；平台订单的人工操作（不走幂等记录，CORE-TASK-105 起）；后台前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-098
+      - CORE-TASK-079
+      - CORE-TASK-078
+    acceptance_criteria:
+      - 只改 allowed_change_paths；测试 tests/integration/test_admin_executor.py 在测试模块里给后台开关为真的生产应用挂测试路由（一个带 pool_id 正文的写命令与一个读命令），真实登录取得会话 cookie 与 CSRF 令牌
+      - 检查顺序逐步各有一条：请求体超过 128 KiB 413（先于会话）；没有会话 401 not_authenticated；CSRF 不符 403 csrf_failed；缺 Idempotency-Key 与格式不对各 400 INVALID_REQUEST；正文不合格 422；替换 ADMIN_ROLES 后 403 FORBIDDEN；别的租户的池与不存在的池 404 POOL_NOT_FOUND 且两者响应只差 request_id；没有后台入口的池 422；每种拒绝都不写幂等记录与流水
+      - 成功的写命令：幂等记录的 credential_id 是管理员的主体，命令体经 execution.context 读到的租户、入口（所选池的 backoffice 入口）、池、操作者 ref（adm 前缀的账号 ID）与角色、request_id 与提交键都如上；同键同内容重放得原响应与 Idempotency-Replayed，同键换内容 409 IDEMPOTENCY_CONFLICT
+      - 两个管理员用同一个提交键各提交一次互不冲突（作用域含主体）；响应形状是 /v1 的 data 与 request_id，request_id 是中间件生成的
+      - operation 为七个订单命令之一而入口是 backoffice 时 403 FORBIDDEN，命令体没有被调用、没有幂等记录、没有取命名锁（测试替换执行器核心断言没被调用）
+      - assert_role 的三种规则各有一条
+      - 测试提交的数据在 finally 里按外键先后删掉，会话结束时 migrated_engine 降到 base 照常成功
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_executor.py
+      - tests/integration/test_admin_executor.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-100
+    title: 后台的库存总览、改配额与配额变更记录接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条的库存总览与配额两页、3.1 改配额（Q-102）、审计页的配额变更。工作包 P3e 的后一半。
+      一，POST /api/v1/admin/allocations：正文同 CORE-TASK-082 的 validate_allocation_request（pool_id、sku_id、expected_version、safety_stock、quotas、reason）；pool_id 与 sku_id 的格式先按现有 ID 的校验判（不合格 422），再 backoffice_entry 判本租户与后台入口；角色 stock_admin；经 run_admin 调 CORE-TASK-090 的 update_allocations，operation 为 allocations.update，read_committed 为真，before_transaction 为 prepare_allocation_rows；响应与错误照 090。
+      二，GET /api/v1/admin/pools/{pool_id}/stock-overview?after=&limit=：只读、不要求角色；池按 backoffice_entry 判本租户（404 同上）。按 sku_id 升序列出这个池有余额行的 SKU，limit 1 到 100、不带为 100，after 是上一页最后一个 sku_id（不合格 422），响应 items 与 next_cursor（规则同契约 2.5：没有下一页时为 null）。每项：sku_id、sku_code、SKU 的 status、四个量与 available（同 /v1 余额的表示）、safety_stock 与 allocation_version（没有 pool_allocations 行时为 0 与 null）、unallocated（用 CORE-TASK-082 的 unallocated 算）、channels（这个池全部 platform 入口按 channel_id 升序，各带 channel_id、platform、quota、pending、review_hold；没有配额行的入口 quota 与 pending 为 0、review_hold 为假）。平台读数、最近发布结果与其余异常标记随第 4 组的发布任务加进来，本任务不预留字段。一次只读快照里读完（同 /v1 读接口的做法）。
+      三，GET /api/v1/admin/allocation-changes?pool_id=&sku_id=&after=&limit=：只读；pool_id 必填（判本租户同上）、sku_id 可选；按变更的主键倒序（最新在前），分页同上（after 为上一页最后一条的 ID）；每项为 allocation_changes 的各列（changes 原样输出）。
+      读的查询放新模块 app/services/admin_queries.py；接口放 app/api/admin_allocations.py，在 app/main.py 只在后台开关为真时挂上。
+      明确不做：发布到平台与读回（第 4 组）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-099
+      - CORE-TASK-090
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_allocations_api.py，用后台开关为真的生产应用、真实登录，数据用 tests/integration/platform_fixtures.py 建、finally 里 purge_tenant
+      - 契约 3.1 例子一第 6 步经本接口改配额成功、第 6′ 步 409 ALLOCATION_EXCEEDS_UNALLOCATED，响应与 CORE-TASK-090 的服务测试一致；allocation_changes 那条的 actor_ref 为管理员账号 ID、actor_role 为 stock_admin、credential_id 为管理员的主体
+      - 别的租户的池 404、没有后台入口的池 422、pool_id 格式不对 422，都不写记录；同一提交键重放得原响应
+      - 库存总览：三个 SKU、两个 platform 入口（一个入口没有配额行）时每项的各量、unallocated 与 channels 如上；limit 为 2 时第一页两项、next_cursor 为第二项的 sku_id，第二页一项、next_cursor 为 null；after 不合格 422
+      - 配额变更列表按最新在前、按 sku_id 过滤、分页正确，别的租户的池 404
+      - 后台开关为假的生产应用上这三个路径都是 404
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_allocations.py
+      - app/services/admin_queries.py
+      - app/main.py
+      - tests/integration/test_admin_allocations_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-101
+    title: 后台的目录接口：商品与 SKU 的增改停启、目录导入与目录变更记录
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条目录页与审计页、2.3、2.6、2.7（工作包 P3f 的目录部分）。
+      在 /api/v1/admin 下沿用 /v1 的目录路径：商品与 SKU 的读（单个与列表）、新建、修改、停用、重新启用，目录导入的预览、查看与确认，目录变更记录的列表；请求模型、判定、响应与错误码同 /v1 的对应接口（有生效平台商品时停用的 409 SKU_HAS_ACTIVE_LISTINGS 由 CORE-TASK-094 在服务里给出）。不做 SKU 合并（契约 8.6 第 2 条：V1 后台不做）。
+      写接口经 CORE-TASK-099 的依赖与 run_admin：角色 catalog_admin，上下文的入口与池为空（目录是租户级的），目录变更记录的作者（ChangeAuthor）从上下文组（同 CORE-TASK-076 的 /v1 写法），所以变更记录上的 credential_id 是管理员的主体、actor_ref 是账号 ID。读接口只要求登录，按管理员的租户读。
+      接口放新模块 app/api/admin_catalog.py，在 app/main.py 只在后台开关为真时挂上。命令体、请求模型与表示函数复用 /v1 的接口模块与服务，不复制判定：为此可以把 app/api/catalog.py、catalog_imports.py、catalog_changes.py 里组命令与表示的部分提成这些模块里的公共函数，/v1 的行为一点不变。
+      明确不做：SKU 合并；平台商品（CORE-TASK-102）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-099
+      - CORE-TASK-094
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_catalog_api.py，用后台开关为真的生产应用、真实登录
+      - 每个后台目录写接口各有成功一条：响应与 /v1 对应接口同形状，目录变更记录的 credential_id、actor_ref、actor_role（catalog_admin）、request_id 与 idempotency_key 取自管理员与这次提交
+      - 停用有生效平台商品的 SKU 得 409 SKU_HAS_ACTIVE_LISTINGS；版本冲突、已是目标状态等 /v1 已有的判定经后台接口得同样的结果（各挑一条）
+      - 读接口只返回管理员租户的对象，别的租户的商品与 SKU 404 且与不存在的响应只差 request_id；目录变更记录只列本租户
+      - 已有的 /v1 目录、导入与变更记录的集成测试一字不改、照常通过
+      - 没有后台路由 SKU 合并；后台开关为假的生产应用上这些路径都是 404
+      - 测试提交的数据在 finally 里按外键先后删掉，会话结束时 migrated_engine 降到 base 照常成功
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_catalog.py
+      - app/api/catalog.py
+      - app/api/catalog_imports.py
+      - app/api/catalog_changes.py
+      - app/main.py
+      - tests/integration/test_admin_catalog_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-102
+    title: 后台的平台商品接口：挂上、改挂、解除与列表
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 2.9 与 8.6 第 2 条平台商品页（工作包 P3f 的平台商品部分）。
+      一，POST /api/v1/admin/listings（挂上）、POST /api/v1/admin/listings/{listing_id}/relink（改挂）、POST /api/v1/admin/listings/{listing_id}/unlink（解除）：正文、判定、响应与错误码照 CORE-TASK-084 的三个命令体（listing_id 的格式先按现有 ID 的校验判，不合格 422）；经 CORE-TASK-099 的依赖与 run_admin，角色 catalog_admin，上下文的入口与池为空（平台商品命令的入口来自正文或平台商品行，由命令体判），执行器选项照 084（目录写锁、balance_rows 为 listing_balance_rows、before_transaction 为 prepare_listing_rows）。operation 用 084 的操作类型常量。
+      二，GET /api/v1/admin/listings?channel_id=&sku_id=&status=&after=&limit= 与 GET /api/v1/admin/listings/{listing_id}：只读、只要求登录，只列管理员租户的平台商品；过滤都可选，status 取 active 或 inactive；按 listing_id 升序，分页规则同 CORE-TASK-100（after 为上一页最后一个 listing_id）；表示同 084。别的租户的平台商品 404 LISTING_NOT_FOUND，与不存在的响应只差 request_id。
+      接口放新模块 app/api/admin_listings.py，在 app/main.py 只在后台开关为真时挂上；读的查询加在 CORE-TASK-100 建的 app/services/admin_queries.py。
+      明确不做：从平台拉规格列表逐行确认（要平台适配器，第 4 组）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-099
+      - CORE-TASK-084
+      - CORE-TASK-100
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_listings_api.py，用后台开关为真的生产应用、真实登录，数据用 platform_fixtures 建、finally 里 purge_tenant
+      - 挂上 201、改挂与解除 200，目录变更记录的 object_type 为 listing、actor_ref 为管理员账号 ID、actor_role 为 catalog_admin、credential_id 为管理员的主体
+      - 084 的错误码经接口各挑一条得到同样结果（LISTING_ALREADY_LINKED、LISTING_HAS_QUOTA、版本不符、别的租户的平台商品 404 LISTING_NOT_FOUND）；同一提交键重放得原响应
+      - 列表按三种过滤各一条、分页两页；别的租户的入口与 SKU 过滤得空列表而不是别的租户的数据
+      - 后台开关为假的生产应用上这些路径都是 404
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_listings.py
+      - app/services/admin_queries.py
+      - app/main.py
+      - tests/integration/test_admin_listings_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-103
+    title: 后台的期初导入、池切上线、收货、不可售与报损、更正接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条后台发起的库存管理命令、6.2 第 6 条、6.3 到 6.5、6.7（工作包 P3g 的前一半）。
+      在 /api/v1/admin 下沿用 /v1 的路径：期初导入的预览、查看与确认（stock-imports），池切 live（pools/{pool_id}/go-live），收货（receipts），标不可售、恢复可售与报损（unavailable-adjustments），更正（corrections）；请求模型、判定、响应与错误码同 /v1 的对应接口。
+      经 CORE-TASK-099 的依赖与 run_admin：池取正文的 pool_id 或路径的 pool_id，按对象 ID 操作的（导入的查看与确认）取对象所属的池（普通读；对象不存在或属于别的租户 404，错误码同 /v1，两种只差 request_id）；入口用 backoffice_entry 得出的这个池的后台入口，所以流水与单据的 channel_id 都是它（契约 6.2 第 6 条）。角色按契约 10 第 3 条的角色表与 assert_role：期初导入的预览与确认、池切 live、更正、报损为 stock_admin；收货、标不可售、恢复可售按规则断言 stock_admin；不可售调整按请求体里的动作定角色，角色判在请求体校验之后（同 /v1）。执行器选项同 /v1 的对应接口。
+      接口放新模块 app/api/admin_stock.py，在 app/main.py 只在后台开关为真时挂上。命令体、请求模型与表示复用 /v1 的接口模块与服务，不复制判定：为此可以把 app/api/stock_imports.py 与 stock_documents.py 里组命令与表示的部分提成公共函数，/v1 的行为一点不变。
+      明确不做：盘点（CORE-TASK-104）；余额与流水的读（104）；平台订单补进 Core（人工登记，CORE-TASK-106）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-099
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_stock_api.py，用后台开关为真的生产应用、真实登录，数据用 platform_fixtures 建（池带 platform 与 backoffice 入口）、finally 里 purge_tenant
+      - 每个接口各有成功一条：流水与单据的 channel_id 为这个池的 backoffice 入口，credential_id 为管理员的主体，actor_ref 为账号 ID，actor_role 为断言的角色；期初导入与池切 live 记录上的操作主体同样
+      - 别的租户的池与导入 404、没有后台入口的池 422、正文不合格 422，都不写流水；/v1 已有的判定经后台接口各挑一条得到同样结果（例如收货在池未切 live 时的拒绝）
+      - 同一提交键重放得原响应；已有的 /v1 期初、切 live、收货、不可售与报损、更正的集成测试一字不改、照常通过
+      - 后台开关为假的生产应用上这些路径都是 404
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_stock.py
+      - app/api/stock_imports.py
+      - app/api/stock_documents.py
+      - app/main.py
+      - tests/integration/test_admin_stock_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-104
+    title: 后台的盘点接口，提交实数前检查收件箱已清空；余额、流水与不变量自查的读接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 6.6、8.3 的 INBOX_NOT_DRAINED、6.8、4.4 与 8.6 第 2 条的盘点、审计、对账与自查页，docs/PLATFORM_CHANNELS.md 第 6.3 节（工作包 P3g 的后一半）。
+      一，盘点：在 /api/v1/admin 下沿用 /v1 的盘点路径（开单、提交实数、确认、取消、查看、列表），请求模型、判定、响应与错误码同 /v1；经 CORE-TASK-099 的依赖与 run_admin，池与入口的取法同 CORE-TASK-103（开单取正文的 pool_id，其余取盘点单所属的池）；角色按角色表与 assert_role（开单、提交、取消断言 stock_admin，确认为 stock_admin）。
+      二，提交实数之前（请求体校验与角色之后、调执行器之前）用普通读检查收件箱：这个池全部 platform 入口上未处理（applied_at 为空）的事件，所属平台订单已存在且有一行的 sku_id 在这次提交的 SKU 里，或平台订单还不存在而事件的 payload 里有一行经这个入口 active 的平台商品解析到这些 SKU 之一，就 409 INBOX_NOT_DRAINED，details.sku_ids 为这些 SKU 按升序；什么也不写、不保存幂等记录（契约 8.3：这只是提醒，不在盘点事务里锁收件箱）。“平台订单还不存在”一种是据第 6.3 节“涉及它的未处理事件”补的。检查的查询放 app/services/admin_queries.py。
+      三，读：GET /api/v1/admin/balances、/api/v1/admin/ledger、/api/v1/admin/pools/{pool_id}，参数、分页、游标与表示同 /v1 的对应接口；GET /api/v1/admin/ops/invariants 直接调不变量自查的读函数，响应同 /v1；都只要求登录，池按 backoffice_entry 判本租户（池类的 404 同上），自查只查管理员的租户（/v1 的自查按凭据的租户，写法相同）。
+      接口放新模块 app/api/admin_counts.py，在 app/main.py 只在后台开关为真时挂上；复用 /v1 的盘点、查询与自查接口模块和服务，不复制判定：可以把 app/api/counts.py 与 stock_queries.py 里组命令与表示的部分提成公共函数，/v1 的行为一点不变。
+      明确不做：平台对账结果（第 4 组）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-103
+      - CORE-TASK-093
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_counts_api.py，用后台开关为真的生产应用、真实登录，数据用 platform_fixtures 建、finally 里 purge_tenant
+      - 盘点开单、提交、确认、取消经后台各成功一条，盘点单与流水的 channel_id 为后台入口、操作主体为管理员；确认的 actor_role 为 stock_admin
+      - 收件箱检查：直接插入一条涉及所提交 SKU 的未处理事件时提交得 409 INBOX_NOT_DRAINED、details.sku_ids 正确、盘点单没有变化、没有幂等记录；平台订单还不存在、payload 经平台商品解析到这个 SKU 的事件同样拦下；事件已处理、事件涉及别的 SKU、事件在别的池的入口上时照常提交
+      - 余额、流水、池与自查的读：响应与 /v1 对应接口同形状，别的租户的池 404，自查只含管理员租户的违反项
+      - 已有的 /v1 盘点、查询与自查的集成测试一字不改、照常通过；后台开关为假的生产应用上这些路径都是 404
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_counts.py
+      - app/api/counts.py
+      - app/api/stock_queries.py
+      - app/services/admin_queries.py
+      - app/main.py
+      - tests/integration/test_admin_counts_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  # 平台订单的人工操作（工作包 P3h，拆成服务与接口各两层）：都写成收件箱里 source 为 manual 的一条事件，与处理同一个事务，不写幂等记录（契约 5.10“后台的人工操作”，Q-100）。
+  - id: CORE-TASK-105
+    title: 平台事件执行器加人工路径：先取订单锁，同一事务写收件箱并处理，按提交键去重
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 5.10 引用格式（人工登记与“平台没有给 ID”）、“后台的人工操作”的写法与情形表（Q-98、Q-100）。工作包 P3h 的人工登记部分（服务层）；接口是 CORE-TASK-106。
+      一，app/services/platform_events.py 加 process_manual_event(engine, *, tenant_id, channel_id, platform_order_id, action, payload, manual_key, request_hash, credential_id, actor_ref, actor_role, no_platform_id, confirm_possible_duplicate, reservation_ttl_seconds)：action 取 created、ready_to_ship、cancelled、shipped、return_received；payload 照 CORE-TASK-083 的 parse_payload（不合格 ValueError）。返回不可变的结果（replayed 真假、event_row_id、result、result_code、platform_order_row_id），被拒时抛 ManualRejected（status、code、details），被拒一律什么也没写。按这个先后：
+      1. 在没有打开事务的连接上 GET_LOCK(order_lock_name(…), 5)，取不到 503 UNAVAILABLE。
+      2. 普通读 (tenant_id, credential_id, manual_key) 已有的人工事件：request_hash 相同则不再处理、返回它的 result 与 result_code、replayed 为真；不同则 409 IDEMPOTENCY_CONFLICT（安全事件由调用方记）。
+      3. 平台订单不存在而 action 不是 created：404 PLATFORM_ORDER_NOT_FOUND。这个订单已有 webhook 或 pull 来源的事件、而 action 是 created、ready_to_ship、cancelled、shipped 之一：409 STATE_CONFLICT，details 为 {"reason": "auto_events_exist"}。这个订单还有别的未处理事件：409 STATE_CONFLICT，details 为 {"reason": "events_pending"}（补的：人工事件只处理它自己，先让作业处理完）。
+      4. classify（CORE-TASK-083）：missing_prior 409 STATE_CONFLICT，details 为 {"reason": "missing_prior_action", "missing": 缺的动作}；blocked 409 STATE_CONFLICT，details 为 {"reason": "order_held"}（补的：待发货被拒在待处理，先重试，CORE-TASK-107）；ignored、attention、apply 照常往下。
+      5. 单据 ID（补的：人工登记必须填平台的 ID，契约 5.10）：shipped 缺 package_id、return_received 缺 return_id、对 committed 订单的 cancelled 缺 refund_id 时，no_platform_id 为真才可以，否则 422 INVALID_REQUEST（details 带 field）；no_platform_id 为真而 payload 带了那个 ID、或用在其余动作与阶段上，422 INVALID_REQUEST。
+      6. 可能重复：no_platform_id 为真、confirm_possible_duplicate 为假，而这个订单已有同一动作、payload 也没带单据 ID、result 为 applied 的人工事件，平台行与件数完全相同（按 platform_line_id 比较各行的件数键），且平台时间（payload 的 platform_time，没有时用 received_at；这次没有 platform_time 时用数据库当前时间）相差不超过 24 小时：409 POSSIBLE_DUPLICATE，details 为 {"events": [{"event_row_id", "platform_time"}]}，按 event_row_id 升序。判定写成 app/domain/platform_events.py 里的纯函数，单元测试加在 tests/unit/test_platform_events.py。
+      7. 照 CORE-TASK-086 第 3 步预建与关单、设 READ COMMITTED；开事务；写收件箱行（new_id 的 pev 前缀，source 为 manual，platform_line_id 为空串，event_key 与 manual_key 都是这次的提交键，request_hash、credential_id 取参数，received_at 为数据库时间）；然后照 086 第 4 步的锁序与 087 到 089 的处理办法处理这一个事件，执行 Core 命令的身份是 credential_id，操作者为 actor_ref 与 actor_role。no_platform_id 为真时单据引用用 CORE-TASK-083 的 manual_document_ref(order_ref, kind, n)，n 为这个订单同一动作、payload 没带单据 ID、result 为 applied 的人工事件数加一（在订单锁下数，确定）。写 applied_at 与 result、result_code，与改动一起提交；释放锁与复原隔离级别照 086 第 7 步。
+      8. 人工路径不留给下一轮：重新解析 SKU 两次都与预建时不同、或命令两次要求整个重做，整笔回滚、503 UNAVAILABLE；数据库错误或程序异常整笔回滚后原样抛出（接口回 500），都什么也没写。
+      process_order 不处理 manual 来源的事件（它们都在登记时处理完了）；已有的自动路径行为不变。
+      明确不做：接口与平台订单的读（CORE-TASK-106）；待处理重试、映射补上后继续处理、关闭待处理单（CORE-TASK-107）。
+    status: ready
+    depends_on:
+      - CORE-TASK-089
+    acceptance_criteria:
+      - 只改 allowed_change_paths；集成测试写在 tests/integration/test_platform_events_manual.py，数据用 platform_fixtures 建（连接 mode 为 manual）、每个测试用自己的租户并在 finally 里 purge_tenant
+      - 人工模式下依次登记 created、ready_to_ship、shipped（带包裹 ID）得契约 5.10 例子第 1 种同样的账面结果，收件箱三行都是 manual、applied_at 有值，流水上的操作主体是传入的 credential_id、actor_ref 与角色如传入
+      - 情形表逐行各一条，被拒后收件箱、平台订单、配额与流水都没有变化：另一个连接持有订单锁 503；未建订单就登记 ready_to_ship 404 PLATFORM_ORDER_NOT_FOUND；未登记待发货就登记交运 409 missing_prior_action；有 webhook 事件的订单登记 shipped 409 auto_events_exist（而登记 return_received 不受限）；有别的未处理事件 409 events_pending；held 且待发货已处理过的订单登记交运 409 order_held
+      - 同一提交键同内容再交 replayed 为真、不再处理；换内容 409 IDEMPOTENCY_CONFLICT
+      - 平台没有给 ID：第一次交运的引用以 m1 结尾，第二次（新提交键、件数不同）以 m2 结尾；与已有的无 ID 交运平台行件数相同、时间在 24 小时内时 409 POSSIBLE_DUPLICATE 列出那个事件，带确认再交生效且得 m2；缺包裹 ID 又没勾选 422，勾选了又带 ID 422
+      - 处理中让一条语句失败（monkeypatch）时整笔回滚、没有收件箱行，异常抛出；process_order 对这个订单没有可处理的事件
+      - 单元测试覆盖可能重复的判定：件数不同、动作不同、时间相差超过 24 小时、对方带单据 ID、对方未生效各不算重复，恰好 24 小时算
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_events.py
+      - app/domain/platform_events.py
+      - tests/unit/test_platform_events.py
+      - tests/integration/test_platform_events_manual.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-106
+    title: 后台的平台订单人工登记接口，平台订单列表与详情
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条（人工登记、待处理与审计页；写接口的检查顺序第 ⑨ 步换成平台事件执行器）、5.10“后台的人工操作”（工作包 P3h 的人工登记部分，接口层）。
+      一，POST /api/v1/admin/platform-orders/events：正文 channel_id、platform_order_id（1 到 128 个字符、不含控制字符）、action、payload（JSON 对象，按 action 用 parse_payload 校验）、no_platform_id 与 confirm_possible_duplicate（可选布尔，默认假）；多出来的键或值为 null 都 422（同 /v1 的请求模型）。检查顺序：require_admin_csrf → Idempotency-Key（缺或不合格 400）→ 正文 422 → 角色（stock_operator 与 stock_admin，断言 stock_admin）→ 本租户：入口不存在或属于别的租户 404 NOT_FOUND（两种只差 request_id），是本租户的但不是 platform 或不是 active 422 INVALID_REQUEST → request_hash 用现有 /v1 的 request_digest（空路径参数与正文）→ 调 CORE-TASK-105 的 process_manual_event（credential_id 为管理员的主体，actor_ref 为账号 ID，actor_role 为断言的角色，提交键作 manual_key，预留有效期取 app.state 上的设置）。不经幂等执行器、不写幂等记录。
+      成功 200，data 为 event_row_id、result、result_code 与 platform_order（平台订单的表示，见下）；replayed 时同样 200 并带响应头 Idempotency-Replayed 为 true；ManualRejected 按它的 status、code、details 回 /v1 的错误形状；IDEMPOTENCY_CONFLICT 时照执行器的写法记一条 idempotency_conflict 安全事件；其余异常回 500 INTERNAL_ERROR。
+      二，GET /api/v1/admin/platform-orders?channel_id=&stage=&attention=&after=&limit=：只读、只要求登录、只列管理员租户的；过滤都可选（attention 取 any 时列出 attention 非空的）；按 platform_order_row_id 倒序（最新在前），分页同 CORE-TASK-100。GET /api/v1/admin/platform-orders/{platform_order_row_id}：平台订单的表示（platform_order_row_id、channel_id、platform_order_id、order_ref、stage、attention、attention_code、ready_at、created_at、updated_at、lines 与 events）；lines 为各行除 known_discrepancy_note 外的列（按 platform_line_id 升序），events 为各事件的 event_row_id、action、source、event_key、payload、received_at、applied_at、result、result_code（按 received_at、event_row_id 升序）；别的租户的或不存在的 404 PLATFORM_ORDER_NOT_FOUND，两种只差 request_id。
+      接口放新模块 app/api/admin_platform_orders.py，在 app/main.py 只在后台开关为真时挂上；读的查询加在 app/services/admin_queries.py。
+      明确不做：待处理重试、继续处理、关闭待处理单与人工核对的接口（CORE-TASK-108）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-105
+      - CORE-TASK-100
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_platform_orders_api.py，用后台开关为真的生产应用、真实登录，数据用 platform_fixtures 建、finally 里 purge_tenant
+      - 经接口登记 created、ready_to_ship、shipped 成功，响应的 platform_order 与库里一致，流水的 actor_ref 为账号 ID、actor_role 为 stock_admin、credential_id 为管理员的主体；没有新的幂等记录
+      - 同键同内容再交 200 带 Idempotency-Replayed；换内容 409 IDEMPOTENCY_CONFLICT 并多一条 idempotency_conflict 安全事件
+      - 检查顺序：没有会话 401、CSRF 不符 403、缺提交键 400、payload 不合格 422、别的租户的入口 404、本租户的 backoffice 入口 422，都不写收件箱；105 的情形经接口各挑两条（503 用另一个连接持有订单锁，409 missing_prior_action）得到同样的码与 details
+      - 列表按三种过滤与分页各有一条，只含本租户；详情的 lines 与 events 如上，别的租户的 404
+      - 后台开关为假的生产应用上这些路径都是 404
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_platform_orders.py
+      - app/services/admin_queries.py
+      - app/main.py
+      - tests/integration/test_admin_platform_orders_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-107
+    title: 平台事件执行器加待处理重试、映射补上后继续处理与关闭平台已取消的待处理单
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条（待处理重试、映射补上之后继续处理、关闭平台已取消的待处理单）、5.10“后台的人工操作”与 3.2 的 held_order_closed（工作包 P3h 的其余部分，服务层）。
+      三种操作都照 CORE-TASK-105 的人工路径做（第 1、2 步的订单锁与提交键去重、第 7、8 步的事务、预建与“不留给下一轮”），写一条 source 为 manual 的收件箱行，但不经 classify、不受 auto_events_exist 与 events_pending 以外的情形限制（契约 5.10 引用格式第 3 条：这三种不受已有自动事件的限制；有别的未处理事件时仍 409 events_pending）。CORE-TASK-083 说这两种“不是收件箱事件、不经 classify”，这里按契约 8.6 第 2 条“都写成收件箱里的一条事件”记一行以便去重与审计，处理仍不经 classify。
+      process_manual_event 加参数 operation：register（默认，即 105 的人工登记）、retry、resume、close；后三种由平台订单行 ID 指定订单（不存在或属于别的租户 404 PLATFORM_ORDER_NOT_FOUND），不收 action 与 payload，收件箱行的 action 与 payload 如下。
+      一，retry（待处理重试）：订单须为 held、ready_at 已记、attention 不是 unmapped，否则 409 STATE_CONFLICT，details 为 {"reason": "not_retryable", "stage", "attention"}。收件箱行 action 为 ready_to_ship、payload 为空对象。照 CORE-TASK-088 再做一次待发货：一个保存点里预留并确认销售，成功则 committed、pending 照减、清空 attention；再被拒则留在 held、attention 与 attention_code 照 088 改写。result 与 result_code 照 088。
+      二，resume（映射补上后继续处理）：订单须为 held 且 attention 为 unmapped，否则 409 STATE_CONFLICT（reason 为 not_unmapped）。在锁内按入口 active 的平台商品（FOR SHARE）重新解析 sku_id 为空的各行；仍有解析不到的 409 STATE_CONFLICT，details 为 {"reason": "still_unmapped", "platform_line_ids": 按升序}，什么也不写。都解析到时：写各行的 sku_id，按 CORE-TASK-086 的 created 对这些行扣配额、记 quota_taken、pending 加剩余件数（quantity 减 cancelled_qty），清空 attention、stage 改回 unpaid；ready_at 已记的再照一做一次待发货。收件箱行 action 为 created、payload 为这个订单各行的 created 形状（platform_line_id、platform_item_id、platform_model_id、quantity）。
+      三，close（关闭平台已取消的待处理单）：订单须为 held，否则 409 STATE_CONFLICT（reason 为 not_held）。收件箱行 action 为 cancelled、payload 为空对象（取消全部剩余件数），照 CORE-TASK-087 扣数之前的取消处理；同一事务里写一条 platform_ops_log，action 为 held_order_closed，before 与 after 为 {"platform_order_row_id", "stage"}，操作主体与操作者取参数，request_id 为这一行的 event_row_id。
+      明确不做：接口（CORE-TASK-108）；清除已确认单的待处理标记、记已知差异（以后与其余运营操作一起登记）。
+    status: ready
+    depends_on:
+      - CORE-TASK-105
+    acceptance_criteria:
+      - 只改 allowed_change_paths；集成测试写在 tests/integration/test_platform_events_manual_ops.py，数据用 platform_fixtures 建、每个测试用自己的租户并在 finally 里 purge_tenant
+      - 重试：待发货因库存不足进 held 后补货再重试，订单 committed、pending 减到 0、Core 有预留与确认销售；仍不足时留在 held、attention_code 为 Core 的错误码；对 unpaid 或 unmapped 的订单重试 409 not_retryable
+      - 继续处理：一行找不到平台商品而 held 的订单，挂上平台商品后继续，那一行有了 sku_id、quota_taken 与 pending 照 created 的规则、订单回到 unpaid；ready_at 已记的直接走到 committed；还有一行挂不上时 409 still_unmapped、什么也不写
+      - 关闭：held 的订单关闭后为 cancelled，pending 减去剩余件数、按 CORE-TASK-087 的规则不加回配额（held 的订单不加回），platform_ops_log 多一条 held_order_closed；对 unpaid 的订单关闭 409 not_held
+      - 三种操作在订单已有 webhook 事件时照样可做；同一提交键同内容再交 replayed、不再处理，换内容 409 IDEMPOTENCY_CONFLICT；另一个连接持有订单锁时 503、什么也不写
+      - 105 的人工登记与 process_order 的已有测试照常通过
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/services/platform_events.py
+      - tests/integration/test_platform_events_manual_ops.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
+
+  - id: CORE-TASK-108
+    title: 后台的待处理重试、继续处理、关闭待处理单与人工核对接口
+    purpose: >-
+      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条、3.2 的 manual_checks 与 platform_ops_log、人工核对逾期规则（Q-99）（工作包 P3h 的其余部分与核对记录，接口层）。
+      一，POST /api/v1/admin/platform-orders/{platform_order_row_id}/retry、/resume、/close：没有请求体（同 /v1 不带正文的写接口）；检查顺序与响应同 CORE-TASK-106 的人工登记接口（角色 stock_operator 与 stock_admin，断言 stock_admin；request_hash 用 request_digest 算路径参数与空正文；不写幂等记录），调 CORE-TASK-107 的对应 operation；平台订单行 ID 格式不对 422，别的租户的或不存在的 404 PLATFORM_ORDER_NOT_FOUND。
+      二，记人工核对：新服务模块 app/services/manual_checks.py 的命令体 record_manual_check(execution, body)：正文 channel_id、checked_from、checked_until（带时区的 RFC 3339，转成 UTC 微秒）、found_discrepancy（布尔）、note（可选，去掉首尾空白后 1 到 500 个字符、不含控制字符）；入口须是这个租户的 platform 入口（不存在或别的租户 404 NOT_FOUND，不是 platform 422）；checked_from 不早于 checked_until 422；事务里 checked_until 晚于数据库当前时间 422（契约 3.2）。写一行 manual_checks（new_id 的 mck 前缀，操作主体列取上下文）与一条 platform_ops_log（action 为 manual_check_recorded，after 为 {"channel_id", "checked_from", "checked_until", "found_discrepancy"}，before 为空），与幂等记录同一事务；返回这一行的表示，201。
+      POST /api/v1/admin/manual-checks 经 CORE-TASK-099 的依赖与 run_admin：角色 stock_operator 与 stock_admin（断言 stock_admin），上下文的入口与池为空，operation 为 manual_checks.create。
+      三，GET /api/v1/admin/manual-checks?channel_id=&after=&limit=：channel_id 必填（本租户的 platform 入口，否则 404 或 422 同上），按 checked_until 倒序、再按 ID 倒序，分页同 CORE-TASK-100；响应另带 overdue，用 CORE-TASK-082 的 manual_check_overdue 按这个入口连接行的 mode 与 mode_changed_at、最近一次 checked_until 与数据库当前时间算。
+      接口放新模块 app/api/admin_platform_ops.py，在 app/main.py 只在后台开关为真时挂上；读的查询加在 app/services/admin_queries.py。
+      明确不做：其余运营操作（写入暂停、解除读回待核对、确认人工配额、清除待处理标记、记已知差异、确认告警、对账、连接，随第 4 组或另行登记）；前端。
+    status: ready
+    depends_on:
+      - CORE-TASK-107
+      - CORE-TASK-106
+    acceptance_criteria:
+      - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_platform_ops_api.py，用后台开关为真的生产应用、真实登录，数据用 platform_fixtures 建、finally 里 purge_tenant
+      - retry、resume、close 经接口各成功一条，各得 107 的结果；同键重放带 Idempotency-Replayed；别的租户的平台订单 404；没有会话 401、CSRF 不符 403、缺提交键 400，都不写收件箱
+      - 记人工核对 201：manual_checks 一行与 platform_ops_log 一条，操作主体为管理员、actor_ref 为账号 ID、actor_role 为 stock_admin；checked_until 晚于数据库时间 422、checked_from 不早于 checked_until 422、backoffice 入口 422、别的租户的入口 404，都什么也不写；同一提交键重放得原响应
+      - 核对列表的排序、分页与 overdue：manual 入口最近一次核对在 13 小时前为真、补一次核对后为假，auto 入口为假
+      - 后台开关为假的生产应用上这些路径都是 404
+      - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+      - app/api/admin_platform_ops.py
+      - app/services/manual_checks.py
+      - app/services/admin_queries.py
+      - app/main.py
+      - tests/integration/test_admin_platform_ops_api.py
+    allowed_commands:
+      - tests.unit
+      - lint.check
+      - format.check
+    creates_branch: true
+    creates_pull_request: true
