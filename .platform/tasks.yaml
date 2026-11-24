@@ -4879,6 +4879,7 @@ tasks:
     status: ready
     depends_on:
       - CORE-TASK-098
+      - CORE-TASK-125
     acceptance_criteria:
       - 只改 allowed_change_paths；测试 tests/integration/test_admin_static.py 用 pytest 的临时目录放一个假的 index.html 与一个资源文件，用后台开关为真的生产应用经 admin_static_dir 指向它
       - /admin/ 与 /admin/stock/sku_x 都回 index.html 的内容、no-cache；资源文件回原内容与长缓存；HEAD 同样的头、没有正文
@@ -5045,7 +5046,7 @@ tasks:
   - id: CORE-TASK-134
     title: 后台库存总览页与单个 SKU 的配额页：四个量、配额、未分配、读取时间与改配额
     purpose: >-
-      按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节库存总览与 SKU 详情两行、第 5.3 节的配额冲突，契约 3.1（改配额、两种冲突自动重读、读取时间）。调 CORE-TASK-100 的 GET pools、stock-overview、allocation-changes 与 POST allocations，CORE-TASK-149 加的 as_of 与 sku_ids，CORE-TASK-102 的 GET listings。 新页面 pages/stock/StockOverviewPage.tsx（/admin/stock，也是 /admin/ 的落点）与 pages/stock/SkuAllocationPage.tsx（/admin/stock/{sku_id}）。总览每行显示 sku_code、状态、四个量与 available、S、各平台入口的 Q 与 pending、F（为负标超额）、待核对与待生效标记；顶部显示读取时间 as_of。 配额页：S 与各入口 Q 的表单、reason 必填、只提交改了的入口、expected_version 取 allocation_version、expected_quota 取页面上的值；表单旁按新值算 F 撇的预览（纯函数）；VERSION_CONFLICT 与 QUOTA_CHANGED 用 sku_ids 只重读这一个 SKU、并排标出新旧值、管理员确认后换新键再交；其余 409 按设计第 5.3 节给下一步链接；下方列配额变更记录与这个 SKU 的平台商品。 上线后人工点检（不挡合并）：总览能翻页、某个 SKU 改一次配额成功并出现在变更记录里。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
+      按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节库存总览与 SKU 详情两行、第 5.3 节的配额冲突，契约 3.1（改配额、两种冲突自动重读、读取时间）。调 CORE-TASK-100 的 GET pools、stock-overview、allocation-changes 与 POST allocations，CORE-TASK-149 加的 as_of 与 sku_ids，CORE-TASK-102 的 GET listings。 新页面 pages/stock/StockOverviewPage.tsx（/admin/stock，也是 /admin/ 的落点）与 pages/stock/SkuAllocationPage.tsx（/admin/stock/{sku_id}）。总览每行显示 sku_code、状态、四个量与 available、S、各平台入口的 Q 与 pending、F（为负标超额）、待核对标记（设计第 2.2 节的待生效标记先不做：契约 3.2 的判定在平台卖出时会误报，待契约改好另行登记）；顶部显示读取时间 as_of。 配额页：S 与各入口 Q 的表单、reason 必填、只提交改了的入口、expected_version 取 allocation_version、expected_quota 取页面上的值；表单旁按新值算 F 撇的预览（纯函数）；VERSION_CONFLICT 与 QUOTA_CHANGED 用 sku_ids 只重读这一个 SKU、并排标出新旧值、管理员确认后换新键再交；其余 409 按设计第 5.3 节给下一步链接；下方列配额变更记录与这个 SKU 的平台商品。 上线后人工点检（不挡合并）：总览能翻页、某个 SKU 改一次配额成功并出现在变更记录里。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
       - CORE-TASK-133
@@ -5077,6 +5078,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节商品与 SKU 一行，契约 2.6（目录命令）、8.6 第 2 条（不做 SKU 合并）。调 CORE-TASK-101 沿用 /v1 的目录读写路径（在 /api/v1/admin 下）。 新页面 pages/catalog/CatalogSearchPage.tsx（/admin/catalog：按 sku_code 或条码查找，另列出库存总览里有余额行的 SKU）、pages/catalog/ProductPage.tsx（/admin/catalog/products/{product_id}：商品与它的 SKU，新建 SKU）、pages/catalog/SkuPage.tsx（/admin/catalog/skus/{sku_id}）；新建商品的表单放在查找页。 修改带 expected_version；VERSION_CONFLICT 重读后让管理员确认；停用遇 SKU_HAS_ACTIVE_LISTINGS 链到按这个 SKU 过滤的平台商品页；SKU_CODE_TAKEN、SKU_CODE_RETIRED、BARCODE_TAKEN 标在对应字段上。说明类字段旁提示不写顾客资料。 上线后人工点检（不挡合并）：查到一个 SKU、改一次名称成功。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-134
       - CORE-TASK-133
       - CORE-TASK-101
     acceptance_criteria:
@@ -5130,6 +5132,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节平台商品一行，契约 2.9。调 CORE-TASK-102 的 GET listings 与单个读，POST listings、listings/relink、listings/unlink；入口取 CORE-TASK-100 的 GET pools。 新页面 pages/listings/ListingsPage.tsx（/admin/listings，筛选放查询串）与 pages/listings/ListingFormPage.tsx（挂上、改挂、解除三种表单）。 挂上：入口、平台商品 ID、规格 ID（没有规格填减号）、SKU（SkuPicker）、原因；改挂与解除带 expected_version。LISTING_ALREADY_LINKED、LISTING_SKU_TAKEN、LISTING_HAS_QUOTA 各给一句说明与下一步链接（后者链到 SKU 的配额页）。 从平台拉规格列表不在本任务（设计第 9 节 G7）。 上线后人工点检（不挡合并）：挂上一个平台规格再解除。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-136
       - CORE-TASK-133
       - CORE-TASK-102
     acceptance_criteria:
@@ -5156,6 +5159,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节期初与上线切换一行（CSV 的 SKU 列填编码，按编码逐个换成 sku_id）、第 4.3 节（确认只许同键重试），契约 6.3、PLATFORM_CHANNELS 第 6.1 节。调 CORE-TASK-103 沿用 /v1 的 stock-imports 预览、查看、确认与 pools/{pool_id}/go-live，CORE-TASK-104 的 GET pools/{pool_id}，CORE-TASK-101 的 GET skus?sku_code=。 新页面 pages/stockImports/StockImportNewPage.tsx、pages/stockImports/StockImportPage.tsx（import_id 在路径里）、pages/stockImports/GoLivePage.tsx（确认对话框写明切换后不能回到初始化；成功后提示去人工登记补已付款未发货的平台订单）。池已 live 时期初入口不显示。 上线后人工点检（不挡合并）：池在初始化时打开期初页能预览（不确认）。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-137
       - CORE-TASK-133
       - CORE-TASK-103
       - CORE-TASK-104
@@ -5184,6 +5188,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节收货、不可售与报损、更正与审计的流水一行，第 4.5 节（页面生成的业务引用）。契约 6.4、6.5、6.7、6.8。调 CORE-TASK-103 沿用 /v1 的 receipts、unavailable-adjustments、corrections，CORE-TASK-104 的 GET ledger。 新页面 pages/stockOps/ReceiptPage.tsx、pages/stockOps/AdjustmentPage.tsx（标不可售、恢复可售、报损三选一，reason_code 必填）、pages/stockOps/LedgerPage.tsx（/admin/audit/ledger：先选 SKU，可选起止时间；每条可更正这条）、pages/stockOps/CorrectionPage.tsx（只从流水进入，带原流水 entry_id）。 receipt_ref 与 adjustment_ref 由页面生成、line_ref 为行号；结果未知后放弃时保留引用（设计第 4.3 节）；BUSINESS_REF_CONFLICT 按设计第 5.3 节提示上次已生效；already_corrected 链到这个 SKU 的流水。 上线后人工点检（不挡合并）：对一个测试 SKU 收货 1 件、在流水里看到它。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-138
       - CORE-TASK-133
       - CORE-TASK-103
       - CORE-TASK-104
@@ -5238,6 +5243,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节平台订单与待处理一行，契约 5.10 与 8.6 第 2 条后台对平台订单的操作。调 CORE-TASK-106 的 GET platform-orders 与单个读，CORE-TASK-108 的 retry、resume、close。 新页面 pages/platformOrders/PlatformOrdersPage.tsx（/admin/platform-orders：入口、阶段、标记的筛选，预设待处理与有标记两个视图）与 pages/platformOrders/PlatformOrderPage.tsx（订单头、各行、事件按时间列出；held 时显示三个按钮，结果按设计第 5 节显示）。 平台订单号只在正文与页面上显示，不进路径与查询串（路径用 platform_order_row_id）。 上线后人工点检（不挡合并）：打开待处理视图与一张订单的详情。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-140
       - CORE-TASK-133
       - CORE-TASK-106
       - CORE-TASK-108
@@ -5291,6 +5297,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节人工核对一行，契约 3.2 的人工核对与逾期规则，PLATFORM_CHANNELS 第 6.2 节第 3 条。调 CORE-TASK-109 的 GET 与 POST manual-checks；入口取 CORE-TASK-100 的 GET pools。 新页面 pages/manualChecks/ManualChecksPage.tsx（/admin/manual-checks：每个 platform 入口一栏，显示服务端给的 overdue 与最近的核对，翻页看更早的）。表单：起止时间（起点默认上一次的 checked_until）、是否发现差异、说明；填到现在按钮填浏览器时间减 1 分钟；结束时间晚于服务器时间的 422 显示对应提示。 上线后人工点检（不挡合并）：页面显示两个入口的逾期状态。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-142
       - CORE-TASK-133
       - CORE-TASK-109
     acceptance_criteria:
@@ -5315,6 +5322,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节连接一行，PRODUCTION_RUNBOOK 第 1.7 节，PLATFORM_CHANNELS 第 2 节与第 6.2 节第 5 条。调 CORE-TASK-116 的 GET connections、POST authorize、disconnect，CORE-TASK-120 的 POST mode。 新页面 pages/connections/ConnectionsPage.tsx（/admin/connections）。授权成功后用 location.assign 整页跳到 redirect_path；带 oauth 参数（authorized、failed、expired）打开时显示提示并用 history.replaceState 去掉参数；按钮旁写明看到错误页就回来重新授权。 切到自动前逐项勾选运行手册第 1.7 节的前两步再提交；MANUAL_CHECK_OVERDUE 与 STATE_CONFLICT 的 manual_events_after_check 各给下一步；成功后显示 takeover_at 并提示马上手动发起一次对账（链到对账页）。断开与切换用确认对话框。 上线后人工点检（不挡合并）：页面显示两个入口的模式与状态。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-143
       - CORE-TASK-133
       - CORE-TASK-116
       - CORE-TASK-120
@@ -5341,6 +5349,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.1 节横幅区（未确认告警、人工核对逾期两条）、第 2.2 节告警、对账、不变量自查三行，PLATFORM_CHANNELS 第 7、8 节。调 CORE-TASK-125 的 GET alerts、POST alerts/{alert_id}/ack、POST incident-decisions、GET 与 POST reconciliations，CORE-TASK-104 的 GET ops/invariants，CORE-TASK-116 的 GET connections 与 CORE-TASK-109 的 GET manual-checks（横幅）。 新页面 pages/alerts/AlertsPage.tsx（默认未确认；确认；记决定的表单）、pages/alerts/ReconciliationsPage.tsx、pages/alerts/InvariantsPage.tsx；Layout 的横幅区在切换页面时刷新（不轮询）：有未确认告警、某个人工模式入口逾期。 already_acked 当作成功刷新；reconcile_pending 提示 15 分钟内不能重复发起。 上线后人工点检（不挡合并）：打开告警与对账页，横幅与实际状态一致。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-144
       - CORE-TASK-133
       - CORE-TASK-104
       - CORE-TASK-109
@@ -5371,6 +5380,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节审计一行（流水标签已在 CORE-TASK-139），契约 2.7、3.1 的配额变更记录。调 CORE-TASK-101 的 GET catalog-changes 与 CORE-TASK-100 的 GET allocation-changes。 新页面 pages/audit/CatalogChangesPage.tsx 与 pages/audit/AllocationChangesPage.tsx；显示 actor_ref、actor_role、request_id、原因与时间，changes 按键值对展开。 上线后人工点检（不挡合并）：两个标签页能翻页。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-145
       - CORE-TASK-139
       - CORE-TASK-100
       - CORE-TASK-101
@@ -5392,18 +5402,21 @@ tasks:
     creates_branch: true
     creates_pull_request: true
   - id: CORE-TASK-147
-    title: 后台其余运营操作的按钮：写入暂停、解除待核对、确认人工配额生效、清除标记与记已知差异
+    title: 后台其余运营操作的按钮：写入暂停、解除待核对、清除待处理标记与记已知差异
     purpose: >-
-      按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节连接、库存总览与平台订单详情三行里依赖缺口 G5 的按钮，第 2.1 节横幅区的自动写平台已暂停，PLATFORM_CHANNELS 第 5 节（已设上时设上不可用）与第 6.2 节第 3、4 条。调 G5 的后端任务登记的接口（见 depends_on）。 新组件 pages/ops/WritePauseCard.tsx（放在连接页：当前状态、设上与解除，原因必填；解除前用确认对话框提醒先确认恢复后的对账已跑完、差异已处理，服务端不判这一条，CORE-TASK-151）与 pages/ops/OpsButtons.tsx（解除待核对、确认人工配额已生效两个按钮放在 SKU 的配额页对应入口旁；清除已确认单的待处理标记、记已知差异放在平台订单详情）；横幅区加写入暂停一条。 上线后人工点检（不挡合并）：写入暂停的状态显示正确（不操作）。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
+      按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节连接、库存总览与平台订单详情三行里依赖缺口 G5 的按钮，第 2.1 节横幅区的自动写平台已暂停，PLATFORM_CHANNELS 第 5 节（已设上时设上不可用）与第 6.2 节第 3、4 条。调 G5 的后端任务登记的接口（见 depends_on）。 新组件 pages/ops/WritePauseCard.tsx（放在连接页：当前状态、设上与解除，原因必填；解除前用确认对话框提醒先确认恢复后的对账已跑完、差异已处理，服务端不判这一条，CORE-TASK-151）与 pages/ops/OpsButtons.tsx（解除待核对按钮放在 SKU 的配额页对应入口旁，带页面上看到的 review_since；确认人工配额已生效不在本任务，待契约 3.2 改好另行登记；清除已确认单的待处理标记、记已知差异放在平台订单详情）；横幅区加写入暂停一条。 上线后人工点检（不挡合并）：写入暂停的状态显示正确（不操作）。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-146
       - CORE-TASK-141
       - CORE-TASK-144
       - CORE-TASK-151
       - CORE-TASK-152
       - CORE-TASK-153
+      - CORE-TASK-134
+      - CORE-TASK-145
     acceptance_criteria:
-      - api/ops.ts 的测试：五种操作的正文与 G5 后端任务写定的一致，结果按设计第 5 节分类
+      - api/ops.ts 的测试：四种操作（设上与解除写入暂停、解除待核对、清除待处理标记、记已知差异）的正文与 G5 后端任务写定的一致，结果按设计第 5 节分类
       - 设上按钮在已设上时不可用、解除在未设上时不可用，判断在纯函数里并有测试
       - 横幅的写入暂停一条按读到的状态显示，有测试
       - 改动只落在 allowed_change_paths；不改 frontend/package.json 与 frontend/package-lock.json、.platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；前端检查（lint、类型检查、vitest、构建与产物检查）由 PR 的必需 CI 检查 frontend 执行并通过
@@ -5428,6 +5441,7 @@ tasks:
       按 docs/ADMIN_FRONTEND.md 0.1（Kelvin 2026-11-24 批准） 第 2.2 节库存总览一行的平台读数与最近发布结果（第 9 节 G1）。调 CORE-TASK-150 在总览 channels 每项加的两组字段。 改 pages/stock/StockOverviewPage.tsx 与 SkuAllocationPage.tsx：每个入口显示最近读数与时间、最近发布的目标值、平台确认值、结果与时间；读数与 Q 不等时标出。 上线后人工点检（不挡合并）：自动模式的入口显示读数。 页面经 CORE-TASK-131 的 lib/request.ts 发请求、按它的分类显示错误（设计第 4.1、5 节），写表单用 lib/submission.ts 的提交键状态机（第 4.2、4.3 节），列表用 lib/paging.ts（第 4.6 节），时间用 TimeText（第 4.4 节）；不用 localStorage、sessionStorage、indexedDB、document.cookie 与 dangerouslySetInnerHTML（ESLint 规则已挡）；能不依赖 DOM 的逻辑（正文拼法、响应解析、页面上的判断）写在 src/api/ 的模块里并有 vitest 测试，组件只接线。新页面在 src/App.tsx 的路由表与 src/components/Layout.tsx 的导航里各加一行。
     status: ready
     depends_on:
+      - CORE-TASK-147
       - CORE-TASK-134
       - CORE-TASK-150
     acceptance_criteria:
@@ -5448,10 +5462,7 @@ tasks:
   - id: CORE-TASK-149
     title: 库存总览加读取时的数据库时间，并可按一组 SKU 只读这几行
     purpose: >-
-      按契约 docs/CONTRACT_V1.md 0.22 的 3.1（配额页面标出这些数的读取时间，即数据库时间）与 6.8 余额的 sku_ids 规则，docs/ADMIN_FRONTEND.md 第 9 节缺口 G2、G3（库存总览与 SKU 详情的配额表单，冲突后只重读这一个 SKU）。在 CORE-TASK-100 的 GET /api/v1/admin/pools/{pool_id}/stock-overview 上补，接口在 app/api/admin_allocations.py、查询在 app/services/admin_queries.py；检查顺序、本租户判定（backoffice_entry 与 admin_not_found）、分页规则与每项的表示都不变。
-      一，as_of：响应的 data 在 items 与 next_cursor 之外加 as_of，是读这一页的只读快照事务里读到的数据库时间（取法同 app/services/reservations.py 的 database_now，在这个事务里读表之前先读它，所以页面上的数不会比它旧），格式用 app/api/catalog.py 的 RFC 3339 微秒 Z 格式化函数。每次响应都带，带不带 sku_ids 都一样。
-      二，可选查询参数 sku_ids：逗号分隔的 1 到 100 个 sku_id，用 app/domain/stock.py 现有的 parse_sku_ids 判（空串、空项、重复、超过 100 个都 422 INVALID_REQUEST），每一项再按 CORE-TASK-100 的 is_admin_id 判 ID 形状，不合格 422。带 sku_ids 时不分页（补的：100 个正好是一页的上限，一次读完，与 6.8 余额一致）：同时带 after 或 limit 422 INVALID_REQUEST，next_cursor 恒为 null。只返回所列 SKU 中在这个池有余额行的，按 sku_id 升序，每项与不带 sku_ids 时同一 SKU 那一项完全相同；没有余额行的、不存在的、属于别的租户的 SKU 不出现，也不报错、不记安全事件（同契约 6.8 余额与 2.6 第 6 条的 ids：查询本来就限在本租户的池里）。参数的判定在 pool_id 的形状判定之后、查库之前；pool_id 的本租户判定照旧先于读数。
-      明确不做：平台读数与最近发布结果（CORE-TASK-150）；其余后台接口；前端。
+      按契约 docs/CONTRACT_V1.md 0.23 的 3.1（配额页面标出这些数的读取时间，即数据库时间）与 6.8 余额的 sku_ids 规则，docs/ADMIN_FRONTEND.md 第 9 节缺口 G2、G3（库存总览与 SKU 详情的配额表单，冲突后只重读这一个 SKU）。在 CORE-TASK-100 的 GET /api/v1/admin/pools/{pool_id}/stock-overview 上补，接口在 app/api/admin_allocations.py、查询在 app/services/admin_queries.py；检查顺序、本租户判定（backoffice_entry 与 admin_not_found）、分页规则与每项的表示都不变。 一，as_of：响应的 data 在 items 与 next_cursor 之外加 as_of，是读这一页的只读快照事务里读到的数据库时间（取法同 app/services/reservations.py 的 database_now，在这个事务里读表之前先读它，所以页面上的数不会比它旧），格式用 app/api/catalog.py 的 RFC 3339 微秒 Z 格式化函数。每次响应都带，带不带 sku_ids 都一样。 二，可选查询参数 sku_ids：逗号分隔的 1 到 100 个 sku_id，用 app/domain/stock.py 现有的 parse_sku_ids 判（空串、空项、重复、超过 100 个都 422 INVALID_REQUEST），每一项再按 CORE-TASK-100 的 is_admin_id 判 ID 形状，不合格 422。带 sku_ids 时不分页（补的：100 个正好是一页的上限，一次读完，与 6.8 余额一致）：同时带 after 或 limit 422 INVALID_REQUEST，next_cursor 恒为 null。只返回所列 SKU 中在这个池有余额行的，按 sku_id 升序，每项与不带 sku_ids 时同一 SKU 那一项完全相同；没有余额行的、不存在的、属于别的租户的 SKU 不出现，也不报错、不记安全事件（同契约 6.8 余额与 2.6 第 6 条的 ids：查询本来就限在本租户的池里）。参数的判定在 pool_id 的形状判定之后、查库之前；pool_id 的本租户判定照旧先于读数。 明确不做：平台读数与最近发布结果（CORE-TASK-150）；其余后台接口；前端。
     status: ready
     depends_on:
       - CORE-TASK-100
@@ -5475,13 +5486,7 @@ tasks:
   - id: CORE-TASK-150
     title: 库存总览每个平台入口加最近一次读回的读数与最近一次发布的结果
     purpose: >-
-      按契约 docs/CONTRACT_V1.md 0.22 的 8.6 第 2 条库存总览页（平台读数与最近发布结果、异常标记）与 3.2 的 platform_publishes、channel_allocations 的 review_hold 三列，docs/PLATFORM_CHANNELS.md 第 4 节，docs/ADMIN_FRONTEND.md 第 9 节缺口 G1。在 CORE-TASK-149 之后的库存总览上补（接口在 app/api/admin_allocations.py、查询在 app/services/admin_queries.py），只加字段，不改参数、检查顺序与分页。
-      数据从哪来（写死）：发布与读回的结果都只在 CORE-TASK-110 建的 platform_publishes 里（CORE-TASK-121 写 kind 为 publish 的行，CORE-TASK-122 写 kind 为 readback 的行），不在别处。channels 的每一项先定这个 SKU 在这个入口上当前 active 的平台商品（sku_listings，同一入口同一 SKU 至多一条，契约 2.9），只取 tenant_id、channel_id、sku_id 与 listing_id 都等于它的行（补的：改挂与解除之后，旧平台商品的结果说的不是现在平台上显示的那个规格）；没有 active 平台商品时下面两项都为 null。按 created_at 倒序、再按 publish_id 倒序取第一条。
-      一，last_publish：kind 为 publish 的最新一条（不论结果）；没有为 null；否则为 target_quantity、platform_quantity（可为 null）、result（confirmed、failed、unknown、unsupported、platform_controlled）、error_code（可为 null）与 published_at（这一行的 created_at；照 CORE-TASK-121，它是写之前读 Q 时的数据库时间，不是平台应答的时间）。
-      二，last_read：kind 为 readback、result 为 matched 或 mismatched 的最新一条（failed 的读回没有读数，跳过，补的）；没有为 null；否则为 platform_quantity（平台读数）、target_quantity（比对用的 Q）、result 与 read_at（这一行的 created_at）。
-      三，同时补上 review_reason 与 review_since（channel_allocations 的同名列，没有配额行或没有设上为 null；补的：解除读回待核对时页面要显示原因与时间，并把 review_since 原样交回，见 CORE-TASK-152）。
-      四，读法：仍在 CORE-TASK-100 的那一个只读快照里读完；一页的 SKU 与全部 platform 入口用固定条数的查询取（例如一条查 active 平台商品、每种 kind 一条用窗口函数各取最新），走 CORE-TASK-110 建的索引 (tenant_id, channel_id, sku_id, created_at, publish_id)，不按 SKU 逐条查（补的）。时间格式用 app/api/catalog.py 的 RFC 3339 微秒 Z。
-      明确不做：写平台、读平台与设上待核对（CORE-TASK-121、122）；平台读数的历史列表；前端。
+      按契约 docs/CONTRACT_V1.md 0.23 的 8.6 第 2 条库存总览页（平台读数与最近发布结果、异常标记）与 3.2 的 platform_publishes、channel_allocations 的 review_hold 三列，docs/PLATFORM_CHANNELS.md 第 4 节，docs/ADMIN_FRONTEND.md 第 9 节缺口 G1。在 CORE-TASK-149 之后的库存总览上补（接口在 app/api/admin_allocations.py、查询在 app/services/admin_queries.py），只加字段，不改参数、检查顺序与分页。 数据从哪来（写死）：发布与读回的结果都只在 CORE-TASK-110 建的 platform_publishes 里（CORE-TASK-121 写 kind 为 publish 的行，CORE-TASK-122 写 kind 为 readback 的行），不在别处。channels 的每一项先定这个 SKU 在这个入口上当前 active 的平台商品（sku_listings，同一入口同一 SKU 至多一条，契约 2.9），只取 tenant_id、channel_id、sku_id 与 listing_id 都等于它的行（补的：改挂与解除之后，旧平台商品的结果说的不是现在平台上显示的那个规格）；没有 active 平台商品时下面两项都为 null。按 created_at 倒序、再按 publish_id 倒序取第一条。 一，last_publish：kind 为 publish 的最新一条（不论结果）；没有为 null；否则为 target_quantity、platform_quantity（可为 null）、result（confirmed、failed、unknown、unsupported、platform_controlled）、error_code（可为 null）与 published_at（这一行的 created_at；照 CORE-TASK-121，它是写之前读 Q 时的数据库时间，不是平台应答的时间）。 二，last_read：kind 为 readback、result 为 matched 或 mismatched 的最新一条（failed 的读回没有读数，跳过，补的）；没有为 null；否则为 platform_quantity（平台读数）、target_quantity（比对用的 Q）、result 与 read_at（这一行的 created_at）。 三，同时补上 review_reason 与 review_since（channel_allocations 的同名列，没有配额行或没有设上为 null；补的：解除读回待核对时页面要显示原因与时间，并把 review_since 原样交回，见 CORE-TASK-152）。 四，读法：仍在 CORE-TASK-100 的那一个只读快照里读完；一页的 SKU 与全部 platform 入口用固定条数的查询取（例如一条查 active 平台商品、每种 kind 一条用窗口函数各取最新），走 CORE-TASK-110 建的索引 (tenant_id, channel_id, sku_id, created_at, publish_id)，不按 SKU 逐条查（补的）。时间格式用 app/api/catalog.py 的 RFC 3339 微秒 Z。 明确不做：写平台、读平台与设上待核对（CORE-TASK-121、122）；平台读数的历史列表；前端。
     status: ready
     depends_on:
       - CORE-TASK-149
@@ -5507,18 +5512,12 @@ tasks:
   - id: CORE-TASK-151
     title: 自动写平台暂停的设上、解除与读当前状态：命令与后台接口
     purpose: >-
-      按契约 docs/CONTRACT_V1.md 0.22 的 3.2（platform_write_pause，platform_ops_log 的 write_pause_set 与 write_pause_cleared 及前后值的键）、8.6 第 2 条（后台的运营操作都走后台执行器、写 platform_ops_log）、10 第 3 条的角色表（设上与解除自动写平台暂停只接受 stock_admin）与 12.1 第 3、6 条，docs/PLATFORM_CHANNELS.md 第 5 节，docs/ADMIN_FRONTEND.md 第 9 节缺口 G5 的第一项（连同读当前状态的接口）。
-      一，新服务模块 app/services/platform_write_pause.py，两个命令体 set_write_pause(execution, body) 与 clear_write_pause(execution, body)（正文只有 reason，已由接口校验）。都在事务里先 FOR UPDATE 这个租户的 platform_write_pause 行（与 CORE-TASK-125 的请求对账锁同一行）；没有这一行即这个租户没有 platform 入口，422 INVALID_REQUEST（同 CORE-TASK-125）。
-      设上：paused 已为真 409 STATE_CONFLICT，details 为 {"reason": "already_paused"}，什么也不改（设计第 5 节：已设上时再设，不改原来的原因、设上的人与时间）；否则 paused 改为真，set_credential_id 取上下文的操作主体、set_at 为数据库时间、set_reason 为正文的 reason，cleared 三列清空（补的：这一行只表示当前这一轮的设上与解除，历史在 platform_ops_log）。
-      解除：paused 已为假 409 STATE_CONFLICT（{"reason": "not_paused"}）；不判对账跑没跑完（设计第 5 节解除的前提“恢复后的对账跑完、差异处理完”由管理员判断：人工模式下没有平台对账可跑，服务硬拦会让暂停解不开，只能改库；补的）；否则 paused 改为假，cleared_credential_id、cleared_at（数据库时间）、cleared_reason 照写，set 三列保留。
-      两种都在同一事务里写一条 platform_ops_log：action 为 write_pause_set 或 write_pause_cleared，object_type 为 tenant、object_id 为 tenant_id（契约没写这两个动作的对象，补的），before 与 after 各为 {"paused"}，reason 为正文的，credential_id、actor_ref、actor_role、request_id 取上下文；与幂等记录同一事务提交。返回这个租户写入暂停的表示（见三），在命令体里、写完之后在同一事务里读出拼好，重放与第一次一字不差。设上与解除都不改配额、发布记录与别的表；停写由 CORE-TASK-121 读 paused 实现，解除之后的写入照 121 的触发条件进行。
-      二，接口加在 CORE-TASK-109 的 app/api/admin_platform_ops.py：POST /api/v1/admin/write-pause/set 与 POST /api/v1/admin/write-pause/clear，经 CORE-TASK-099 的依赖与 run_admin（operation 分别为 platform_ops.write_pause_set 与 platform_ops.write_pause_clear，角色 stock_admin，上下文的入口与池为空）；正文只有 reason（同契约 2.6 的 reason 惯例：去掉首尾空白后 1 到 500 个字符、不含控制字符，存去空白后的值），多出来的键或值为 null 都 422；成功 200。
-      三，GET /api/v1/admin/write-pause：只要求登录（CORE-TASK-099 的读依赖）；返回 paused、set_actor_ref、set_at、set_reason、cleared_actor_ref、cleared_at、cleared_reason。两个 actor_ref 是 set_credential_id、cleared_credential_id 对应的管理员账号 ID（按 admin_accounts 的 credential_id 取）；那个主体不是管理员（例如运行手册的 SQL 写的 system 主体）或列为空时为 null；不输出 credential_id；时间用 app/api/catalog.py 的 RFC 3339 微秒 Z。这个租户没有这一行时 paused 为假、其余为 null（补的）。读查询加在 app/services/admin_queries.py。
-      明确不做：运行手册里设上暂停的 SQL；解除暂停时触发一次全量重写（恢复后的差异由对账与读回设上待核对、解除时按 CORE-TASK-121 的触发 (c) 重写）；前端的按钮与横幅。
+      按契约 docs/CONTRACT_V1.md 0.23 的 3.2（platform_write_pause，platform_ops_log 的 write_pause_set 与 write_pause_cleared 及前后值的键）、8.6 第 2 条（后台的运营操作都走后台执行器、写 platform_ops_log）、10 第 3 条的角色表（设上与解除自动写平台暂停只接受 stock_admin）与 12.1 第 3、6 条，docs/PLATFORM_CHANNELS.md 第 5 节，docs/ADMIN_FRONTEND.md 第 9 节缺口 G5 的第一项（连同读当前状态的接口）。 一，新服务模块 app/services/platform_write_pause.py，两个命令体 set_write_pause(execution, body) 与 clear_write_pause(execution, body)（正文只有 reason，已由接口校验）。都在事务里先 FOR UPDATE 这个租户的 platform_write_pause 行（与 CORE-TASK-125 的请求对账锁同一行）；没有这一行即这个租户没有 platform 入口，422 INVALID_REQUEST（同 CORE-TASK-125）。 设上：paused 已为真 409 STATE_CONFLICT，details 为 {"reason": "already_paused"}，什么也不改（设计第 5 节：已设上时再设，不改原来的原因、设上的人与时间）；否则 paused 改为真，set_credential_id 取上下文的操作主体、set_at 为数据库时间、set_reason 为正文的 reason，cleared 三列清空（补的：这一行只表示当前这一轮的设上与解除，历史在 platform_ops_log）。 解除：paused 已为假 409 STATE_CONFLICT（{"reason": "not_paused"}）；不判对账跑没跑完（设计第 5 节解除的前提“恢复后的对账跑完、差异处理完”由管理员判断：人工模式下没有平台对账可跑，服务硬拦会让暂停解不开，只能改库；补的）；否则 paused 改为假，cleared_credential_id、cleared_at（数据库时间）、cleared_reason 照写，set 三列保留。 两种都在同一事务里写一条 platform_ops_log：action 为 write_pause_set 或 write_pause_cleared，object_type 为 tenant、object_id 为 tenant_id（契约没写这两个动作的对象，补的），before 与 after 各为 {"paused"}，reason 为正文的，credential_id、actor_ref、actor_role、request_id 取上下文；与幂等记录同一事务提交。返回这个租户写入暂停的表示（见三），在命令体里、写完之后在同一事务里读出拼好，重放与第一次一字不差。设上与解除都不改配额、发布记录与别的表；停写由 CORE-TASK-121 读 paused 实现，解除之后的写入照 121 的触发条件进行。 二，接口加在 CORE-TASK-109 的 app/api/admin_platform_ops.py：POST /api/v1/admin/write-pause/set 与 POST /api/v1/admin/write-pause/clear，经 CORE-TASK-099 的依赖与 run_admin（operation 分别为 platform_ops.write_pause_set 与 platform_ops.write_pause_clear，角色 stock_admin，上下文的入口与池为空）；正文只有 reason（同契约 2.6 的 reason 惯例：去掉首尾空白后 1 到 500 个字符、不含控制字符，存去空白后的值），多出来的键或值为 null 都 422；成功 200。 三，GET /api/v1/admin/write-pause：只要求登录（CORE-TASK-099 的读依赖）；返回 paused、set_actor_ref、set_at、set_reason、cleared_actor_ref、cleared_at、cleared_reason。两个 actor_ref 是 set_credential_id、cleared_credential_id 对应的管理员账号 ID（按 admin_accounts 的 credential_id 取）；那个主体不是管理员（例如运行手册的 SQL 写的 system 主体）或列为空时为 null；不输出 credential_id；时间用 app/api/catalog.py 的 RFC 3339 微秒 Z。这个租户没有这一行时 paused 为假、其余为 null（补的）。读查询加在 app/services/admin_queries.py。 明确不做：运行手册里设上暂停的 SQL；解除暂停时触发一次全量重写（恢复后的差异由对账与读回设上待核对、解除时按 CORE-TASK-121 的触发 (c) 重写）；前端的按钮与横幅。
     status: ready
     depends_on:
       - CORE-TASK-109
       - CORE-TASK-125
+      - CORE-TASK-150
     acceptance_criteria:
       - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_write_pause_api.py，用后台开关为真的生产应用、真实登录，数据用 tests/integration/platform_fixtures.py 建、finally 里 purge_tenant
       - 设上 200：行上 paused 为真、set 三列如上、cleared 三列为空，一条 write_pause_set（before 的 paused 为假、after 为真，reason 为正文的，操作主体为管理员、actor_ref 为账号 ID、actor_role 为 stock_admin）；已设上时用新提交键再设 409 already_paused，原来的 set 三列不变、不多写日志；同一提交键重放得原响应
@@ -5539,15 +5538,9 @@ tasks:
     creates_branch: true
     creates_pull_request: true
   - id: CORE-TASK-152
-    title: 解除读回待核对与确认人工配额已生效：命令与后台接口
+    title: 解除读回待核对：命令与后台接口
     purpose: >-
-      按契约 docs/CONTRACT_V1.md 0.22 的 3.2（channel_allocations 的 review_hold、review_reason、review_since 与 manual_confirmed_quota、manual_confirmed_at，platform_ops_log 的 review_hold_cleared 与 manual_quota_confirmed 及前后值的键；确认只记 manual_confirmed 两列、不改 quota）、3.1 的锁序、8.6 第 2 条与 10 第 3 条的角色表（两者都只接受 stock_admin），docs/PLATFORM_CHANNELS.md 第 4、5 节与 6.2 第 1、3 条，docs/ADMIN_FRONTEND.md 第 9 节缺口 G5 的第二、三项。
-      一，命令体加在 CORE-TASK-090 的 app/services/allocations.py（正文都已由接口校验并预检过，见二）。
-      clear_review_hold(execution, body)：正文 channel_id、sku_id、expected_review_since、reason。事务里只 FOR UPDATE 这一行 channel_allocations（契约 3.1 锁序里用不到的层跳过）。没有这一行或 review_hold 为假 409 STATE_CONFLICT（{"reason": "not_on_hold"}）；review_since 不等于 expected_review_since（按 UTC 微秒比）409 STATE_CONFLICT（{"reason": "review_changed", "review_since": 当前值}）（补的：解除之后读回或对账又设上了一次，页面看到的是上一次，不让管理员解除没看过的这一次）；否则 review_hold 改为假、review_reason 与 review_since 清空（CORE-TASK-080 的搭配约束），同一事务写一条 platform_ops_log：action review_hold_cleared，object_type sku、object_id 为 sku_id，before 与 after 为 channel_id、sku_id、review_hold、review_reason 四个键（与 CORE-TASK-122 写 review_hold_set 的形状相同，CORE-TASK-121 的触发 (c) 按它找），reason 为正文的，操作主体列取上下文。不改 quota 与 pending、不写 allocation_changes、不调平台：解除之后由发布作业按 121 的触发 (c) 写一次当前的 Q（设计第 4 节“先核对，再写绝对目标”）。
-      confirm_manual_quota(execution, body)：正文 channel_id、sku_id、manual_confirmed_quota（0 到 1000000 的整数，bool 不算）。事务里先 FOR SHARE 这个入口的 platform_connections 行（与 CORE-TASK-120 切换模式串行），再 FOR UPDATE 这一行 channel_allocations。按先后只报第一个：mode 不是 manual 409 STATE_CONFLICT（{"reason": "not_manual"}）（设计 6.2：只有人工模式要确认已生效，补的）；没有这一行 409 STATE_CONFLICT（{"reason": "no_allocation"}）（补的）；manual_confirmed_quota 大于当前 quota 409 STATE_CONFLICT（{"reason": "exceeds_quota", "quota": 当前值}）（补的：卖家后台显示多于 Q 会多卖；小于 Q 的照记，页面照旧显示“待生效”，提示管理员减配额或补设）；否则写 manual_confirmed_quota 与 manual_confirmed_at（数据库时间），与原值相同也照写、刷新时间（补的：重新核对过就是一次新的确认），同一事务写一条 platform_ops_log：action manual_quota_confirmed，object_type sku、object_id 为 sku_id，before 与 after 为 channel_id、sku_id、manual_confirmed_quota 三个键，reason 为空，操作主体列取上下文。不改 quota。
-      两个命令都返回这一行的表示：channel_id、sku_id、quota、pending、review_hold、review_reason、review_since、manual_confirmed_quota、manual_confirmed_at（时间用 app/api/catalog.py 的 RFC 3339 微秒 Z，与 CORE-TASK-150 总览里同名键的格式相同），在同一事务里读出拼好，200。
-      二，接口加在 CORE-TASK-100 的 app/api/admin_allocations.py：POST /api/v1/admin/channel-allocations/clear-review-hold 与 POST /api/v1/admin/channel-allocations/confirm-manual-quota，经 CORE-TASK-099 的依赖与 run_admin（operation 分别为 allocations.clear_review_hold 与 allocations.confirm_manual_quota，角色 stock_admin，上下文的入口与池为空）。正文如上，多出来的键或值为 null 都 422；channel_id 与 sku_id 按 is_admin_id 判形状；expected_review_since 为带时区的 RFC 3339、转成 UTC 微秒，不合格 422；reason 同契约 2.6 的 reason 惯例。调执行器之前用本请求的连接普通读预检（读完结束事务），不合格的都在这里拒绝、什么也不写：入口不存在 404 NOT_FOUND，属于别的租户经 admin_not_found（object_type channel）记 cross_tenant 后同样 404；不是 platform 入口 422 INVALID_REQUEST（inactive 的 platform 入口也可以：两者都只是记录，补的）；SKU 不存在 404 SKU_NOT_FOUND，属于别的租户经 admin_not_found（object_type sku）同样 404。
-      明确不做：改配额（CORE-TASK-100）；发布与读回（CORE-TASK-121、122）；前端。
+      按契约 docs/CONTRACT_V1.md 0.23 的 3.2（channel_allocations 的 review_hold、review_reason、review_since，platform_ops_log 的 review_hold_cleared 及前后值的键）、3.1 的锁序、8.6 第 2 条与 10 第 3 条的角色表（只接受 stock_admin），docs/PLATFORM_CHANNELS.md 第 4、5 节，docs/ADMIN_FRONTEND.md 第 9 节缺口 G5 的第二项。 一，命令体加在 CORE-TASK-090 的 app/services/allocations.py（正文都已由接口校验并预检过，见二）。 clear_review_hold(execution, body)：正文 channel_id、sku_id、expected_review_since、reason。事务里只 FOR UPDATE 这一行 channel_allocations（契约 3.1 锁序里用不到的层跳过）。没有这一行或 review_hold 为假 409 STATE_CONFLICT（{"reason": "not_on_hold"}）；review_since 不等于 expected_review_since（按 UTC 微秒比）409 STATE_CONFLICT（{"reason": "review_changed", "review_since": 当前值}）（补的：解除之后读回或对账又设上了一次，页面看到的是上一次，不让管理员解除没看过的这一次）；否则 review_hold 改为假、review_reason 与 review_since 清空（CORE-TASK-080 的搭配约束），同一事务写一条 platform_ops_log：action review_hold_cleared，object_type sku、object_id 为 sku_id，before 与 after 为 channel_id、sku_id、review_hold、review_reason 四个键（与 CORE-TASK-122 写 review_hold_set 的形状相同，CORE-TASK-121 的触发 (c) 按它找），reason 为正文的，操作主体列取上下文。不改 quota 与 pending、不写 allocation_changes、不调平台：解除之后由发布作业按 121 的触发 (c) 写一次当前的 Q（设计第 4 节“先核对，再写绝对目标”）。 命令返回这一行的表示：channel_id、sku_id、quota、pending、review_hold、review_reason、review_since、manual_confirmed_quota、manual_confirmed_at（时间用 app/api/catalog.py 的 RFC 3339 微秒 Z，与 CORE-TASK-150 总览里同名键的格式相同），在同一事务里读出拼好，200。 二，接口加在 CORE-TASK-100 的 app/api/admin_allocations.py：POST /api/v1/admin/channel-allocations/clear-review-hold，经 CORE-TASK-099 的依赖与 run_admin（operation 为 allocations.clear_review_hold，角色 stock_admin，上下文的入口与池为空）。正文如上，多出来的键或值为 null 都 422；channel_id 与 sku_id 按 is_admin_id 判形状；expected_review_since 为带时区的 RFC 3339、转成 UTC 微秒，不合格 422；reason 同契约 2.6 的 reason 惯例。调执行器之前用本请求的连接普通读预检（读完结束事务），不合格的都在这里拒绝、什么也不写：入口不存在 404 NOT_FOUND，属于别的租户经 admin_not_found（object_type channel）记 cross_tenant 后同样 404；不是 platform 入口 422 INVALID_REQUEST（inactive 的 platform 入口也可以：只是解除一个标记，补的）；SKU 不存在 404 SKU_NOT_FOUND，属于别的租户经 admin_not_found（object_type sku）同样 404。 明确不做：确认人工配额已生效（契约 3.2 按 manual_confirmed_quota 与 quota 是否相等判“待生效”，平台卖出时 Q 与平台显示量一起减，会误报；先改契约再登记，见登记 PR）；改配额（CORE-TASK-100）；发布与读回（CORE-TASK-121、122）；前端。
     status: ready
     depends_on:
       - CORE-TASK-150
@@ -5556,9 +5549,8 @@ tasks:
       - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_channel_allocation_ops_api.py，用后台开关为真的生产应用、真实登录，数据用 tests/integration/platform_fixtures.py 建、finally 里 purge_tenant
       - 解除待核对：设上 review_hold 之后带库里的 review_since 解除 200，三列清空、quota 与 pending 不变、没有新的 allocation_changes，一条 review_hold_cleared（四个键、object_type sku、actor_role 为 stock_admin、actor_ref 为账号 ID）；之后用模拟适配器跑 CORE-TASK-121 的一轮，这个 SKU 在这个入口写了一次当前的 Q
       - 没设上时 409 not_on_hold；expected_review_since 与库里不同时 409 review_changed、details 带当前值；两种都不改行、不写日志
-      - 确认人工配额：manual 入口确认等于 quota 的值 200，两列照写、quota 不变，一条 manual_quota_confirmed；用新提交键再确认同值时 manual_confirmed_at 更新、多一条日志；大于 quota 409 exceeds_quota；auto 入口 409 not_manual；没有配额行 409 no_allocation
       - 预检：不存在的入口 404、别的租户的入口与别的租户的 SKU 各 404 并各多一条 cross_tenant、backoffice 入口 422、ID 形状不对 422；没有会话 401、CSRF 不符 403、缺提交键 400；都不写日志与幂等记录
-      - 同一提交键重放得原响应；后台开关为假的生产应用上这两个路径都是 404
+      - 同一提交键重放得原响应；后台开关为假的生产应用上这个路径是 404
       - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
     allowed_change_paths:
       - app/services/allocations.py
@@ -5574,17 +5566,11 @@ tasks:
   - id: CORE-TASK-153
     title: 清除已确认平台订单的待处理标记与记已知差异：命令与后台接口
     purpose: >-
-      按契约 docs/CONTRACT_V1.md 0.22 的 3.2（platform_order_lines 的 known_discrepancy 与说明，platform_ops_log 的 attention_cleared 与 known_discrepancy_marked 及前后值的键）、5.10 第 6 步已确认之后被拒的后台处理（对照卖家后台、必要时用库存命令对回实物并记已知差异，都处理完再清除待处理标记）、8.6 第 2 条（后台的运营操作走后台执行器）、10 第 3 条的角色表（两者都接受 stock_operator 与 stock_admin，断言 stock_admin），docs/PLATFORM_CHANNELS.md 6.2 第 4 条，docs/ADMIN_FRONTEND.md 第 9 节缺口 G5 的后两项。
-      这两种操作不是平台事件：走 CORE-TASK-099 的 run_admin、写幂等记录，不写收件箱、不经平台事件执行器、不取订单的命名锁（只改一行平台订单与至多一行订单行，行锁已与平台事件执行器的事务串行，补的；区别于 CORE-TASK-108 的三个操作）。
-      一，新服务模块 app/services/platform_order_ops.py。
-      clear_attention(execution, platform_order_row_id, body)：正文只有 reason。事务里 FOR UPDATE 这一行平台订单。stage 不是 committed 409 STATE_CONFLICT（{"reason": "not_committed", "stage": 当前值}）（held 单的 attention 由重试、继续处理与关闭解开，CORE-TASK-107；补的）；attention 为空 409 STATE_CONFLICT（{"reason": "no_attention"}）；否则 attention 与 attention_code 一起清空（CORE-TASK-093 的约束），同一事务写一条 platform_ops_log：action attention_cleared，object_type platform_order、object_id 为 platform_order_row_id，before 为 platform_order_row_id、attention、attention_code 三个键的原值，after 同三个键、后两者为 null，reason 为正文的，操作主体列取上下文。不改阶段、件数、配额、pending 与 Core 的账，不确认告警（告警另行确认，CORE-TASK-125）。
-      mark_known_discrepancy(execution, platform_order_row_id, body)：正文 platform_line_id（1 到 128 个字符、不含控制字符，同 CORE-TASK-106 的 platform_order_id）与 note（同契约 2.6 的 reason 惯例）。事务里先 FOR UPDATE 平台订单行、再 FOR UPDATE 这一行订单行。按先后只报第一个：订单 stage 不是 committed 409 STATE_CONFLICT（{"reason": "not_committed", "stage": 当前值}）（契约 3.2 说的是提交到 Core 之后才发现录错的行；扣数之前录错的用取消或关闭处理，补的）；这个订单没有这一行 404 NOT_FOUND（details 为 {"platform_line_id"}）；这一行已记 409 STATE_CONFLICT（{"reason": "already_marked"}）（只记一次，不改说明、不撤销：契约只有“记”，补的）；否则 known_discrepancy 为真、known_discrepancy_note 为 note（CORE-TASK-093 的搭配约束），同一事务写一条 platform_ops_log：action known_discrepancy_marked，object_type platform_order、object_id 为 platform_order_row_id，before 与 after 为 platform_order_row_id、platform_line_id、known_discrepancy 三个键（假与真），reason 为 note，操作主体列取上下文。不改账、不改 attention（清除标记是另一个操作）；记了已知差异的订单在对账里整单不比（CORE-TASK-123 已实现）。
-      两个命令都返回这个平台订单在 CORE-TASK-106 详情里的表示（lines 照 106 不含说明文字），用 106 的详情读法在同一事务里读出拼好，200。
-      二，接口加在 CORE-TASK-106 的 app/api/admin_platform_orders.py：POST /api/v1/admin/platform-orders/{platform_order_row_id}/clear-attention 与 POST /api/v1/admin/platform-orders/{platform_order_row_id}/known-discrepancies，经 CORE-TASK-099 的依赖与 run_admin（operation 分别为 platform_orders.clear_attention 与 platform_orders.mark_known_discrepancy，角色 stock_operator 与 stock_admin、断言 stock_admin，上下文的入口与池为空）。正文如上，多出来的键或值为 null 都 422；行 ID 按 is_admin_id 判形状，不合格 422。调执行器之前用本请求的连接普通读预检：不存在 404 PLATFORM_ORDER_NOT_FOUND，属于别的租户经 admin_not_found（object_type platform_order）记 cross_tenant 后同样 404，两种只差 request_id。
-      明确不做：撤销已知差异、改说明；已知差异的说明文字的读接口；平台运营日志的列表（缺口 G9）；前端。
+      按契约 docs/CONTRACT_V1.md 0.23 的 3.2（platform_order_lines 的 known_discrepancy 与说明，platform_ops_log 的 attention_cleared 与 known_discrepancy_marked 及前后值的键）、5.10 第 6 步已确认之后被拒的后台处理（对照卖家后台、必要时用库存命令对回实物并记已知差异，都处理完再清除待处理标记）、8.6 第 2 条（后台的运营操作走后台执行器）、10 第 3 条的角色表（两者都接受 stock_operator 与 stock_admin，断言 stock_admin），docs/PLATFORM_CHANNELS.md 6.2 第 4 条，docs/ADMIN_FRONTEND.md 第 9 节缺口 G5 的后两项。 这两种操作不是平台事件：走 CORE-TASK-099 的 run_admin、写幂等记录，不写收件箱、不经平台事件执行器、不取订单的命名锁（只改一行平台订单与至多一行订单行，行锁已与平台事件执行器的事务串行，补的；区别于 CORE-TASK-108 的三个操作）。 命令体与接口放在一个任务里（同已登记的 109、120、125：两个小命令、四个文件，分开反而要多一次登记与评审）。 一，新服务模块 app/services/platform_order_ops.py。 clear_attention(execution, platform_order_row_id, body)：正文只有 reason。事务里 FOR UPDATE 这一行平台订单。stage 不是 committed 409 STATE_CONFLICT（{"reason": "not_committed", "stage": 当前值}）（held 单的 attention 由重试、继续处理与关闭解开，CORE-TASK-107；补的）；attention 为空 409 STATE_CONFLICT（{"reason": "no_attention"}）；否则 attention 与 attention_code 一起清空（CORE-TASK-093 的约束），同一事务写一条 platform_ops_log：action attention_cleared，object_type platform_order、object_id 为 platform_order_row_id，before 为 platform_order_row_id、attention、attention_code 三个键的原值，after 同三个键、后两者为 null，reason 为正文的，操作主体列取上下文。不改阶段、件数、配额、pending 与 Core 的账，不确认告警（告警另行确认，CORE-TASK-125）。 mark_known_discrepancy(execution, platform_order_row_id, body)：正文 platform_line_id（1 到 128 个字符、不含控制字符，同 CORE-TASK-106 的 platform_order_id）与 note（同契约 2.6 的 reason 惯例）。事务里先 FOR UPDATE 平台订单行、再 FOR UPDATE 这一行订单行。按先后只报第一个：订单 stage 不是 committed 409 STATE_CONFLICT（{"reason": "not_committed", "stage": 当前值}）（契约 3.2 说的是提交到 Core 之后才发现录错的行；扣数之前录错的用取消或关闭处理，补的）；这个订单没有这一行 404 NOT_FOUND（details 为 {"platform_line_id"}）；这一行已记 409 STATE_CONFLICT（{"reason": "already_marked"}）（只记一次，不改说明、不撤销：契约只有“记”，补的）；否则 known_discrepancy 为真、known_discrepancy_note 为 note（CORE-TASK-093 的搭配约束），同一事务写一条 platform_ops_log：action known_discrepancy_marked，object_type platform_order、object_id 为 platform_order_row_id，before 与 after 为 platform_order_row_id、platform_line_id、known_discrepancy 三个键（假与真），reason 为 note，操作主体列取上下文。不改账、不改 attention（清除标记是另一个操作）；记了已知差异的订单在对账里整单不比（CORE-TASK-123 已实现）。 两个命令都返回这个平台订单在 CORE-TASK-106 详情里的表示（lines 照 106 不含说明文字），用 106 的详情读法在同一事务里读出拼好，200。 二，接口加在 CORE-TASK-106 的 app/api/admin_platform_orders.py：POST /api/v1/admin/platform-orders/{platform_order_row_id}/clear-attention 与 POST /api/v1/admin/platform-orders/{platform_order_row_id}/known-discrepancies，经 CORE-TASK-099 的依赖与 run_admin（operation 分别为 platform_orders.clear_attention 与 platform_orders.mark_known_discrepancy，角色 stock_operator 与 stock_admin、断言 stock_admin，上下文的入口与池为空）。正文如上，多出来的键或值为 null 都 422；行 ID 按 is_admin_id 判形状，不合格 422。调执行器之前用本请求的连接普通读预检：不存在 404 PLATFORM_ORDER_NOT_FOUND，属于别的租户经 admin_not_found（object_type platform_order）记 cross_tenant 后同样 404，两种只差 request_id。 明确不做：撤销已知差异、改说明；已知差异的说明文字的读接口；平台运营日志的列表（缺口 G9）；前端。
     status: ready
     depends_on:
       - CORE-TASK-108
+      - CORE-TASK-152
     acceptance_criteria:
       - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_platform_order_marks_api.py，用后台开关为真的生产应用、真实登录，数据用 tests/integration/platform_fixtures.py 建、finally 里 purge_tenant
       - 清除标记：经人工登记做出一张已确认、交运被拒而写了 attention 的订单，清除 200：attention 与 attention_code 为空，阶段、各行、流水与配额都不变，一条 attention_cleared（三个键的前后值如上、actor_role 为 stock_admin、actor_ref 为账号 ID）；用新提交键再清 409 no_attention；held 单 409 not_committed 且不改
