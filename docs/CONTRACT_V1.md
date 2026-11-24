@@ -670,7 +670,7 @@ V1 用拉取，不做推送（Q-08）。
   | `incident_decision` | `decision`（`continue_selling` / `stop_selling`）、`channel_id`（可空） |
   | `reconciliation_started` | `run_id`、`trigger` |
   | `connection_authorized`、`connection_disconnected`、`connection_mode_changed`、`connection_status_changed` | `channel_id`、`status`、`mode`、`capabilities`（只是能力的名字与可用与否，不含令牌） |
-- 这些操作都不改账面量与流水；改 `Q` 的只有 §3.1 的事件、改配额与人工确认（确认只记 `manual_confirmed_*`，不改 `quota`）。（0.24）`manual_confirmed_quota` 除了后台的确认，只随平台新订单（含继续处理补做的）减少、随从自动切回人工清空（§3.1、上表）；随事件的减少不写 `platform_ops_log`（同 `Q` 随事件的变化，从平台订单与它的事件可以还原），切回人工时的清空记在 `connection_mode_changed` 那一条里（前后值的键不变，清空是这个动作的固定效果）。
+- 这些操作都不改账面量与流水；改 `Q` 的只有 §3.1 的事件、改配额与人工确认（确认只记 `manual_confirmed_*`，不改 `quota`）。（0.24）`manual_confirmed_quota` 除了后台的确认，只随平台新订单（含继续处理补做的）减少、随从自动切回人工清空（§3.1、上表）；随事件的减少不写 `platform_ops_log`（同 `Q` 随事件的变化，从平台订单与它的事件可以还原），切回人工时的清空不另记（被清掉的旧值不保留），由那条 `connection_mode_changed` 里 `mode` 从 `auto` 改成 `manual` 可知已清空（前后值的键不变）。
 
 ---
 
