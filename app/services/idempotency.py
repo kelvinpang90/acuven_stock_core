@@ -129,6 +129,15 @@ READ COMMITTED（契约 §4.1 下文、§6.6）：
 - 函数抛 ApiError 照常作为响应返回；抛别的异常记进程日志、503 UNAVAILABLE。
   两种情况都不执行命令、不保存幂等记录，同键重试会重新执行。
   命名锁与隔离级别照常由 _release_locks 收尾（连接已作废时作废它）。
+
+命令上下文（契约 §5.10“命令体共用”，Q-84）：
+
+- run_idempotent 是 HTTP 包装：从 get_access、request.state.request_id 与
+  app.state.reservation_ttl_seconds 组出 CommandContext（app/services/command_context.py），
+  再调核心 run_with_context。
+- 核心的作用域、锁名、幂等记录、安全事件与日志里的身份、入口、操作者与 request_id
+  一律从上下文取；取连接、作废连接与写响应仍按请求。后台执行器以后共用这个核心。
+- execution.context 是这个上下文。execution.access 与 execution.request 是暂时保留的兼容属性。
 """
 
 import json
@@ -167,6 +176,7 @@ from app.domain.idempotency import (
 )
 from app.domain.ids import new_id
 from app.models.inventory import IdempotencyRecord, StockBalance
+from app.services.command_context import CommandContext
 from app.services.security_events import SecurityEventRecord, record_security_event
 
 REPLAYED = "Idempotency-Replayed"
@@ -207,10 +217,21 @@ class _Scope:
 
 
 class Execution:
-    """交给命令的执行上下文：本请求、事务已开的连接，以及登记事件与被拒仍保留的写入的方法。"""
+    """交给命令的执行上下文：命令上下文、事务已开的连接，以及登记事件与被拒仍保留的写入的方法。
 
-    def __init__(self, request: Request, connection: Connection, operation: str, digest: str):
+    request 与 access 是暂时保留的兼容属性（命令改读 context 之后去掉）。
+    """
+
+    def __init__(
+        self,
+        request: Request,
+        context: CommandContext,
+        connection: Connection,
+        operation: str,
+        digest: str,
+    ):
         self.request = request
+        self.context = context
         self.connection = connection
         self.operation = operation
         self._digest = digest
@@ -228,7 +249,7 @@ class Execution:
 
     def record_security_event(self, event_type: str, details: dict[str, Any]) -> None:
         """暂存一条安全事件，事务结束、命名锁释放之后写。"""
-        self.events.append(_event(self.request, event_type, details))
+        self.events.append(_event(self.context, event_type, details))
 
     def keep_on_rejection(self, write: Callable[[Connection], None]) -> None:
         """命令以业务 4xx 拒绝时仍要保留的写入：撤销命令的写入之后，在同一事务里执行。"""
@@ -256,19 +277,53 @@ class RedoCommand(Exception):
         super().__init__("the command asked to be redone after a rollback")
 
 
-def _event(request: Request, event_type: str, details: dict[str, Any]) -> SecurityEventRecord:
-    access = get_access(request)
+def _event(
+    context: CommandContext, event_type: str, details: dict[str, Any]
+) -> SecurityEventRecord:
     return SecurityEventRecord(
         event_type=event_type,
-        request_id=request.state.request_id,
-        tenant_id=access.principal.tenant_id,
-        credential_id=access.principal.credential_id,
+        request_id=context.request_id,
+        tenant_id=context.tenant_id,
+        credential_id=context.credential_id,
         # 第 6 步已校验：操作者头要么都带且都合格，要么都不带。
-        actor_ref=None if access.actor is None else access.actor.ref,
+        actor_ref=None if context.actor is None else context.actor.ref,
+        http_method=context.http_method,
+        path=context.path,
+        user_agent=context.user_agent,
+        details=details,
+    )
+
+
+def _check_arguments(operation: str, attempts: int) -> None:
+    if (
+        not isinstance(operation, str)
+        or len(operation) > _OPERATION_MAX_LENGTH
+        or not _OPERATION.fullmatch(operation)
+    ):
+        raise ValueError(f"invalid operation name: {operation!r}")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        raise ValueError(f"attempts must be a positive integer, got {attempts!r}")
+
+
+def http_context(request: Request) -> CommandContext:
+    """HTTP 执行器的命令上下文。
+
+    身份、入口、操作者与幂等键取第 4–6 步的结果，request_id 取请求，预留有效期取 app.state。
+    """
+    access = get_access(request)
+    principal = access.principal
+    return CommandContext(
+        tenant_id=principal.tenant_id,
+        channel_id=principal.channel_id,
+        pool_id=principal.pool_id,
+        credential_id=principal.credential_id,
+        actor=access.actor,
+        request_id=request.state.request_id,
+        idempotency_key=access.idempotency_key,
+        reservation_ttl_seconds=request.app.state.reservation_ttl_seconds,
         http_method=request.method,
         path=request.scope["path"],  # 不含查询串
         user_agent=request.headers.get("user-agent"),
-        details=details,
     )
 
 
@@ -284,7 +339,7 @@ def run_idempotent(
     before_transaction: BeforeTransaction | None = None,
     attempts: int = 2,
 ) -> Response:
-    """第 10 步：取命名锁，重放、冲突或执行命令，释放锁，再写安全事件。
+    """第 10 步的 HTTP 包装：按请求组出命令上下文，再调 run_with_context。
 
     catalog_lock 为真时（写目录的命令）取到幂等锁之后、开事务之前再取本租户的目录写锁。
     balance_rows 给了时，取锁之后、开业务事务之前用单独的短事务预建它返回的余额行（§4.1）。
@@ -293,26 +348,54 @@ def run_idempotent(
     命令抛 RedoCommand 时回滚，从预建那一步整个重做；一个请求最多做 attempts 遍
     （默认 2），最后一遍仍抛时 503。
     """
-    if (
-        not isinstance(operation, str)
-        or len(operation) > _OPERATION_MAX_LENGTH
-        or not _OPERATION.fullmatch(operation)
-    ):
-        raise ValueError(f"invalid operation name: {operation!r}")
-    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
-        raise ValueError(f"attempts must be a positive integer, got {attempts!r}")
-    access = get_access(request)
-    if access.idempotency_key is None:
+    _check_arguments(operation, attempts)
+    if get_access(request).idempotency_key is None:
         raise RuntimeError("a write endpoint needs authorize(..., write=True)")
+    return run_with_context(
+        request,
+        http_context(request),
+        operation=operation,
+        body=body,
+        command=command,
+        catalog_lock=catalog_lock,
+        balance_rows=balance_rows,
+        read_committed=read_committed,
+        before_transaction=before_transaction,
+        attempts=attempts,
+    )
+
+
+def run_with_context(
+    request: Request,
+    context: CommandContext,
+    *,
+    operation: str,
+    body: ParsedBody | None,
+    command: Callable[[Execution], CommandResult],
+    catalog_lock: bool = False,
+    balance_rows: BalanceRows | None = None,
+    read_committed: bool = False,
+    before_transaction: BeforeTransaction | None = None,
+    attempts: int = 2,
+) -> Response:
+    """第 10 步的核心：取命名锁，重放、冲突或执行命令，释放锁，再写安全事件。
+
+    作用域、锁名、幂等记录与安全事件里的身份与 request_id 都取自 context；
+    取连接、作废连接与写响应按 request。参数同 run_idempotent。
+    """
+    _check_arguments(operation, attempts)
+    if context.idempotency_key is None:
+        raise RuntimeError("an idempotent command needs an idempotency key")
     scope = _Scope(
-        access.principal.tenant_id,
-        access.principal.credential_id,
+        context.tenant_id,
+        context.credential_id,
         operation,
-        access.idempotency_key,
+        context.idempotency_key,
     )
     digest = request_digest(dict(request.path_params), None if body is None else body.raw)
+    request_id = context.request_id
 
-    connection = _idle_connection(request)
+    connection = _idle_connection(request, request_id)
     database = connection.engine.url.database or ""
     name = lock_name(
         database,
@@ -322,21 +405,27 @@ def run_idempotent(
         scope.idempotency_key,
     )
     try:
-        _acquire(request, connection, name)
+        _acquire(request_id, connection, name)
         if catalog_lock:
-            _acquire_catalog(request, connection, catalog_lock_name(database, scope.tenant_id))
+            _acquire_catalog(request_id, connection, catalog_lock_name(database, scope.tenant_id))
         attempt = 1
         while True:
             if balance_rows is not None:
-                _prepare_balances(request, connection, scope.tenant_id, balance_rows)
+                _prepare_balances(request_id, connection, scope.tenant_id, balance_rows)
             if read_committed and attempt == 1:
                 # 重做时会话仍是 READ COMMITTED：由 _release_locks 才设回默认。
-                _read_committed(request, connection)
+                _read_committed(request_id, connection)
             if before_transaction is not None:
-                _before_transaction(request, connection, before_transaction)
+                _before_transaction(request_id, connection, before_transaction)
             try:
                 response, events = _execute(
-                    request, connection, scope, digest, command, may_redo=attempt < attempts
+                    request,
+                    context,
+                    connection,
+                    scope,
+                    digest,
+                    command,
+                    may_redo=attempt < attempts,
                 )
             except RedoCommand:
                 # 业务事务已回滚，这次登记的事件丢弃；从预建那一步重做（§5.7 通用）。
@@ -344,7 +433,7 @@ def run_idempotent(
                 continue
             break
     finally:
-        _release_locks(request, connection, reset_isolation=read_committed)
+        _release_locks(request, request_id, connection, reset_isolation=read_committed)
     # 用同一个连接写；它已被作废时 record_security_event 从池里另取一个（§7.2）。
     engine = getattr(request.app.state, "engine", None)
     for event in events:
@@ -352,26 +441,26 @@ def run_idempotent(
     return response
 
 
-def _idle_connection(request: Request) -> Connection:
+def _idle_connection(request: Request, request_id: str) -> Connection:
     """处理这个请求的连接，先结束它上面的事务（取锁时不能有打开的事务）。"""
     connection = request_connection(request)
     try:
         connection.rollback()
     except SQLAlchemyError:
-        _log.warning("rollback failed (request_id=%s)", request.state.request_id, exc_info=True)
+        _log.warning("rollback failed (request_id=%s)", request_id, exc_info=True)
         discard_connection(request)
         raise unavailable() from None
     return connection
 
 
-def _acquire(request: Request, connection: Connection, name: str) -> None:
+def _acquire(request_id: str, connection: Connection, name: str) -> None:
     """GET_LOCK(锁名, 0)：1 取到；0 别的请求持有，409；NULL 或出错 503。都不写任何东西。"""
     try:
         acquired = connection.execute(text("SELECT GET_LOCK(:name, 0)"), {"name": name}).scalar()
         # 结束这条语句隐式开的事务：之后的事务在取锁之后才建立读快照（§7.1 执行顺序第 3 步）。
         connection.rollback()
     except SQLAlchemyError:
-        _log.warning("GET_LOCK failed (request_id=%s)", request.state.request_id, exc_info=True)
+        _log.warning("GET_LOCK failed (request_id=%s)", request_id, exc_info=True)
         raise unavailable() from None
     if acquired == 1:
         return
@@ -386,7 +475,7 @@ def _acquire(request: Request, connection: Connection, name: str) -> None:
     raise unavailable()
 
 
-def _acquire_catalog(request: Request, connection: Connection, name: str) -> None:
+def _acquire_catalog(request_id: str, connection: Connection, name: str) -> None:
     """GET_LOCK(目录锁名, 等待秒数)：1 取到；0（超时）、NULL 或出错 503。都不写任何东西。
 
     调用时连接上没有打开的事务：_acquire 已结束它的语句隐式开的事务。
@@ -401,7 +490,7 @@ def _acquire_catalog(request: Request, connection: Connection, name: str) -> Non
     except SQLAlchemyError:
         _log.warning(
             "GET_LOCK on the catalog failed (request_id=%s)",
-            request.state.request_id,
+            request_id,
             exc_info=True,
         )
         raise unavailable() from None
@@ -410,7 +499,7 @@ def _acquire_catalog(request: Request, connection: Connection, name: str) -> Non
 
 
 def _prepare_balances(
-    request: Request, connection: Connection, tenant_id: str, balance_rows: BalanceRows
+    request_id: str, connection: Connection, tenant_id: str, balance_rows: BalanceRows
 ) -> None:
     """余额行预建（§4.1）：在业务事务之前用单独的短事务按 (pool_id, sku_id) 升序逐行建好。
 
@@ -429,7 +518,6 @@ def _prepare_balances(
                     if getattr(exc.orig, "args", ())[:1] != (_NO_REFERENCED_ROW,):
                         raise
     except Exception:
-        request_id = request.state.request_id
         _log.exception("pre-creating balance rows failed (request_id=%s)", request_id)
         try:
             connection.rollback()
@@ -447,7 +535,7 @@ def _balance_upsert(tenant_id: str, pool_id: str, sku_id: str) -> Executable:
     return statement.on_duplicate_key_update(balance_id=table.c.balance_id)
 
 
-def _read_committed(request: Request, connection: Connection) -> None:
+def _read_committed(request_id: str, connection: Connection) -> None:
     """之后开的事务用 READ COMMITTED；由 _release_locks 设回默认。出错 503，什么也不写。"""
     try:
         connection.execute(text("SET SESSION transaction_isolation = 'READ-COMMITTED'"))
@@ -455,13 +543,13 @@ def _read_committed(request: Request, connection: Connection) -> None:
     except SQLAlchemyError:
         _log.warning(
             "setting READ COMMITTED failed (request_id=%s)",
-            request.state.request_id,
+            request_id,
             exc_info=True,
         )
         raise unavailable() from None
 
 
-def _before_transaction(request: Request, connection: Connection, hook: BeforeTransaction) -> None:
+def _before_transaction(request_id: str, connection: Connection, hook: BeforeTransaction) -> None:
     """调用钩子；它抛 ApiError 原样传出，抛别的异常记进程日志、503。什么也不保存。"""
     try:
         hook(connection)
@@ -470,12 +558,14 @@ def _before_transaction(request: Request, connection: Connection, hook: BeforeTr
     except Exception:
         _log.exception(
             "the step before the business transaction failed (request_id=%s)",
-            request.state.request_id,
+            request_id,
         )
         raise unavailable() from None
 
 
-def _release_locks(request: Request, connection: Connection, *, reset_isolation: bool) -> None:
+def _release_locks(
+    request: Request, request_id: str, connection: Connection, *, reset_isolation: bool
+) -> None:
     """无论结果如何都在同一连接上释放（同一会话取锁可重入，只释放一次放不干净）。
 
     reset_isolation 为真时先把会话的隔离级别设回服务器默认。
@@ -494,7 +584,7 @@ def _release_locks(request: Request, connection: Connection, *, reset_isolation:
     except SQLAlchemyError:
         _log.warning(
             "releasing named locks failed, discarding the connection (request_id=%s)",
-            request.state.request_id,
+            request_id,
             exc_info=True,
         )
         invalidate_connection(request)
@@ -511,6 +601,7 @@ def _rollback_quietly(transaction: Transaction) -> None:
 
 def _execute(
     request: Request,
+    context: CommandContext,
     connection: Connection,
     scope: _Scope,
     digest: str,
@@ -524,15 +615,15 @@ def _execute(
     命令（或被拒仍保留的写入、rejudge）抛 RedoCommand 时回滚：
     may_redo 为真时把它传出，由调用方重做；否则（最后一遍）503，事件都丢弃。
     """
-    request_id = request.state.request_id
-    execution = Execution(request, connection, scope.operation, digest)
+    request_id = context.request_id
+    execution = Execution(request, context, connection, scope.operation, digest)
     transaction = connection.begin()
     try:
         stored = _find(connection, scope)
         decision = decide(None if stored is None else stored.request_hash, digest)
         if decision is not Decision.EXECUTE:
             transaction.rollback()
-            return _answer(request, scope, stored, decision)
+            return _answer(request, context, scope, stored, decision)
 
         try:
             response, final = _run_command(execution, command)
@@ -557,7 +648,7 @@ def _execute(
             # 按已有记录重放或冲突。
             transaction.rollback()
             execution.events = []
-            return _answer_existing(request, connection, scope, digest)
+            return _answer_existing(request, context, connection, scope, digest)
         transaction.commit()
         return response, execution.events
     except RedoCommand:
@@ -569,11 +660,11 @@ def _execute(
         _log.warning(
             "the command asked to be redone on its last attempt (request_id=%s)", request_id
         )
-        return error_response(request_id, unavailable()), []
+        return error_response(request.state.request_id, unavailable()), []
     except Exception:
         _log.exception("idempotent command failed (request_id=%s)", request_id)
         _rollback_quietly(transaction)
-        return error_response(request_id, internal_error()), execution.events
+        return error_response(request.state.request_id, internal_error()), execution.events
 
 
 def _run_command(
@@ -631,22 +722,22 @@ def _save(
 
 
 def _answer_existing(
-    request: Request, connection: Connection, scope: _Scope, digest: str
+    request: Request, context: CommandContext, connection: Connection, scope: _Scope, digest: str
 ) -> tuple[Response, list[SecurityEventRecord]]:
     """另开事务读出已有记录，按重放或冲突返回。"""
     with connection.begin():
         stored = _find(connection, scope)
     if stored is None:
         raise RuntimeError("the conflicting idempotency record is not visible")
-    return _answer(request, scope, stored, decide(stored.request_hash, digest))
+    return _answer(request, context, scope, stored, decide(stored.request_hash, digest))
 
 
 def _answer(
-    request: Request, scope: _Scope, stored, decision: Decision
+    request: Request, context: CommandContext, scope: _Scope, stored, decision: Decision
 ) -> tuple[Response, list[SecurityEventRecord]]:
     if decision is Decision.REPLAY:
         headers = {REPLAYED: "true"}
         return JSONResponse(stored.response_body, stored.response_status, headers), []
     error = ApiError(409, IDEMPOTENCY_CONFLICT, "idempotency key was used with different content")
-    event = _event(request, IDEMPOTENCY_CONFLICT_EVENT, {"operation": scope.operation})
+    event = _event(context, IDEMPOTENCY_CONFLICT_EVENT, {"operation": scope.operation})
     return error_response(request.state.request_id, error), [event]
