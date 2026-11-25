@@ -408,13 +408,22 @@ def test_every_bad_credential_gets_the_same_401_and_its_reason_is_only_in_the_ev
         ({"credential": REVOKED_CREDENTIAL, "tenant_status": "inactive"}, "credential_revoked"),
     ],
 )
+def test_with_several_reasons_the_first_in_order_is_recorded(client, engine, overrides, reason):
+    caller = issue(engine, **overrides)
+    rid = request_id()
+    response = client.get("/test/items/item-1", headers=caller.auth | {"X-Request-ID": rid})
+    assert error_of(response, 401) == EXPECTED_401
+    [event] = events(engine, rid)
+    assert event["details"] == {"reason": reason}
+
+
 def test_a_token_under_an_admin_principal_is_treated_as_unknown(client, engine):
     """鉴权只认 service 主体：令牌挂在 admin 下时与令牌不存在一样，对外不区分原因。"""
     plain = generate_token()
-    credential_id, token_id = new_id("cred"), new_id("ctk")
+    token_id = new_id("ctk")
     with engine.begin() as db:
         tenant_id = add_tenant(db)
-        add_credential(db, tenant_id, credential_id=credential_id, kind=ADMIN, scopes=[])
+        credential_id = add_credential(db, tenant_id, kind=ADMIN, scopes=[])
         token = {"token_id": token_id, "token_digest": token_digest(plain)}
         db.execute(token_insert(tenant_id, credential_id, **token))
     try:
@@ -446,15 +455,6 @@ def test_a_token_under_an_admin_principal_is_treated_as_unknown(client, engine):
         with engine.begin() as db:
             db.execute(delete(CredentialToken).where(CredentialToken.token_id == token_id))
             db.execute(delete(Credential).where(Credential.credential_id == credential_id))
-
-
-def test_with_several_reasons_the_first_in_order_is_recorded(client, engine, overrides, reason):
-    caller = issue(engine, **overrides)
-    rid = request_id()
-    response = client.get("/test/items/item-1", headers=caller.auth | {"X-Request-ID": rid})
-    assert error_of(response, 401) == EXPECTED_401
-    [event] = events(engine, rid)
-    assert event["details"] == {"reason": reason}
 
 
 def test_both_tokens_work_during_rotation_and_the_old_one_stops_at_its_deadline(client, engine):
