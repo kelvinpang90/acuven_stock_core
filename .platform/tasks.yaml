@@ -3066,7 +3066,7 @@ tasks:
       三，Execution 改为持有上下文：新增 context 属性；record_security_event 按上下文与上面的 HTTP 三项组事件；connection、operation、request_digest、keep_on_rejection、BusinessRefTaken、RedoCommand 的用法不变。暂时保留 access 与 request 两个兼容属性，返回值与现在相同，服务层与接口层一处不改（CORE-TASK-075、076 改读上下文，079 去掉兼容属性）。
       四，tests/integration/test_idempotency.py 里的测试命令改读 execution.context，并加下面验收标准里的测试。
       明确不做：服务层与接口层（075、076）；入口种类的检查（契约 5.10 由后台执行器建上下文时做，随后台执行器的任务）；按业务引用返回原结果的标记（工作包 P2c′）；平台事件执行器。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 新增 app/services/command_context.py，只改 allowed_change_paths 里的其余文件；测试用 ast 读这个模块的 import，没有 fastapi 与 starlette
