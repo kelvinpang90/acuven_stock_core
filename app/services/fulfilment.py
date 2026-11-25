@@ -161,11 +161,11 @@ def find_order_document(
 def _find(
     execution: Execution, document_type: str, document_ref: str
 ) -> OrderDocumentRecord | None:
-    principal = execution.access.principal
+    context = execution.context
     return find_order_document(
         execution.connection,
-        principal.tenant_id,
-        principal.channel_id,
+        context.tenant_id,
+        context.channel_id,
         document_type,
         document_ref,
     )
@@ -208,22 +208,21 @@ def insert_order_document(
 
     撞唯一约束（并发的同一引用先提交）时抛 BusinessRefTaken，在 create_document 里重新判定。
     """
-    access = execution.access
-    principal = access.principal
+    context = execution.context
     values = {
         "document_id": document_id,
-        "tenant_id": principal.tenant_id,
-        "channel_id": principal.channel_id,
+        "tenant_id": context.tenant_id,
+        "channel_id": context.channel_id,
         "pool_id": pool_id,
         "reservation_id": reservation_id,
         "document_type": document_type,
         "document_ref": document_ref,
         "request_hash": execution.request_digest,
         "result": result,
-        "credential_id": principal.credential_id,
-        "actor_ref": None if access.actor is None else access.actor.ref,
-        "actor_role": None if access.actor is None else access.actor.role,
-        "request_id": execution.request.state.request_id,
+        "credential_id": context.credential_id,
+        "actor_ref": None if context.actor is None else context.actor.ref,
+        "actor_role": None if context.actor is None else context.actor.role,
+        "request_id": context.request_id,
         "created_at": created_at,
     }
     try:
@@ -361,11 +360,11 @@ def _execute(
 ) -> CommandResult:
     """第 2–5 步。"""
     connection = execution.connection
-    principal = execution.access.principal
-    tenant_id = principal.tenant_id
+    context = execution.context
+    tenant_id = context.tenant_id
 
     # 第 2 步：锁预留行。
-    reservation = lock_reservation_by_ref(connection, tenant_id, principal.channel_id, order_ref)
+    reservation = lock_reservation_by_ref(connection, tenant_id, context.channel_id, order_ref)
     if reservation is None:
         not_found = ApiError(404, RESERVATION_NOT_FOUND, "reservation not found")
         return _reject(execution, document_type, document_ref, not_found)

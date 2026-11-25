@@ -400,7 +400,7 @@ def test_concurrent_resets_of_one_pool_and_day_take_effect_once(
     lock_balances = demo_reset_service.lock_balances
 
     def gated(execution, pool_id, sku_ids):
-        late = execution.request.state.request_id == late_rid
+        late = execution.context.request_id == late_rid
         if late:
             before_lock.pass_through()
         balances = lock_balances(execution, pool_id, sku_ids)

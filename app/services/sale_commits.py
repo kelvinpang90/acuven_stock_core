@@ -219,7 +219,7 @@ class CommitSkus:
 
 
 def _tenant_id(execution: Execution) -> str:
-    return execution.access.principal.tenant_id
+    return execution.context.tenant_id
 
 
 def _payment_ref_conflict(execution: Execution, payment_ref: str) -> ApiError:
@@ -253,9 +253,9 @@ def _answer_by_payment_ref(
     在本订单上且已 committed 按 _answer_committed 回答；
     其他（待审、已结案或没查到）返回 None，继续判定。
     """
-    principal = execution.access.principal
+    context = execution.context
     paid = find_reservation_by_payment_ref(
-        execution.connection, principal.tenant_id, principal.channel_id, payment_ref
+        execution.connection, context.tenant_id, context.channel_id, payment_ref
     )
     if paid is None:
         return None
@@ -295,13 +295,13 @@ def _state_conflict(status: str, **details: Any) -> ApiError:
 
 def _commit_columns(execution: Execution) -> dict[str, Any]:
     """确认（或转入待审）的摘要与 commit_* 各列，取本次请求（§5.7 存放）。"""
-    access = execution.access
+    context = execution.context
     return {
         "commit_request_hash": execution.request_digest,
-        "commit_credential_id": access.principal.credential_id,
-        "commit_actor_ref": None if access.actor is None else access.actor.ref,
-        "commit_actor_role": None if access.actor is None else access.actor.role,
-        "commit_request_id": execution.request.state.request_id,
+        "commit_credential_id": context.credential_id,
+        "commit_actor_ref": None if context.actor is None else context.actor.ref,
+        "commit_actor_role": None if context.actor is None else context.actor.role,
+        "commit_request_id": context.request_id,
     }
 
 
@@ -576,11 +576,10 @@ def _insert_created(
     撞 order_ref 或 payment_ref 的唯一约束（并发的预留或确认先提交）时抛 RedoCommand，
     重做时按已有的预留回答。
     """
-    access = execution.access
-    principal = access.principal
+    context = execution.context
     values = {
         "reservation_id": reservation.reservation_id,
-        "tenant_id": principal.tenant_id,
+        "tenant_id": context.tenant_id,
         "channel_id": reservation.channel_id,
         "pool_id": reservation.pool_id,
         "order_ref": reservation.order_ref,
@@ -588,10 +587,10 @@ def _insert_created(
         "ttl_seconds": ttl_seconds,
         "expires_at": reservation.expires_at,
         "request_hash": reservation.request_hash,
-        "credential_id": principal.credential_id,
-        "actor_ref": None if access.actor is None else access.actor.ref,
-        "actor_role": None if access.actor is None else access.actor.role,
-        "request_id": execution.request.state.request_id,
+        "credential_id": context.credential_id,
+        "actor_ref": None if context.actor is None else context.actor.ref,
+        "actor_role": None if context.actor is None else context.actor.role,
+        "request_id": context.request_id,
         "created_at": reservation.created_at,
         "closed_at": reservation.closed_at,
         "payment_ref": reservation.payment_ref,
@@ -614,7 +613,7 @@ def _insert_created(
         connection.execute(
             insert(OrderLine).values(
                 order_line_id=new_id(ORDER_LINE_ID_PREFIX),
-                tenant_id=principal.tenant_id,
+                tenant_id=context.tenant_id,
                 reservation_id=reservation.reservation_id,
                 pool_id=reservation.pool_id,
                 sku_id=line.sku_id,
@@ -634,8 +633,8 @@ def _create_from_fault(
     → SKU 行（FOR SHARE，按 sku_id 升序）。
     """
     connection = execution.connection
-    principal = execution.access.principal
-    tenant_id = principal.tenant_id
+    context = execution.context
+    tenant_id = context.tenant_id
     pool_id = skus.pool_id
     sku_ids = [line.sku_id for line in commit.lines]
     events_from = len(execution.events)
@@ -669,12 +668,12 @@ def _create_from_fault(
     )
 
     now = command_now(execution)
-    ttl_seconds = execution.request.app.state.reservation_ttl_seconds
+    ttl_seconds = context.reservation_ttl_seconds
     enough = not shortfalls
     # 从未 active：closed_at 为创建时间，expires_at 只是形式值。
     created = ReservationRecord(
         reservation_id=new_id(RESERVATION_ID_PREFIX),
-        channel_id=principal.channel_id,
+        channel_id=context.channel_id,
         order_ref=order_ref,
         pool_id=pool_id,
         status=COMMITTED if enough else LATE_PAYMENT_REVIEW,
@@ -735,8 +734,8 @@ def create_sale_commit(
     skus 是本请求开事务前处理过的 SKU（skus.prepared），晚到确认与故障补交新建判可售时要用。
     """
     connection = execution.connection
-    principal = execution.access.principal
-    tenant_id = principal.tenant_id
+    context = execution.context
+    tenant_id = context.tenant_id
 
     # 第 1 步：业务引用。
     answered = _answer_by_payment_ref(execution, order_ref, commit.payment_ref)
@@ -744,7 +743,7 @@ def create_sale_commit(
         return answered
 
     # 第 2 步：锁预留行。第 2–4 步不写东西的拒绝都经 _reject，先重查业务引用。
-    reservation = lock_reservation_by_ref(connection, tenant_id, principal.channel_id, order_ref)
+    reservation = lock_reservation_by_ref(connection, tenant_id, context.channel_id, order_ref)
     if reservation is None:
         if commit.reservation_id is not None:
             # 不按这个 ID 另查，不记事件。
@@ -812,9 +811,9 @@ def create_sale_commit(
 def close_late_payment_review(execution: Execution, order_ref: str) -> CommandResult:
     """待审结案（§5.7）：网店已退款，Core 只记下结案；待审时没有扣过数，不写流水。"""
     connection = execution.connection
-    principal = execution.access.principal
-    tenant_id = principal.tenant_id
-    reservation = lock_reservation_by_ref(connection, tenant_id, principal.channel_id, order_ref)
+    context = execution.context
+    tenant_id = context.tenant_id
+    reservation = lock_reservation_by_ref(connection, tenant_id, context.channel_id, order_ref)
     if reservation is None:
         raise ApiError(404, RESERVATION_NOT_FOUND, "reservation not found")
     if reservation.status == CLOSED_REFUNDED:
@@ -829,7 +828,6 @@ def close_late_payment_review(execution: Execution, order_ref: str) -> CommandRe
             details={"status": status},
         )
 
-    access = execution.access
     connection.execute(
         update(Reservation)
         .where(
@@ -839,10 +837,10 @@ def close_late_payment_review(execution: Execution, order_ref: str) -> CommandRe
         .values(
             status=CLOSED_REFUNDED,
             review_closed_at=now,
-            review_closed_credential_id=principal.credential_id,
-            review_closed_actor_ref=None if access.actor is None else access.actor.ref,
-            review_closed_actor_role=None if access.actor is None else access.actor.role,
-            review_closed_request_id=execution.request.state.request_id,
+            review_closed_credential_id=context.credential_id,
+            review_closed_actor_ref=None if context.actor is None else context.actor.ref,
+            review_closed_actor_role=None if context.actor is None else context.actor.role,
+            review_closed_request_id=context.request_id,
             last_changed_at=now,
         )
     )

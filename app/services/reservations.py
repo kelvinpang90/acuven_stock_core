@@ -318,7 +318,7 @@ def current_representation(
 
 
 def _tenant_id(execution: Execution) -> str:
-    return execution.access.principal.tenant_id
+    return execution.context.tenant_id
 
 
 def _outside_create(execution: Execution) -> CommandResult:
@@ -424,11 +424,10 @@ def _reserve(
         raise ApiError(409, INSUFFICIENT_STOCK, "not enough available stock", details=details)
 
     now = command_now(execution)
-    access = execution.access
-    principal = access.principal
+    context = execution.context
     record = ReservationRecord(
         reservation_id=new_id(RESERVATION_ID_PREFIX),
-        channel_id=principal.channel_id,
+        channel_id=context.channel_id,
         order_ref=order_ref,
         pool_id=pool_id,
         status=ACTIVE,
@@ -442,7 +441,7 @@ def _reserve(
         execution,
         {
             "reservation_id": record.reservation_id,
-            "tenant_id": principal.tenant_id,
+            "tenant_id": context.tenant_id,
             "channel_id": record.channel_id,
             "pool_id": pool_id,
             "order_ref": order_ref,
@@ -450,10 +449,10 @@ def _reserve(
             "ttl_seconds": ttl_seconds,
             "expires_at": record.expires_at,
             "request_hash": record.request_hash,
-            "credential_id": principal.credential_id,
-            "actor_ref": None if access.actor is None else access.actor.ref,
-            "actor_role": None if access.actor is None else access.actor.role,
-            "request_id": execution.request.state.request_id,
+            "credential_id": context.credential_id,
+            "actor_ref": None if context.actor is None else context.actor.ref,
+            "actor_role": None if context.actor is None else context.actor.role,
+            "request_id": context.request_id,
             "created_at": now,
             "last_changed_at": now,
         },
@@ -464,7 +463,7 @@ def _reserve(
         connection.execute(
             insert(OrderLine).values(
                 order_line_id=new_id(ORDER_LINE_ID_PREFIX),
-                tenant_id=principal.tenant_id,
+                tenant_id=context.tenant_id,
                 reservation_id=record.reservation_id,
                 pool_id=pool_id,
                 sku_id=line.sku_id,
@@ -501,13 +500,11 @@ def create_reservation(
     查到（并发的另一个请求已提交）或写预留撞唯一约束时抛 BusinessRefTaken，
     执行器在新事务里按第 1 步重新判定。
     """
-    principal = execution.access.principal
+    context = execution.context
 
     def find(execution: Execution) -> ReservationRecord | None:
         connection = execution.connection
-        return find_reservation_by_ref(
-            connection, principal.tenant_id, principal.channel_id, order_ref
-        )
+        return find_reservation_by_ref(connection, context.tenant_id, context.channel_id, order_ref)
 
     def rejudge(execution: Execution) -> CommandResult:
         existing = find(execution)
@@ -757,7 +754,6 @@ def release_reservation(execution: Execution, reservation_id: str, reason: str) 
     # 流水的 channel_id 取预留的销售入口（§5.6），其余身份取本请求的。
     identity = replace(entry_identity(execution), channel_id=reservation.channel_id)
     lines = _release_lines(connection, tenant_id, reservation, identity, reason, now)
-    access = execution.access
     statement = update(Reservation).where(
         Reservation.tenant_id == tenant_id, Reservation.reservation_id == reservation_id
     )
@@ -765,7 +761,7 @@ def release_reservation(execution: Execution, reservation_id: str, reason: str) 
         statement.values(
             status=RELEASED,
             release_reason=reason,
-            released_credential_id=access.principal.credential_id,
+            released_credential_id=execution.context.credential_id,
             released_actor_ref=identity.actor_ref,
             released_actor_role=identity.actor_role,
             released_request_id=identity.request_id,

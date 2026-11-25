@@ -79,7 +79,7 @@ class _Existing:
 def _find_reset(execution: Execution, fields: ResetFields) -> _Existing | None:
     """按 (tenant_id, pool_id, business_date) 用普通读查。"""
     statement = select(DemoReset.request_hash, DemoReset.result).where(
-        DemoReset.tenant_id == execution.access.principal.tenant_id,
+        DemoReset.tenant_id == execution.context.tenant_id,
         DemoReset.pool_id == fields.pool_id,
         DemoReset.business_date == fields.business_date,
     )
@@ -122,20 +122,19 @@ def _insert_reset(
     result: dict[str, Any],
 ) -> None:
     """写 demo_resets 一行；channel_id 取凭据的销售入口。撞唯一约束时抛 BusinessRefTaken。"""
-    access = execution.access
-    principal = access.principal
+    context = execution.context
     values = {
         "reset_id": reset_id,
-        "tenant_id": principal.tenant_id,
-        "channel_id": principal.channel_id,
+        "tenant_id": context.tenant_id,
+        "channel_id": context.channel_id,
         "pool_id": fields.pool_id,
         "business_date": fields.business_date,
         "request_hash": execution.request_digest,
         "result": result,
-        "credential_id": principal.credential_id,
-        "actor_ref": None if access.actor is None else access.actor.ref,
-        "actor_role": None if access.actor is None else access.actor.role,
-        "request_id": execution.request.state.request_id,
+        "credential_id": context.credential_id,
+        "actor_ref": None if context.actor is None else context.actor.ref,
+        "actor_role": None if context.actor is None else context.actor.role,
+        "request_id": context.request_id,
         "created_at": created_at,
     }
     try:

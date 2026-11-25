@@ -503,7 +503,7 @@ def test_a_concurrent_reservation_of_the_same_order_answers_with_the_winner(
 
     def gated(execution, pool_id):
         # 第 1 步（按 order_ref 查预留）之后、锁余额行之前。
-        key = execution.access.idempotency_key
+        key = execution.context.idempotency_key
         passed.append(key)
         if key == first_key:
             # 后到者预建完余额行、查过 order_ref（没有）之后，先到者才锁余额行并提交。
