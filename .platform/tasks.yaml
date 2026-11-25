@@ -3204,7 +3204,7 @@ tasks:
       逐个开通允许池停在只有 platform、还没有 backoffice 的中间状态（反过来也一样）；之后后台执行器找不到池的 backoffice 入口时怎么处理，留给后台的任务，本任务不管。
       四，app/cli/service_auth.py 的 credential issue：--channel 只接受 api 入口，指向别的种类以退出码 2 结束、什么也不写。app/cli/__init__.py 的 require_channel 不取 kind（也不在本任务路径里），照旧调它之后在 service_auth.py 里另查这个入口的 kind。
       明确不做：配额、平台商品、平台订单、收件箱与连接（第 2 组起）；后台；让 platform、backoffice 入口经任何执行器写。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-077
     acceptance_criteria:
