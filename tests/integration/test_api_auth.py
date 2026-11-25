@@ -16,7 +16,7 @@ import pytest
 from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from sqlalchemy import Connection, Engine, insert, literal_column, make_url, select, update
+from sqlalchemy import Connection, Engine, delete, insert, literal_column, make_url, select, update
 from sqlalchemy.exc import OperationalError
 
 from app.api.auth import (
@@ -37,6 +37,7 @@ from app.config import Settings
 from app.db import make_engine
 from app.domain.requests import CATALOG_ADMIN, STOCK_ADMIN, STOCK_OPERATOR, Actor
 from app.domain.service_auth import (
+    ADMIN,
     CATALOG_READ,
     CATALOG_WRITE,
     ORDERS_WRITE,
@@ -48,7 +49,7 @@ from app.domain.service_auth import (
 from app.main import create_app
 from app.models.catalog import Tenant
 from app.models.inventory import StockBalance
-from app.models.service_auth import CredentialToken, SecurityEvent
+from app.models.service_auth import Credential, CredentialToken, SecurityEvent
 from app.services import security_events
 from tests.integration.conftest import TEST_DATABASE_URL, add_credential, new_id
 from tests.integration.test_inventory_schema import (
@@ -407,6 +408,46 @@ def test_every_bad_credential_gets_the_same_401_and_its_reason_is_only_in_the_ev
         ({"credential": REVOKED_CREDENTIAL, "tenant_status": "inactive"}, "credential_revoked"),
     ],
 )
+def test_a_token_under_an_admin_principal_is_treated_as_unknown(client, engine):
+    """鉴权只认 service 主体：令牌挂在 admin 下时与令牌不存在一样，对外不区分原因。"""
+    plain = generate_token()
+    credential_id, token_id = new_id("cred"), new_id("ctk")
+    with engine.begin() as db:
+        tenant_id = add_tenant(db)
+        add_credential(db, tenant_id, credential_id=credential_id, kind=ADMIN, scopes=[])
+        token = {"token_id": token_id, "token_digest": token_digest(plain)}
+        db.execute(token_insert(tenant_id, credential_id, **token))
+    try:
+        observed = []
+        for bearer in (plain, generate_token()):
+            rid = request_id()
+            headers = {"Authorization": f"Bearer {bearer}", "X-Request-ID": rid}
+            response = client.get("/test/items/item-1", headers=headers)
+            [event] = events(engine, rid)
+            recorded = {
+                column: event[column]
+                for column in ("event_type", "tenant_id", "credential_id", "details", "path")
+            }
+            observed.append((error_of(response, 401), recorded))
+        admin, unknown = observed
+        assert admin == unknown
+        assert admin == (
+            EXPECTED_401,
+            {
+                "event_type": "invalid_credential",
+                "tenant_id": None,
+                "credential_id": None,
+                "details": {"reason": "token_not_found"},
+                "path": "/test/items/item-1",
+            },
+        )
+    finally:
+        # 先删令牌再删主体：会话结束时 demo 库要能降到 base。
+        with engine.begin() as db:
+            db.execute(delete(CredentialToken).where(CredentialToken.token_id == token_id))
+            db.execute(delete(Credential).where(Credential.credential_id == credential_id))
+
+
 def test_with_several_reasons_the_first_in_order_is_recorded(client, engine, overrides, reason):
     caller = issue(engine, **overrides)
     rid = request_id()

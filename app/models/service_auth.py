@@ -19,6 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+from app.domain.service_auth import ADMIN, PRINCIPAL_KINDS, SERVICE, SYSTEM
 from app.models.catalog import EXACT_COLLATION, ID, NOW, STATUS, TABLE_OPTIONS, TIMESTAMP
 from app.models.inventory import CODE32, REF
 
@@ -37,13 +38,31 @@ EVENT_TYPES = (
 )
 
 
-def _one_of(column: str, values: tuple[str, ...]) -> CheckConstraint:
+def _in(column: str, values: tuple[str, ...]) -> str:
     allowed = ", ".join(f"'{value}'" for value in values)
-    return CheckConstraint(f"{column} IN ({allowed})", name=column)
+    return f"{column} IN ({allowed})"
+
+
+def _one_of(column: str, values: tuple[str, ...]) -> CheckConstraint:
+    return CheckConstraint(_in(column, values), name=column)
+
+
+# kind 为未知值时下面两条不拦，只由 kind 那条拒绝。
+_NO_SCOPE_KINDS = (ADMIN, SYSTEM)
+_SCOPES_BY_KIND = (
+    "JSON_TYPE(scopes) = 'ARRAY'"
+    f" AND (kind <> '{SERVICE}' OR JSON_LENGTH(scopes) > 0)"
+    f" AND (NOT ({_in('kind', _NO_SCOPE_KINDS)}) OR JSON_LENGTH(scopes) = 0)"
+)
+_CHANNEL_BY_KIND = f"NOT ({_in('kind', _NO_SCOPE_KINDS)}) OR channel_id IS NULL"
 
 
 class Credential(Base):
-    """一个调用方服务身份；scope 签发后不改（契约第 10 节第 4 条）。"""
+    """一个操作主体（契约第 10 节第 4 条）；scope 签发后不改。
+
+    service 是调用方服务身份，scope 非空；admin 与 system 不带 scope、不带销售入口。
+    令牌只签给 service（命令行与鉴权两处保证），credential_tokens 不按种类加约束。
+    """
 
     __tablename__ = "credentials"
     __table_args__ = (
@@ -53,8 +72,10 @@ class Credential(Base):
         ),
         # 复合外键 (tenant_id, credential_id) 的引用目标。
         UniqueConstraint("tenant_id", "credential_id"),
-        # scope 的取值由应用校验，这里只要求是非空数组。
-        CheckConstraint("JSON_TYPE(scopes) = 'ARRAY' AND JSON_LENGTH(scopes) > 0", name="scopes"),
+        _one_of("kind", PRINCIPAL_KINDS),
+        # scope 的取值由应用校验，这里只要求是数组：service 非空，admin 与 system 为空。
+        CheckConstraint(_SCOPES_BY_KIND, name="scopes"),
+        CheckConstraint(_CHANNEL_BY_KIND, name="channel"),
         _one_of("status", ("active", "revoked")),
         CheckConstraint("(status = 'revoked') = (revoked_at IS NOT NULL)", name="revoked_at"),
         TABLE_OPTIONS,
@@ -65,6 +86,7 @@ class Credential(Base):
     channel_id: Mapped[str | None] = mapped_column(ID)
     name: Mapped[str] = mapped_column(String(200))
     scopes: Mapped[list[str]] = mapped_column(JSON)
+    kind: Mapped[str] = mapped_column(STATUS, server_default=SERVICE)
     status: Mapped[str] = mapped_column(STATUS)
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=NOW)

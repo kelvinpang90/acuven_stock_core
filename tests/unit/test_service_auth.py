@@ -3,15 +3,19 @@ import unittest
 from datetime import UTC, datetime, timedelta
 
 from app.domain.service_auth import (
+    ADMIN,
     CATALOG_READ,
     CATALOG_WRITE,
     DEMO_RESET,
     OPS_READ,
     ORDERS_READ,
     ORDERS_WRITE,
+    PRINCIPAL_KINDS,
     SCOPES,
+    SERVICE,
     STOCK_READ,
     STOCK_WRITE,
+    SYSTEM,
     InvalidOption,
     InvalidScopes,
     PoolDecision,
@@ -32,6 +36,13 @@ from app.domain.service_auth import (
 
 TOKEN = generate_token(bytes(range(32)))
 NOW = datetime(2026, 11, 13, 8, 0, tzinfo=UTC)
+
+
+class PrincipalKindTest(unittest.TestCase):
+    def test_the_three_kinds_of_principal(self):
+        # 契约第 10 节第 4 条：库里的检查约束与鉴权都按这三个精确值。
+        self.assertEqual(PRINCIPAL_KINDS, ("service", "admin", "system"))
+        self.assertEqual((SERVICE, ADMIN, SYSTEM), PRINCIPAL_KINDS)
 
 
 class TokenFormatTest(unittest.TestCase):
