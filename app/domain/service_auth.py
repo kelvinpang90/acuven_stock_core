@@ -20,6 +20,13 @@ _TOKEN = re.compile(r"csk_[A-Za-z0-9_-]{43}")
 
 ACTIVE = "active"
 
+# 操作主体的种类（契约第 10 节第 4 条）：令牌由命令行只签给 service，鉴权也只认 service；
+# admin 与 system 不带 scope、不带销售入口。
+SERVICE = "service"
+ADMIN = "admin"
+SYSTEM = "system"
+PRINCIPAL_KINDS = (SERVICE, ADMIN, SYSTEM)
+
 CATALOG_READ = "catalog.read"
 CATALOG_WRITE = "catalog.write"
 STOCK_READ = "stock.read"

@@ -57,6 +57,7 @@ from app.domain.requests import (
 from app.domain.service_auth import (
     ACTIVE,
     SCOPES,
+    SERVICE,
     PoolDecision,
     authorize_pool,
     authorize_sales_command,
@@ -202,7 +203,10 @@ def _read[T](request: Request, query: Callable[[Connection], T]) -> T:
 
 
 def _principal_query(digest: str):
-    """按摘要查令牌，同一条查询里联查凭据、租户、销售入口与入口绑定的池；带上数据库时间。"""
+    """按摘要查令牌，同一条查询里联查凭据、租户、销售入口与入口绑定的池；带上数据库时间。
+
+    只认 service 主体：令牌挂在别的种类下时查不到，与令牌不存在一样（契约第 10 节第 4 条）。
+    """
     return (
         select(
             CredentialToken.revoked_at.label("token_revoked_at"),
@@ -223,6 +227,7 @@ def _principal_query(digest: str):
             and_(
                 Credential.tenant_id == CredentialToken.tenant_id,
                 Credential.credential_id == CredentialToken.credential_id,
+                Credential.kind == SERVICE,
             ),
         )
         .join(Tenant, Tenant.tenant_id == Credential.tenant_id)

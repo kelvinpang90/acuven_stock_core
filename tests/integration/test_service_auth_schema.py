@@ -2,19 +2,34 @@
 
 幂等记录与流水指向凭据的外键见 test_inventory_schema。
 连接夹具 db 与 assert_rejected_by 见 conftest。
+0012 的升降照 test_demo_reset_schema 的先例在 production 库上做，不动共享的 demo 库；
+无论成败都在 finally 里升回 head，提交进去的行也在 finally 里删掉。
 """
 
 from datetime import datetime
 
-from sqlalchemy import Connection, insert, select
+import pytest
+from sqlalchemy import Connection, Engine, delete, insert, inspect, select
 from sqlalchemy.sql.expression import Executable
 
-from app.domain.service_auth import generate_token, token_digest
-from app.models.service_auth import EVENT_TYPES, CredentialToken, SecurityEvent
+from alembic import command
+from app.domain.environment import PRODUCTION
+from app.domain.service_auth import ADMIN, SERVICE, SYSTEM, generate_token, token_digest
+from app.models.catalog import Tenant
+from app.models.service_auth import EVENT_TYPES, Credential, CredentialToken, SecurityEvent
 from tests.integration.conftest import add_credential, assert_rejected_by, credential_insert, new_id
+from tests.integration.test_demo_reset_schema import (
+    alembic_version,
+    head_revision,
+    migrate_production,
+    rolled_back,
+)
 from tests.integration.test_inventory_schema import add_channel, add_pool, add_tenant
 
 REVOKED_AT = datetime(2026, 11, 13, 9, 0)
+SCOPES_CHECK = "ck_credentials_scopes"
+KIND_CHECK = "ck_credentials_kind"
+CHANNEL_CHECK = "ck_credentials_channel"
 
 
 def token_insert(tenant_id: str, credential_id: str, **overrides: object) -> Executable:
@@ -71,6 +86,44 @@ def test_credential_status_must_be_an_exact_known_value(db: Connection):
     tenant = add_tenant(db)
     for status in ["Active", "ACTIVE", "Revoked", "REVOKED", "inactive"]:
         assert_rejected_by(db, credential_insert(tenant, status=status), "ck_credentials_status")
+
+
+# 操作主体的种类（契约第 10 节第 4 条）
+
+
+def kind_of(conn: Connection, credential_id: str) -> str:
+    statement = select(Credential.kind).where(Credential.credential_id == credential_id)
+    return conn.execute(statement).scalar_one()
+
+
+def test_kind_defaults_to_service(db: Connection):
+    tenant = add_tenant(db)
+    assert kind_of(db, add_credential(db, tenant)) == SERVICE
+
+
+def test_kind_must_be_an_exact_known_value(db: Connection):
+    tenant = add_tenant(db)
+    for kind in ["Service", "ADMIN", "System", "operator", ""]:
+        assert_rejected_by(db, credential_insert(tenant, kind=kind), KIND_CHECK)
+        assert_rejected_by(db, credential_insert(tenant, kind=kind, scopes=[]), KIND_CHECK)
+
+
+def test_service_scopes_must_be_a_non_empty_array(db: Connection):
+    tenant = add_tenant(db)
+    assert_rejected_by(db, credential_insert(tenant, kind=SERVICE, scopes=[]), SCOPES_CHECK)
+    assert kind_of(db, add_credential(db, tenant, kind=SERVICE)) == SERVICE
+
+
+@pytest.mark.parametrize("kind", [ADMIN, SYSTEM])
+def test_admin_and_system_have_no_scopes_and_no_channel(db: Connection, kind: str):
+    tenant = add_tenant(db)
+    channel = add_channel(db, tenant, add_pool(db, tenant))
+    assert kind_of(db, add_credential(db, tenant, kind=kind, scopes=[])) == kind
+    for scopes in [["catalog.read"], ["ops.read"], {}, "catalog.read"]:
+        assert_rejected_by(db, credential_insert(tenant, kind=kind, scopes=scopes), SCOPES_CHECK)
+    assert_rejected_by(
+        db, credential_insert(tenant, kind=kind, scopes=[], channel_id=channel), CHANNEL_CHECK
+    )
 
 
 # 令牌（契约第 10 节第 4 条）
@@ -155,3 +208,67 @@ def test_event_occurred_at_defaults_to_database_time(db: Connection):
         select(SecurityEvent.occurred_at).where(SecurityEvent.event_id == event_id)
     ).scalar_one()
     assert occurred_at is not None
+
+
+# 0012 的升降（production 库）
+
+
+def has_kind(engine: Engine) -> bool:
+    return "kind" in {column["name"] for column in inspect(engine).get_columns("credentials")}
+
+
+def remove_committed(engine: Engine, rows: list[tuple[str, str]]) -> None:
+    """删掉测试提交的 (租户, 凭据)：它们没有令牌，也没有别的行引用。"""
+    with engine.begin() as conn:
+        for tenant_id, credential_id in rows:
+            conn.execute(delete(Credential).where(Credential.credential_id == credential_id))
+            conn.execute(delete(Tenant).where(Tenant.tenant_id == tenant_id))
+
+
+def test_downgrade_to_0011_and_back_keeps_existing_credentials_as_service(
+    production_engine: Engine,
+):
+    committed: list[tuple[str, str]] = []
+    try:
+        migrate_production(command.downgrade, "0011", PRODUCTION)
+        try:
+            assert alembic_version(production_engine) == "0011"
+            assert not has_kind(production_engine)
+            # 0003 的原约束回来了：scopes 一律非空。
+            with rolled_back(production_engine) as conn:
+                tenant = add_tenant(conn)
+                assert_rejected_by(conn, credential_insert(tenant, scopes=[]), SCOPES_CHECK)
+            # 0011 上已有的行，升级后是 service。
+            with production_engine.begin() as conn:
+                tenant = add_tenant(conn)
+                committed.append((tenant, add_credential(conn, tenant)))
+        finally:
+            migrate_production(command.upgrade, "head", PRODUCTION)
+        assert alembic_version(production_engine) == head_revision()
+        assert has_kind(production_engine)
+        with production_engine.connect() as conn:
+            assert kind_of(conn, committed[0][1]) == SERVICE
+        with rolled_back(production_engine) as conn:
+            tenant = add_tenant(conn)
+            assert kind_of(conn, add_credential(conn, tenant, kind=ADMIN, scopes=[])) == ADMIN
+            assert_rejected_by(conn, credential_insert(tenant, scopes=[]), SCOPES_CHECK)
+    finally:
+        remove_committed(production_engine, committed)
+
+
+def test_downgrade_fails_without_changes_while_admin_or_system_principals_exist(
+    production_engine: Engine,
+):
+    with production_engine.begin() as conn:
+        tenant = add_tenant(conn)
+        committed = [(tenant, add_credential(conn, tenant, kind=SYSTEM, scopes=[]))]
+    try:
+        with pytest.raises(RuntimeError):
+            migrate_production(command.downgrade, "0011", PRODUCTION)
+        assert alembic_version(production_engine) == head_revision()
+        assert has_kind(production_engine)
+        with production_engine.connect() as conn:
+            assert kind_of(conn, committed[0][1]) == SYSTEM
+    finally:
+        remove_committed(production_engine, committed)
+        migrate_production(command.upgrade, "head", PRODUCTION)

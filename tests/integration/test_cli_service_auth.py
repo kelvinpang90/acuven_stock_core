@@ -8,6 +8,7 @@
 import json
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -15,7 +16,7 @@ import pytest
 from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from sqlalchemy import DateTime, Engine, func, insert, literal_column, select, update
+from sqlalchemy import DateTime, Engine, delete, func, insert, literal_column, select, update
 from sqlalchemy.exc import OperationalError
 
 from app.api.auth import authorize, get_access
@@ -23,11 +24,14 @@ from app.api.errors import ok
 from app.config import Settings
 from app.domain.environment import PRODUCTION
 from app.domain.service_auth import (
+    ADMIN,
     CATALOG_READ,
     DEMO_RESET,
     OPS_READ,
     ORDERS_WRITE,
+    SERVICE,
     STOCK_READ,
+    SYSTEM,
     generate_token,
     is_token_format,
     token_digest,
@@ -189,6 +193,45 @@ def db_now(engine: Engine) -> datetime:
         return conn.execute(select(DB_NOW)).scalar_one()
 
 
+@contextmanager
+def admin_and_system(engine: Engine, tenant_id: str) -> Iterator[dict[str, str]]:
+    """直接插入并提交的 admin 与 system 主体（按种类给出 ID），各挂一个令牌。
+
+    退出时先删令牌再删主体（没有别的行引用它们）：共享的 demo 库在会话结束时
+    要降到 base，0012 的降级在库里有这两种主体时失败。
+    """
+    created: dict[str, str] = {}
+    try:
+        with engine.begin() as db:
+            for kind in (ADMIN, SYSTEM):
+                credential_id = new_id("cred")
+                created[kind] = credential_id
+                db.execute(
+                    insert(Credential).values(
+                        credential_id=credential_id,
+                        tenant_id=tenant_id,
+                        kind=kind,
+                        name=f"{kind} principal",
+                        scopes=[],
+                        status="active",
+                    )
+                )
+                db.execute(
+                    insert(CredentialToken).values(
+                        token_id=new_id("ctk"),
+                        tenant_id=tenant_id,
+                        credential_id=credential_id,
+                        token_digest=token_digest(generate_token()),
+                    )
+                )
+        yield created
+    finally:
+        ids = list(created.values())
+        with engine.begin() as db:
+            db.execute(delete(CredentialToken).where(CredentialToken.credential_id.in_(ids)))
+            db.execute(delete(Credential).where(Credential.credential_id.in_(ids)))
+
+
 def utc(value: datetime) -> str:
     return value.isoformat(timespec="microseconds") + "Z"
 
@@ -228,6 +271,8 @@ def test_issue_prints_the_token_once_and_stores_only_its_digest(cli, engine, cli
     }
 
     credential = credential_row(engine, credential_id)
+    # 命令行只签发 service 主体。
+    assert credential["kind"] == SERVICE
     assert credential["channel_id"] == shop.channel_id
     assert credential["scopes"] == list(SCOPES)
     assert credential["status"] == "active"
@@ -254,7 +299,9 @@ def test_issue_prints_the_token_once_and_stores_only_its_digest(cli, engine, cli
 def test_an_ops_credential_has_no_channel(cli, engine, shop):
     output = cli(*issue_argv(shop.tenant_id, scopes=(OPS_READ,))).json()
     assert output["channel_id"] is None
-    assert credential_row(engine, output["credential_id"])["scopes"] == [OPS_READ]
+    credential = credential_row(engine, output["credential_id"])
+    assert credential["scopes"] == [OPS_READ]
+    assert credential["kind"] == SERVICE
 
 
 @dataclass
@@ -512,6 +559,21 @@ def test_rejected_rotations_exit_2_and_change_nothing(case, operator, cli, engin
     assert (counts(engine), token_rows(engine, credential_id)) == before
 
 
+@pytest.mark.parametrize("kind", [ADMIN, SYSTEM])
+def test_rotate_and_revoke_refuse_admin_and_system_principals(cli, engine, shop, kind):
+    with admin_and_system(engine, shop.tenant_id) as principals:
+        credential_id = principals[kind]
+        before = counts(engine), credential_row(engine, credential_id)
+        tokens = token_rows(engine, credential_id)
+        for argv in (rotate_argv(credential_id, "24"), revoke_credential_argv(credential_id)):
+            result = cli(*argv)
+            assert result.code == 2
+            result.one_error_line()
+            assert (counts(engine), credential_row(engine, credential_id)) == before
+            assert token_rows(engine, credential_id) == tokens
+        assert events_of(engine, credential_id) == []
+
+
 def test_production_refuses_to_rotate_a_demo_reset_credential(cli, production_cli, engine, shop):
     credential_id = issue(cli, shop, scopes=(DEMO_RESET, ORDERS_WRITE))["credential_id"]
     before = counts(engine), token_rows(engine, credential_id)
@@ -664,6 +726,7 @@ def test_list_shows_the_tenants_credentials_and_tokens_without_digests(cli, engi
             {
                 "credential_id": credential_id,
                 "name": credential["name"],
+                "kind": credential["kind"],
                 "channel_id": credential["channel_id"],
                 "scopes": credential["scopes"],
                 "status": credential["status"],
@@ -681,6 +744,7 @@ def test_list_shows_the_tenants_credentials_and_tokens_without_digests(cli, engi
     assert rotated_tokens[0]["expires_at"] == rotated["expired_tokens"][0]["expires_at"]
     assert by_id[retired["credential_id"]]["status"] == "revoked"
     assert by_id[ops["credential_id"]]["channel_id"] is None
+    assert {credential["kind"] for credential in listed["credentials"]} == {SERVICE}
 
     # 不含摘要与明文令牌，也不含别的租户的凭据；只读，不写事件。
     for output in (shop_issue, rotated, ops, retired):
@@ -689,6 +753,21 @@ def test_list_shows_the_tenants_credentials_and_tokens_without_digests(cli, engi
     assert foreign["credential_id"] not in result.out
     assert foreign["token_id"] not in result.out
     assert counts(engine) == before
+
+
+def test_list_shows_the_kind_of_every_principal(cli, engine, shop):
+    service_id = issue(cli, shop)["credential_id"]
+    with admin_and_system(engine, shop.tenant_id) as principals:
+        before = counts(engine)
+        listed = cli("credential", "list", "--tenant", shop.tenant_id).json()
+        assert counts(engine) == before
+    by_id = {credential["credential_id"]: credential for credential in listed["credentials"]}
+    kinds = {credential_id: credential["kind"] for credential_id, credential in by_id.items()}
+    assert kinds == {service_id: SERVICE, principals[ADMIN]: ADMIN, principals[SYSTEM]: SYSTEM}
+    for kind in (ADMIN, SYSTEM):
+        assert by_id[principals[kind]]["scopes"] == []
+        assert by_id[principals[kind]]["channel_id"] is None
+        assert len(by_id[principals[kind]]["tokens"]) == 1
 
 
 def test_list_for_an_unknown_tenant_exits_2(cli):

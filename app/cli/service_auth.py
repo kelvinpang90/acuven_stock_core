@@ -3,6 +3,7 @@
 改变权限的四个子命令都必带 --actor 与 --reason，成功后返回 Audited，由 run_command 在业务事务
 提交之后另开短事务写一条安全事件。明文令牌只出现在成功输出的 JSON 里：库里只存摘要，
 不进安全事件、报错与日志；输出丢了就吊销那个令牌再轮换。
+只签发 service 凭据；admin 与 system 主体不由这里轮换与吊销，列出时每项带 kind。
 不做：修改凭据的 scope 或入口（要改就签发新凭据、吊销旧的）、恢复已吊销的对象、到期清理。
 """
 
@@ -18,6 +19,7 @@ from app.domain.ids import new_id
 from app.domain.requests import is_reference
 from app.domain.service_auth import (
     DEMO_RESET,
+    SERVICE,
     TOKEN_PREFIX,
     InvalidOption,
     InvalidScopes,
@@ -69,14 +71,25 @@ def _reject_demo_reset_in_production(args: Namespace, scopes: list[str]) -> None
 
 
 def _lock_active_credential(conn: Connection, credential_id: str) -> Row:
-    """按 ID 查凭据并加排他锁：并发的轮换与吊销排队，后到的看到的是前一个提交后的状态。"""
+    """按 ID 查凭据并加排他锁：并发的轮换与吊销排队，后到的看到的是前一个提交后的状态。
+
+    只管 service 凭据：admin 与 system 主体在这里拒绝，什么也不写。
+    """
     credential = conn.execute(
-        select(Credential.credential_id, Credential.tenant_id, Credential.scopes, Credential.status)
+        select(
+            Credential.credential_id,
+            Credential.tenant_id,
+            Credential.scopes,
+            Credential.kind,
+            Credential.status,
+        )
         .where(Credential.credential_id == credential_id)
         .with_for_update()
     ).one_or_none()
     if credential is None:
         raise CliError("credential not found")
+    if credential.kind != SERVICE:
+        raise CliError("only service credentials can be rotated or revoked here")
     if credential.status != ACTIVE:
         raise CliError("credential is already revoked")
     return credential
@@ -121,7 +134,8 @@ def issue_credential(conn: Connection, args: Namespace) -> Audited:
         "scopes": list(scopes),
         "status": ACTIVE,
     }
-    conn.execute(insert(Credential).values(credential))
+    # 命令行只签发 service 凭据；输出不变，不带 kind。
+    conn.execute(insert(Credential).values(credential | {"kind": SERVICE}))
     token_id, token = _add_token(conn, args.tenant, credential["credential_id"])
     event = SecurityEventRecord(
         CREDENTIAL_ISSUED,
@@ -272,6 +286,7 @@ def list_credentials(conn: Connection, args: Namespace) -> dict[str, Any]:
         select(
             Credential.credential_id,
             Credential.name,
+            Credential.kind,
             Credential.channel_id,
             Credential.scopes,
             Credential.status,
@@ -286,6 +301,7 @@ def list_credentials(conn: Connection, args: Namespace) -> dict[str, Any]:
             {
                 "credential_id": credential.credential_id,
                 "name": credential.name,
+                "kind": credential.kind,
                 "channel_id": credential.channel_id,
                 "scopes": credential.scopes,
                 "status": credential.status,
