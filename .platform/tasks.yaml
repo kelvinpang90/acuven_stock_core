@@ -3165,7 +3165,7 @@ tasks:
       二，命令行 app/cli/service_auth.py：credential issue 只建 service；credential rotate 与 credential revoke 对 admin、system 主体拒绝（退出码 2、一行原因、什么也不写、不记安全事件）；credential list 每项输出 kind。token revoke 不变。
       三，鉴权 app/api/auth.py：按令牌找主体时只认 kind 为 service 的；令牌挂在别的种类下时与令牌不存在一样 401 UNAUTHORIZED，对外不区分原因，安全事件照现有无效凭据的做法记。
       明确不做：建 admin 主体（随后台登录的任务）与 system 主体（CORE-TASK-078）；入口种类；service 凭据的任何行为变化。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 只改 allowed_change_paths；迁移为 alembic/versions/20261123_0012_principal_kind.py、down_revision 为 0011；upgrade 后 alembic check 无差异；降到 0011 再升回 head 照常，照 tests/integration/test_demo_reset_schema.py 的先例在 production 测试库上做，无论成败都在 finally 里升回 head，不动共享的 demo 库
