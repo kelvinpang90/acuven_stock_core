@@ -3208,7 +3208,7 @@ tasks:
     depends_on:
       - CORE-TASK-077
     acceptance_criteria:
-      - 只改 allowed_change_paths；迁移为 alembic/versions/20261123_0013_sales_channel_kind.py、down_revision 为 0012；upgrade 后 alembic check 无差异；降到 0012 再升回 head 照常，在 production 测试库上做、无论成败都在 finally 里升回 head，不动共享的 demo 库
+      - 只改 allowed_change_paths；迁移为 alembic/versions/20261123_0013_sales_channel_kind.py、down_revision 为 0012；upgrade 后 alembic check 无差异；降到 0012 再升回 head 照常，在 production 测试库上做、无论成败都在 finally 里升回 head，不动共享的 demo 库；tests/integration/test_service_auth_schema.py 里已有的 test_downgrade_fails_without_changes_while_admin_or_system_principals_exist 适配 0013：MySQL 的 DDL 不在事务里，从 head 降到 0011 时 0013 的降级先成功并提交版本 0012，0012 的降级再因 system 主体失败，所以版本停在 0012 而不是 head。改法二选一：先降到 0012、再试降到 0011 并认定 RuntimeError 后版本停在 0012；或从 head 降到 0011、认定 RuntimeError 后版本停在 0012。不论哪种，finally 里照旧删掉提交的行并升回 head；其余断言（credentials 的 kind 列仍在、system 主体仍是 SYSTEM）保留；0013 的降级不另加对 system 主体的拒绝（它只在一个池有多个入口时拒绝）；模型 SalesChannel 的 kind 列照 Credential.kind 的先例只用 server_default、不加 Python 端的 default（tests/integration/test_reservation_last_changed_at.py 在 0009 的结构上经 conftest 的 channel_insert 插入入口行，带 Python 端默认值会插入当时还没有的 kind 列而失败，这两个文件不在允许路径里）
       - 单元测试逐条验证组合规则：空池加 api、platform、backoffice 都允许；已有 api 时再加任何种类都拒绝；已有 platform 或 backoffice 时加 api 拒绝；已有 backoffice 时再加 backoffice 拒绝；已有两个 platform 与一个 backoffice 时再加 platform 允许；空、65 个字符、含空格或斜杠的店铺 ID 被拒；判定模块不 import 任何做 I/O 的库
       - 约束测试写在 tests/integration/test_inventory_schema.py：kind 取值以外、platform 入口缺 platform 或店铺 ID、api 或 backoffice 入口带了这两列、platform 取值以外、店铺 ID 字符集不对、同租户同平台同店铺 ID 重复，各被预期的那条约束拒绝；同一个池上的第二个入口不再被数据库拒绝（原来断言同池第二个入口被唯一约束拒绝的测试改为断言这一点）
       - 命令行测试写在 tests/integration/test_cli_provisioning.py，覆盖两种组合与各种违反：池上开通 api 之后再开任何种类被拒；开通两个 platform 与一个 backoffice 成功，第二个 backoffice 被拒、再加 api 被拒；被拒时库里没有新行；不带 --kind 的现有用法得 api 入口，已有的拒绝用例照常
@@ -3226,6 +3226,7 @@ tasks:
       - tests/integration/test_inventory_schema.py
       - tests/integration/test_cli_provisioning.py
       - tests/integration/test_cli_service_auth.py
+      - tests/integration/test_service_auth_schema.py
     allowed_commands:
       - tests.unit
       - lint.check
