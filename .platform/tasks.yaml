@@ -3096,7 +3096,7 @@ tasks:
       这四个服务调用的 app/services/stock.py 的公共函数（例如 entry_identity）里仍经兼容属性取值，由 CORE-TASK-076 改。
       两个测试里经兼容属性取值的钩子改读上下文：tests/integration/test_reservations_api.py 与 test_demo_resets_api.py。
       明确不做：库存、合并与目录类（076）；去掉兼容属性（079）；判定与写入的任何改动。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-074
     acceptance_criteria:
