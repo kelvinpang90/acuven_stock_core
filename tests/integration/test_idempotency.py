@@ -12,15 +12,19 @@
 重做路由声明了余额行预建、READ COMMITTED 与开事务前的钩子，命令同上插地点；
 预建函数与钩子可以按 marker 换掉，用来数调用次数、在重做期间停住。
 三遍路由声明了 READ COMMITTED 与最多做 3 遍，命令同上插地点。
+上下文路由直接调核心 run_with_context，命令上下文按 marker 取测试登记的，命令同上插地点。
 造数据与观察都用测试自己的连接；应用用自己的连接池。
 """
 
+import ast
 import hashlib
 import json
 import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
+from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 
@@ -37,10 +41,12 @@ from app.api.requests import ParsedBody, RequestBody, json_body
 from app.config import Settings
 from app.domain.catalog import catalog_lock_name
 from app.domain.idempotency import lock_name, request_digest
+from app.domain.requests import STOCK_ADMIN, STOCK_OPERATOR, Actor
 from app.domain.service_auth import STOCK_WRITE, generate_token, token_digest
 from app.main import create_app
 from app.models.inventory import IdempotencyRecord, Location, StockBalance
-from app.services import idempotency
+from app.services import command_context, idempotency
+from app.services.command_context import CommandContext
 from app.services.idempotency import (
     BalanceRows,
     BeforeTransaction,
@@ -85,6 +91,8 @@ REDO_NOTES = "test-redo-notes.create"
 REDO_NOTES_URL = "/test/redo/notes"
 THREE_ATTEMPTS_NOTES = "test-three-attempts-notes.create"
 THREE_ATTEMPTS_NOTES_URL = "/test/three-attempts/notes"
+CONTEXT_NOTES = "test-context-notes.create"
+CONTEXT_NOTES_URL = "/test/context/notes"
 KEY = "shop:note:1"
 REJECTED = "NOTE_REJECTED"
 REF_CONFLICT = "BUSINESS_REF_CONFLICT"
@@ -95,6 +103,9 @@ HOOKS: dict[str, Callable[[Execution], None]] = {}
 # 重做路由按 marker 换的预建函数与开事务前的钩子；没挂时预建请求体的 rows、不调钩子。
 BALANCE_ROWS: dict[str, BalanceRows] = {}
 BEFORE_TRANSACTION: dict[str, BeforeTransaction] = {}
+# 上下文路由按 marker 取的命令上下文，与它收到的请求（看兼容属性 request 是不是它）。
+CONTEXTS: dict[str, CommandContext] = {}
+ROUTE_REQUESTS: dict[str, Request] = {}
 
 
 # --- 测试专用路由 ---
@@ -111,7 +122,7 @@ WRITE = Depends(authorize(STOCK_WRITE, write=True))
 
 
 def write_note(execution: Execution, note: Note) -> CommandResult:
-    tenant_id = execution.access.principal.tenant_id
+    tenant_id = execution.context.tenant_id
     location_id = new_id("loc")
     values = {
         "location_id": location_id,
@@ -161,7 +172,7 @@ def claim_ref(execution: Execution, note: Note) -> CommandResult:
 
     撞主键时抛 BusinessRefTaken；插完引用之后运行钩子。
     """
-    tenant_id = execution.access.principal.tenant_id
+    tenant_id = execution.context.tenant_id
     note_id = new_id("loc")
     values = {"location_id": note_id, "tenant_id": tenant_id, "name": note.marker}
     execution.connection.execute(insert(Location).values(status="active", **values))
@@ -291,6 +302,18 @@ def add_test_routes(app) -> None:
             attempts=3,
         )
 
+    @app.post(CONTEXT_NOTES_URL, dependencies=[WRITE])
+    def create_context_note(request: Request, body: NoteBody) -> Response:
+        note = body.model
+        ROUTE_REQUESTS[note.marker] = request
+        return idempotency.run_with_context(
+            request,
+            CONTEXTS[note.marker],
+            operation=CONTEXT_NOTES,
+            body=body,
+            command=lambda execution: write_note(execution, note),
+        )
+
 
 @pytest.fixture
 def client(migrated_engine: Engine) -> Iterator[TestClient]:
@@ -313,6 +336,13 @@ def clear_hooks() -> Iterator[None]:
     HOOKS.clear()
     BALANCE_ROWS.clear()
     BEFORE_TRANSACTION.clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_contexts() -> Iterator[None]:
+    yield
+    CONTEXTS.clear()
+    ROUTE_REQUESTS.clear()
 
 
 # --- 请求、造数据与观察 ---
@@ -1179,7 +1209,7 @@ def redo_first(times: int, seen: list[int]) -> Callable[[Execution], None]:
         seen.append(attempt)
         values = {
             "location_id": new_id("loc"),
-            "tenant_id": execution.access.principal.tenant_id,
+            "tenant_id": execution.context.tenant_id,
             "name": f"attempt-{attempt}",
             "status": "active",
         }
@@ -1446,3 +1476,168 @@ def test_a_redo_stays_read_committed_and_the_isolation_is_reset_afterwards(clien
         assert db.execute(text("SELECT CONNECTION_ID()")).scalar_one() == connection_id
         isolation = db.execute(text("SELECT @@transaction_isolation")).scalar_one()
         assert isolation == "REPEATABLE-READ"
+
+
+# --- 命令上下文 ---
+
+
+def test_the_command_context_does_not_import_fastapi_or_starlette():
+    tree = ast.parse(Path(command_context.__file__).read_text(encoding="utf-8"))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules |= {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            modules.add(node.module or "")
+    assert modules
+    assert {module.split(".")[0] for module in modules}.isdisjoint({"fastapi", "starlette"})
+
+
+def context_for(caller: Caller, **values: object) -> CommandContext:
+    fields = {
+        "tenant_id": caller.tenant_id,
+        "channel_id": None,
+        "pool_id": caller.pool_id,
+        "credential_id": caller.credential_id,
+        "actor": None,
+        "request_id": f"ctx-{uuid4().hex}",
+        "idempotency_key": KEY,
+        "reservation_ttl_seconds": 900,
+    }
+    return CommandContext(**(fields | values))
+
+
+def test_the_command_context_is_immutable(engine):
+    context = context_for(issue(engine))
+    with pytest.raises(FrozenInstanceError):
+        context.tenant_id = "other"
+
+
+def test_the_http_wrapper_builds_the_context_from_the_request(client, engine):
+    caller = issue(engine)
+    seen: dict[str, object] = {}
+
+    def look(execution: Execution) -> None:
+        request = execution.request
+        seen["context"] = execution.context
+        seen["access"] = execution.access
+        seen["state_access"] = request.state.access
+        seen["request_id"] = request.state.request_id
+        seen["ttl"] = request.app.state.reservation_ttl_seconds
+
+    HOOKS["m"] = look
+    headers = {
+        "X-Actor-Ref": "clerk-1",
+        "X-Actor-Role": STOCK_OPERATOR,
+        "User-Agent": "context-agent/1",
+    }
+    url = "/test/folders/f1/notes?view=full"
+    response = send(client, caller, url=url, json={"marker": "m"}, headers=headers)
+    assert response.status_code == 201
+
+    context = seen["context"]
+    access = seen["access"]
+    # 兼容属性 access 照旧是第 4–6 步放进 request.state 的那一个。
+    assert access is seen["state_access"]
+    principal = access.principal
+    assert context.tenant_id == principal.tenant_id == caller.tenant_id
+    assert context.credential_id == principal.credential_id == caller.credential_id
+    assert context.channel_id == principal.channel_id
+    assert context.channel_id is not None
+    assert context.pool_id == principal.pool_id == caller.pool_id
+    assert context.actor == access.actor == Actor("clerk-1", STOCK_OPERATOR)
+    assert context.idempotency_key == access.idempotency_key == KEY
+    assert context.request_id == seen["request_id"] == rid_of(response)
+    assert context.reservation_ttl_seconds == seen["ttl"]
+    assert context.reservation_ttl_seconds == client.app.state.reservation_ttl_seconds
+    assert context.http_method == "POST"
+    assert context.path == "/test/folders/f1/notes"  # 不含查询串
+    assert context.user_agent == "context-agent/1"
+
+
+def test_the_core_takes_identity_from_the_context_not_the_token(client, engine):
+    caller = issue(engine)
+    # 同租户另一个凭据、另一组操作者与 request_id；请求本身用 caller 的令牌、不带操作者头。
+    other = add_caller(engine, caller)
+    context = context_for(
+        caller,
+        credential_id=other.credential_id,
+        actor=Actor("context-actor", STOCK_ADMIN),
+        http_method="POST",
+        path="/context/path",
+        user_agent="context-agent/2",
+    )
+    CONTEXTS["m"] = CONTEXTS["m2"] = context
+    seen: dict[str, object] = {}
+
+    def look(execution: Execution) -> None:
+        used = text("SELECT IS_USED_LOCK(:name)")
+        with engine.connect() as db:
+            name = note_lock(other, operation=CONTEXT_NOTES)
+            seen["context_lock"] = db.execute(used, {"name": name}).scalar()
+            name = note_lock(caller, operation=CONTEXT_NOTES)
+            seen["token_lock"] = db.execute(used, {"name": name}).scalar()
+        seen["context"] = execution.context
+        seen["same_request"] = execution.request is ROUTE_REQUESTS["m"]
+        seen["access"] = execution.access
+        seen["state_access"] = execution.request.state.access
+
+    HOOKS["m"] = look
+    body = {"marker": "m", "event": True}
+    first = send(client, caller, url=CONTEXT_NOTES_URL, json=body)
+    assert first.status_code == 201
+    assert notes(engine, caller, "m") == 1
+
+    # 命名锁按上下文的凭据取，令牌的凭据那一把没人持有。
+    assert seen["context_lock"] is not None
+    assert seen["token_lock"] is None
+    assert seen["context"] is context
+    # 兼容属性照旧是请求与令牌的鉴权结果。
+    assert seen["same_request"] is True
+    assert seen["access"] is seen["state_access"]
+    assert seen["access"].principal.credential_id == caller.credential_id
+
+    # 幂等记录的作用域、credential_id 与 request_id 取自上下文；响应按请求写。
+    assert records(engine, caller, operation=CONTEXT_NOTES) == []
+    [record] = records(engine, other, operation=CONTEXT_NOTES)
+    assert record["tenant_id"] == caller.tenant_id
+    assert record["credential_id"] == other.credential_id
+    assert record["request_id"] == context.request_id
+    assert record["response_body"] == first.json()
+    assert first.json()["request_id"] == rid_of(first)
+
+    # 安全事件的身份与 request_id 取自上下文。
+    assert events(engine, rid_of(first)) == []
+    [event] = events(engine, context.request_id)
+    assert event["event_type"] == COMMAND_EVENT
+    assert event["tenant_id"] == caller.tenant_id
+    assert event["credential_id"] == other.credential_id
+    assert event["actor_ref"] == "context-actor"
+    assert event["request_id"] == context.request_id
+    assert event["http_method"] == "POST"
+    assert event["path"] == "/context/path"
+    assert event["user_agent"] == "context-agent/2"
+    assert_lock_free(engine, note_lock(other, operation=CONTEXT_NOTES))
+
+    # 同一上下文同键重放：命令不执行，不写事件。
+    replay = send(client, caller, url=CONTEXT_NOTES_URL, json=body)
+    assert replay.status_code == 201
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == first.json()
+    assert notes(engine, caller, "m") == 1
+    assert len(events(engine, context.request_id)) == 1
+
+    # 同一上下文同键换内容：冲突，冲突事件同样取自上下文。
+    conflict = send(client, caller, url=CONTEXT_NOTES_URL, json={"marker": "m2"})
+    assert error_of(conflict, 409)["code"] == "IDEMPOTENCY_CONFLICT"
+    assert notes(engine, caller, "m2") == 0
+    assert events(engine, rid_of(conflict)) == []
+    recorded = events(engine, context.request_id)
+    [conflict_event] = [e for e in recorded if e["event_type"] == "idempotency_conflict"]
+    assert conflict_event["tenant_id"] == caller.tenant_id
+    assert conflict_event["credential_id"] == other.credential_id
+    assert conflict_event["actor_ref"] == "context-actor"
+    assert conflict_event["details"] == {"operation": CONTEXT_NOTES}
+    [kept] = records(engine, other, operation=CONTEXT_NOTES)
+    assert kept["request_id"] == context.request_id
+    assert_lock_free(engine, note_lock(other, operation=CONTEXT_NOTES))
