@@ -19,6 +19,7 @@ from sqlalchemy import (
     Date,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     SmallInteger,
     String,
     UniqueConstraint,
@@ -27,6 +28,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+from app.domain.channels import API, CHANNEL_KINDS, MAX_PLATFORM_SHOP_ID_LENGTH, PLATFORM, PLATFORMS
 from app.models.catalog import (
     CONFIRMATION_COLUMNS,
     EXACT_COLLATION,
@@ -67,9 +69,9 @@ ENTRY_TYPES = (
 )
 
 
-def _one_of(column: str, values: tuple[str, ...]) -> CheckConstraint:
+def _one_of(column: str, values: tuple[str, ...], name: str | None = None) -> CheckConstraint:
     allowed = ", ".join(f"'{value}'" for value in values)
-    return CheckConstraint(f"{column} IN ({allowed})", name=column)
+    return CheckConstraint(f"{column} IN ({allowed})", name=name or column)
 
 
 def _quantity_invariants(prefix: str = "", suffix: str = "") -> list[CheckConstraint]:
@@ -165,16 +167,38 @@ class StockPool(Base):
 
 
 class SalesChannel(Base):
+    """入口：api、platform 或 backoffice（契约第 3 节，0.22，Q-81）。
+
+    一个池可以有多个入口；入口的组合（恰好一个 api，或若干 platform 加一个 backoffice）
+    由开通入口的命令行在锁住池行之后检查，数据库层不兜底。
+    """
+
     __tablename__ = "sales_channels"
     __table_args__ = (
         ForeignKeyConstraint(
             ["tenant_id", "pool_id"], ["stock_pools.tenant_id", "stock_pools.pool_id"]
         ),
+        # 上一条复合外键要用的索引（原来由唯一约束 (tenant_id, pool_id) 兼任）。
+        Index("ix_sales_channels_tenant_id_pool_id", "tenant_id", "pool_id"),
         # 复合外键 (tenant_id, channel_id) 的引用目标。
         UniqueConstraint("tenant_id", "channel_id"),
-        # 一个池只允许一个销售入口（契约第 3 节，C-07）；将来启用共卖时另行迁移放开。
-        UniqueConstraint("tenant_id", "pool_id"),
+        # 一个平台店铺在本租户只登记一次；MySQL 唯一索引允许多个 NULL，不影响别的种类。
+        UniqueConstraint("tenant_id", "platform", "platform_shop_id"),
         _one_of("status", ("active", "inactive")),
+        # 约束名互不为前缀。kind 为未知值、两列为空时只由 kind 那条拒绝；两列为空时后两条不拦。
+        _one_of("kind", CHANNEL_KINDS),
+        CheckConstraint(
+            f"(kind = '{PLATFORM}') = (platform IS NOT NULL)"
+            f" AND (kind = '{PLATFORM}') = (platform_shop_id IS NOT NULL)",
+            name="platform_pair",
+        ),
+        _one_of("platform", PLATFORMS, name="platform_value"),
+        # 以排除字符集外的字符来写：ICU 的 $ 还会匹配末尾换行之前的位置。
+        CheckConstraint(
+            f"CHAR_LENGTH(platform_shop_id) BETWEEN 1 AND {MAX_PLATFORM_SHOP_ID_LENGTH}"
+            " AND NOT REGEXP_LIKE(platform_shop_id, '[^A-Za-z0-9._:-]', 'c')",
+            name="shop_id",
+        ),
         TABLE_OPTIONS,
     )
 
@@ -185,6 +209,12 @@ class SalesChannel(Base):
     status: Mapped[str] = mapped_column(STATUS)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=NOW)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=NOW)
+    # 照 Credential.kind 只用数据库默认值：旧结构上插入入口的代码不带这一列。
+    kind: Mapped[str] = mapped_column(STATUS, server_default=API)
+    platform: Mapped[str | None] = mapped_column(CODE32)
+    platform_shop_id: Mapped[str | None] = mapped_column(
+        String(MAX_PLATFORM_SHOP_ID_LENGTH, collation=EXACT_COLLATION)
+    )
 
 
 class StockBalance(Base):

@@ -2,6 +2,8 @@
 
 在真 MySQL 上跑：直接调用入口函数 main，传入测试库的 Settings 与两个内存输出流。
 命令行只能建、不能停用，所以「已停用」的租户与地点由测试用自己的连接直接写库。
+提交进共享 demo 库的 platform、backoffice 入口与 system 主体由各测试在退出时删掉
+（platform_tenants）：会话结束时 demo 库要降到 base。
 """
 
 import io
@@ -9,19 +11,35 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
-from sqlalchemy import Connection, Engine, func, insert, make_url, select
+from sqlalchemy import Connection, Engine, delete, event, func, insert, make_url, select
 
 from app.cli.__main__ import main
+from app.cli.provisioning import SHOP_HAS_CHANNEL
 from app.config import Settings
+from app.domain.channels import (
+    API,
+    API_CHANNEL_NOT_ALONE,
+    BACKOFFICE,
+    PLATFORM,
+    POOL_HAS_API_CHANNEL,
+    POOL_HAS_BACKOFFICE_CHANNEL,
+    SHOPEE,
+    TIKTOK_SHOP,
+)
+from app.domain.service_auth import SYSTEM
 from app.models.catalog import Tenant
 from app.models.inventory import WENT_LIVE_COLUMNS, Location, SalesChannel, StockPool
+from app.models.service_auth import Credential, SecurityEvent
 from tests.integration.conftest import ROOT, TEST_DATABASE_URL, new_id
 
-TABLES = (Tenant, Location, StockPool, SalesChannel)
+# 开通 platform 入口时会建 system 主体，被拒时凭据表也不能多出行。
+TABLES = (Tenant, Location, StockPool, SalesChannel, Credential)
+NOT_PLATFORM = {"kind": API, "platform": None, "platform_shop_id": None}
 
 
 @dataclass
@@ -54,6 +72,47 @@ def create(kind: str, name: str = "X", **refs: str) -> list[str]:
     for option, value in refs.items():
         argv += [f"--{option}", value]
     return argv
+
+
+def channel_argv(
+    tenant_id: str,
+    pool_id: str,
+    kind: str | None = None,
+    platform: str | None = None,
+    shop_id: str | None = None,
+    name: str = "X",
+) -> list[str]:
+    """channel create；种类、平台与店铺 ID 不给就不带那个选项。"""
+    argv = create("channel", name, tenant=tenant_id, pool=pool_id)
+    for option, value in (("kind", kind), ("platform", platform), ("platform-shop-id", shop_id)):
+        if value is not None:
+            argv += [f"--{option}", value]
+    return argv
+
+
+def remove_platform_channels(engine: Engine, tenant_ids: list[str]) -> None:
+    """删掉这些租户的 platform、backoffice 入口与 system 主体（没有别的行引用它们）。
+
+    共享的 demo 库在会话结束时要降到 base：0013 的降级在一个池有多个入口时失败，
+    0012 的降级在库里有 system 主体时失败。
+    """
+    if not tenant_ids:
+        return
+    principals = Credential.tenant_id.in_(tenant_ids), Credential.kind == SYSTEM
+    channels = SalesChannel.tenant_id.in_(tenant_ids), SalesChannel.kind != API
+    with engine.begin() as conn:
+        conn.execute(delete(Credential).where(*principals))
+        conn.execute(delete(SalesChannel).where(*channels))
+
+
+@contextmanager
+def platform_tenants(engine: Engine) -> Iterator[list[str]]:
+    """收集测试里开通了 platform 或 backoffice 入口的租户，退出时（不论成败）删掉那些行。"""
+    tenants: list[str] = []
+    try:
+        yield tenants
+    finally:
+        remove_platform_channels(engine, tenants)
 
 
 @pytest.fixture
@@ -151,6 +210,7 @@ def test_channel_create_writes_an_active_channel_bound_to_the_pool(cli, migrated
     tenant_id = cli(*create("tenant", "Shop")).json()["tenant_id"]
     location_id = cli(*create("location", "W", tenant=tenant_id)).json()["location_id"]
     pool_id = cli(*create("pool", "P", tenant=tenant_id, location=location_id)).json()["pool_id"]
+    # 不带 --kind 的现有用法得 api 入口，输出没有 system_credential_id。
     output = cli(*create("channel", "  Web shop ", tenant=tenant_id, pool=pool_id)).json()
     assert output["channel_id"].startswith("chan_")
     assert output == {
@@ -159,6 +219,7 @@ def test_channel_create_writes_an_active_channel_bound_to_the_pool(cli, migrated
         "pool_id": pool_id,
         "name": "Web shop",
         "status": "active",
+        **NOT_PLATFORM,
     }
     assert row(migrated_engine, SalesChannel, output["channel_id"]) == output
 
@@ -198,7 +259,35 @@ def world(cli, migrated_engine) -> World:
 
 def rejected_commands(w: World) -> dict[str, list[str]]:
     tenant, dead = w.mine.tenant_id, w.inactive_tenant_id
+    # 参数错误开在还没有入口的池上：被拒只因为参数。
+    free, used = w.free_pool_id, w.mine.pool_id
+
+    def shop(shop_id: str) -> list[str]:
+        return channel_argv(tenant, free, PLATFORM, SHOPEE, shop_id)
+
     return {
+        "unknown kind": channel_argv(tenant, free, kind="web"),
+        "kind in the wrong case": channel_argv(tenant, free, kind="API"),
+        "unknown platform": channel_argv(tenant, free, PLATFORM, "lazada", "shop-1"),
+        "platform in the wrong case": channel_argv(tenant, free, PLATFORM, "Shopee", "shop-1"),
+        "platform channel without platform": channel_argv(tenant, free, PLATFORM, shop_id="s1"),
+        "platform channel without shop ID": channel_argv(tenant, free, PLATFORM, SHOPEE),
+        "api channel with platform": channel_argv(tenant, free, platform=SHOPEE),
+        "api channel with shop ID": channel_argv(tenant, free, API, shop_id="shop-1"),
+        "backoffice channel with platform": channel_argv(
+            tenant, free, BACKOFFICE, SHOPEE, "shop-1"
+        ),
+        "empty shop ID": shop(""),
+        "shop ID over 64": shop("s" * 65),
+        "shop ID with a space": shop("shop 1"),
+        "shop ID with a slash": shop("shop/1"),
+        "platform channel on a pool with an api channel": channel_argv(
+            tenant, used, PLATFORM, TIKTOK_SHOP, "shop-1"
+        ),
+        "backoffice channel on a pool with an api channel": channel_argv(tenant, used, BACKOFFICE),
+        "platform channel on a foreign pool": channel_argv(
+            tenant, w.other.pool_id, PLATFORM, SHOPEE, "shop-1"
+        ),
         "unknown subcommand": ["frobnicate"],
         "unknown action": ["tenant", "delete", "--name", "x"],
         "no subcommand": [],
@@ -239,6 +328,22 @@ REJECTED_CASES = [
     "location is inactive",
     "foreign pool",
     "pool already has a channel",
+    "unknown kind",
+    "kind in the wrong case",
+    "unknown platform",
+    "platform in the wrong case",
+    "platform channel without platform",
+    "platform channel without shop ID",
+    "api channel with platform",
+    "api channel with shop ID",
+    "backoffice channel with platform",
+    "empty shop ID",
+    "shop ID over 64",
+    "shop ID with a space",
+    "shop ID with a slash",
+    "platform channel on a pool with an api channel",
+    "backoffice channel on a pool with an api channel",
+    "platform channel on a foreign pool",
 ]
 
 
@@ -260,6 +365,229 @@ def test_the_free_pool_still_accepts_its_first_channel(cli, world):
     tenant_id = world.mine.tenant_id
     output = cli(*create("channel", "Second", tenant=tenant_id, pool=world.free_pool_id)).json()
     assert output["pool_id"] == world.free_pool_id
+
+
+# --- 入口的种类与组合（契约第 3 节，Q-81） ---
+
+BAD_SHOP_ID = "platform shop ID must be 1 to 64 letters, digits or . _ : -"
+# MySQL 上 with_for_update(read=True) 的两种写法。
+SHARED_LOCK = (" FOR SHARE", " LOCK IN SHARE MODE")
+
+
+def bare_pool(cli, tenant_id: str | None = None) -> tuple[str, str]:
+    """用命令行建一个还没有入口的池；不给租户就新建一个。返回 (租户, 池)。"""
+    if tenant_id is None:
+        tenant_id = cli(*create("tenant", "Shop")).json()["tenant_id"]
+    location_id = cli(*create("location", "W", tenant=tenant_id)).json()["location_id"]
+    pool_id = cli(*create("pool", "P", tenant=tenant_id, location=location_id)).json()["pool_id"]
+    return tenant_id, pool_id
+
+
+def system_ids(engine: Engine, tenant_id: str) -> list[str]:
+    where = Credential.tenant_id == tenant_id, Credential.kind == SYSTEM
+    with engine.connect() as conn:
+        return list(conn.execute(select(Credential.credential_id).where(*where)).scalars())
+
+
+def security_events_of(engine: Engine, tenant_id: str) -> int:
+    events = select(func.count()).select_from(SecurityEvent)
+    statement = events.where(SecurityEvent.tenant_id == tenant_id)
+    with engine.connect() as conn:
+        return conn.execute(statement).scalar_one()
+
+
+def refused(result: Result, reason: str) -> None:
+    assert result.code == 2
+    assert result.one_error_line() == f"error: {reason}\n"
+
+
+def test_platform_channels_and_one_backoffice_channel_share_a_pool(cli, migrated_engine):
+    with platform_tenants(migrated_engine) as tenants:
+        tenant_id, pool_id = bare_pool(cli)
+        tenants.append(tenant_id)
+        shopee = cli(*channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shopee:my.1")).json()
+        system_id = shopee["system_credential_id"]
+        assert shopee == {
+            "channel_id": shopee["channel_id"],
+            "tenant_id": tenant_id,
+            "pool_id": pool_id,
+            "name": "X",
+            "status": "active",
+            "kind": PLATFORM,
+            "platform": SHOPEE,
+            "platform_shop_id": "shopee:my.1",
+            "system_credential_id": system_id,
+        }
+        stored = {key: value for key, value in shopee.items() if key != "system_credential_id"}
+        assert row(migrated_engine, SalesChannel, shopee["channel_id"]) == stored
+
+        # 第一个 platform 入口建出这个租户的 system 主体，不记安全事件。
+        assert system_ids(migrated_engine, tenant_id) == [system_id]
+        assert row(migrated_engine, Credential, system_id) == {
+            "credential_id": system_id,
+            "tenant_id": tenant_id,
+            "channel_id": None,
+            "name": "platform_events",
+            "scopes": [],
+            "kind": SYSTEM,
+            "status": "active",
+            "revoked_at": None,
+        }
+
+        tiktok = cli(*channel_argv(tenant_id, pool_id, PLATFORM, TIKTOK_SHOP, "7001")).json()
+        assert tiktok["system_credential_id"] == system_id
+        backoffice = cli(*channel_argv(tenant_id, pool_id, BACKOFFICE)).json()
+        assert "system_credential_id" not in backoffice
+        expected = NOT_PLATFORM | {"kind": BACKOFFICE}
+        assert {key: backoffice[key] for key in expected} == expected
+
+        # 第二个 backoffice、再加 api 都被拒，什么也不写。
+        before = counts(migrated_engine)
+        refused(cli(*channel_argv(tenant_id, pool_id, BACKOFFICE)), POOL_HAS_BACKOFFICE_CHANNEL)
+        refused(cli(*channel_argv(tenant_id, pool_id, API)), API_CHANNEL_NOT_ALONE)
+        refused(cli(*channel_argv(tenant_id, pool_id)), API_CHANNEL_NOT_ALONE)
+        assert counts(migrated_engine) == before
+
+        # 两个 platform 加一个 backoffice 之后，platform 照样可以再加。
+        third = cli(*channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shopee:my.2")).json()
+        assert third["system_credential_id"] == system_id
+        assert system_ids(migrated_engine, tenant_id) == [system_id]
+        assert security_events_of(migrated_engine, tenant_id) == 0
+
+        channels = cli("show", "--tenant", tenant_id).json()["channels"]
+        shown = {(item["kind"], item["platform"], item["platform_shop_id"]) for item in channels}
+        assert shown == {
+            (PLATFORM, SHOPEE, "shopee:my.1"),
+            (PLATFORM, TIKTOK_SHOP, "7001"),
+            (PLATFORM, SHOPEE, "shopee:my.2"),
+            (BACKOFFICE, None, None),
+        }
+
+
+def test_a_pool_with_an_api_channel_accepts_no_other_channel(cli, migrated_engine):
+    shop = provision(cli)
+    before = counts(migrated_engine)
+    for argv in (
+        channel_argv(shop.tenant_id, shop.pool_id),
+        channel_argv(shop.tenant_id, shop.pool_id, API),
+        channel_argv(shop.tenant_id, shop.pool_id, PLATFORM, SHOPEE, "shop-1"),
+        channel_argv(shop.tenant_id, shop.pool_id, BACKOFFICE),
+    ):
+        refused(cli(*argv), POOL_HAS_API_CHANNEL)
+    assert counts(migrated_engine) == before
+    assert system_ids(migrated_engine, shop.tenant_id) == []
+
+
+def test_a_backoffice_channel_may_come_first(cli, migrated_engine):
+    with platform_tenants(migrated_engine) as tenants:
+        tenant_id, pool_id = bare_pool(cli)
+        tenants.append(tenant_id)
+        backoffice = cli(*channel_argv(tenant_id, pool_id, BACKOFFICE)).json()
+        assert backoffice["kind"] == BACKOFFICE
+        assert "system_credential_id" not in backoffice
+        # 只有 backoffice 的中间状态不建 system 主体。
+        assert system_ids(migrated_engine, tenant_id) == []
+        refused(cli(*channel_argv(tenant_id, pool_id, API)), API_CHANNEL_NOT_ALONE)
+        platform = cli(*channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shop-1")).json()
+        assert system_ids(migrated_engine, tenant_id) == [platform["system_credential_id"]]
+
+
+def test_one_system_principal_per_tenant_and_one_channel_per_platform_shop(cli, migrated_engine):
+    with platform_tenants(migrated_engine) as tenants:
+        tenant_id, first_pool = bare_pool(cli)
+        _, second_pool = bare_pool(cli, tenant_id)
+        other_id, other_pool = bare_pool(cli)
+        tenants += [tenant_id, other_id]
+        first = cli(*channel_argv(tenant_id, first_pool, PLATFORM, SHOPEE, "shop-1")).json()
+        system_id = first["system_credential_id"]
+        # 同租户另一个池上的 platform 入口不再建 system 主体。
+        second = cli(*channel_argv(tenant_id, second_pool, PLATFORM, SHOPEE, "shop-2")).json()
+        assert second["system_credential_id"] == system_id
+        assert system_ids(migrated_engine, tenant_id) == [system_id]
+
+        # 同租户同平台同店铺 ID 已有：不论开在哪个池。
+        before = counts(migrated_engine)
+        for pool_id in (first_pool, second_pool):
+            argv = channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shop-1")
+            refused(cli(*argv), SHOP_HAS_CHANNEL)
+        assert counts(migrated_engine) == before
+
+        # 别的平台的同号店铺、别的租户的同一店铺照样可以；别的租户有自己的 system 主体。
+        cli(*channel_argv(tenant_id, second_pool, PLATFORM, TIKTOK_SHOP, "shop-1")).json()
+        other = cli(*channel_argv(other_id, other_pool, PLATFORM, SHOPEE, "shop-1")).json()
+        assert other["system_credential_id"] != system_id
+        assert system_ids(migrated_engine, other_id) == [other["system_credential_id"]]
+        assert system_ids(migrated_engine, tenant_id) == [system_id]
+        assert security_events_of(migrated_engine, tenant_id) == 0
+
+
+def test_refusals_follow_arguments_tenant_pool_combination_then_shop(cli, world, migrated_engine):
+    tenant, free, used = world.mine.tenant_id, world.free_pool_id, world.mine.pool_id
+    unknown, dead, foreign = new_id("ten"), world.inactive_tenant_id, world.other.pool_id
+    with platform_tenants(migrated_engine) as tenants:
+        tenants.append(tenant)
+        cli(*channel_argv(tenant, free, PLATFORM, SHOPEE, "dup-1")).json()
+        cases = [
+            (channel_argv(unknown, foreign, PLATFORM, SHOPEE, "dup 1"), BAD_SHOP_ID),
+            (channel_argv(unknown, foreign, BACKOFFICE), "tenant not found"),
+            (channel_argv(dead, foreign, BACKOFFICE), "tenant is not active"),
+            (channel_argv(tenant, foreign, BACKOFFICE), "pool not found for this tenant"),
+            (channel_argv(tenant, used, PLATFORM, SHOPEE, "dup-1"), POOL_HAS_API_CHANNEL),
+            (channel_argv(tenant, free, PLATFORM, SHOPEE, "dup-1"), SHOP_HAS_CHANNEL),
+        ]
+        before = counts(migrated_engine)
+        for argv, reason in cases:
+            refused(cli(*argv), reason)
+        assert counts(migrated_engine) == before
+
+
+@contextmanager
+def statements() -> Iterator[list[str]]:
+    """这段时间里各引擎发给数据库的语句，空白压成一个空格。"""
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany) -> None:
+        seen.append(" ".join(statement.split()))
+
+    event.listen(Engine, "before_cursor_execute", record)
+    try:
+        yield seen
+    finally:
+        event.remove(Engine, "before_cursor_execute", record)
+
+
+def test_channel_create_locks_the_pool_then_the_tenant_and_reads_with_shared_locks(
+    cli, migrated_engine
+):
+    with platform_tenants(migrated_engine) as tenants:
+        tenant_id, pool_id = bare_pool(cli)
+        tenants.append(tenant_id)
+        with statements() as seen:
+            cli(*channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shop-1")).json()
+
+    def position(select_from: str, locked: bool, ending: tuple[str, ...] = ()) -> int:
+        found = [
+            index
+            for index, statement in enumerate(seen)
+            if statement.startswith(f"SELECT {select_from} ")
+            and statement.endswith((" FOR UPDATE", *SHARED_LOCK)) == locked
+            and (not ending or statement.endswith(ending))
+        ]
+        assert len(found) == 1, seen
+        return found[0]
+
+    plain_tenant = position("tenants.status FROM tenants", locked=False)
+    pool = position("stock_pools.pool_id FROM stock_pools", True, (" FOR UPDATE",))
+    tenant = position("tenants.status FROM tenants", True, (" FOR UPDATE",))
+    kinds = position("sales_channels.kind FROM sales_channels", True, SHARED_LOCK)
+    system = position("credentials.credential_id FROM credentials", True, SHARED_LOCK)
+    # 先普通读核对租户，再锁池行、再锁租户行，之后才读已有入口与 system 主体。
+    assert plain_tenant < pool < tenant < kinds < system
+    # 不对租户行先取共享锁（不调 require_tenant），免得锁升级。
+    assert not any(
+        statement.startswith("SELECT tenants.") and statement.endswith(SHARED_LOCK)
+        for statement in seen
+    )
 
 
 def test_argument_errors_do_not_echo_the_values_passed(cli):
@@ -331,6 +659,7 @@ def test_show_tenant_lists_only_that_tenants_objects(cli):
                 "pool_id": mine.pool_id,
                 "name": "Web",
                 "status": "active",
+                **NOT_PLATFORM,
             }
         ],
     }

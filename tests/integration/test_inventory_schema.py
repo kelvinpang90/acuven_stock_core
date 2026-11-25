@@ -2,12 +2,24 @@
 
 这些规则由数据库兜底，服务层的 bug 也绕不过去。
 连接夹具 db、assert_rejected_by 与各表的造数见 conftest。
+0013 的升降在 production 库上做，见文件末尾。
 """
 
-from sqlalchemy import Connection, insert, select
+import pytest
+from sqlalchemy import Connection, Engine, delete, insert, inspect, select
 from sqlalchemy.sql.expression import Executable
 
-from app.models.inventory import IdempotencyRecord, Location, StockBalance
+from alembic import command
+from app.domain.channels import API, BACKOFFICE, PLATFORM, PLATFORMS, SHOPEE, TIKTOK_SHOP
+from app.domain.environment import PRODUCTION
+from app.models.catalog import Tenant
+from app.models.inventory import (
+    IdempotencyRecord,
+    Location,
+    SalesChannel,
+    StockBalance,
+    StockPool,
+)
 from tests.integration.conftest import (
     add_balance,
     add_channel,
@@ -25,6 +37,12 @@ from tests.integration.conftest import (
     new_id,
     pool_insert,
     went_live,
+)
+from tests.integration.test_demo_reset_schema import (
+    alembic_version,
+    head_revision,
+    migrate_production,
+    rolled_back,
 )
 
 # 只有 stock_balance 为负时，reserved + unavailable ≤ stock_balance 必然同时被违反；
@@ -57,13 +75,106 @@ def test_pool_cannot_sit_at_another_tenants_location(db: Connection):
     )
 
 
-def test_a_pool_has_at_most_one_sales_channel(db: Connection):
+def test_a_pool_may_have_several_channels(db: Connection):
+    # 入口组合由开通命令行检查（契约第 3 节，Q-81），数据库不再拒绝同一个池上的第二个入口。
     tenant = add_tenant(db)
     pool = add_pool(db, tenant)
     add_channel(db, tenant, pool)
-    assert_rejected_by(db, channel_insert(tenant, pool), "uq_sales_channels_tenant_id_pool_id")
-    # 另一个池可以有自己的入口。
-    add_channel(db, tenant, add_pool(db, tenant))
+    add_channel(db, tenant, pool)
+    db.execute(channel_insert(tenant, pool, **platform_shop()))
+    db.execute(channel_insert(tenant, pool, kind=BACKOFFICE))
+    kinds = db.execute(select(SalesChannel.kind).where(SalesChannel.pool_id == pool)).scalars()
+    assert sorted(kinds) == sorted([API, API, PLATFORM, BACKOFFICE])
+
+
+# 入口的种类与平台店铺（契约第 3 节，0.22，Q-81）
+
+KIND_CHECK = "ck_sales_channels_kind"
+PAIR_CHECK = "ck_sales_channels_platform_pair"
+PLATFORM_CHECK = "ck_sales_channels_platform_value"
+SHOP_ID_CHECK = "ck_sales_channels_shop_id"
+SHOP_UNIQUE = "uq_sales_channels_tenant_id_platform_platform_shop_id"
+
+
+def platform_shop(platform: str = SHOPEE, shop_id: str | None = None) -> dict[str, object]:
+    """一个 platform 入口的三列；店铺 ID 默认取一个新的。"""
+    return {"kind": PLATFORM, "platform": platform, "platform_shop_id": shop_id or new_id("shop")}
+
+
+def test_kind_defaults_to_api(db: Connection):
+    tenant = add_tenant(db)
+    channel = add_channel(db, tenant, add_pool(db, tenant))
+    columns = (SalesChannel.kind, SalesChannel.platform, SalesChannel.platform_shop_id)
+    row = db.execute(select(*columns).where(SalesChannel.channel_id == channel)).one()
+    assert tuple(row) == (API, None, None)
+
+
+def test_kind_must_be_an_exact_known_value(db: Connection):
+    tenant = add_tenant(db)
+    pool = add_pool(db, tenant)
+    for kind in (API, BACKOFFICE):
+        db.execute(channel_insert(tenant, pool, kind=kind))
+    db.execute(channel_insert(tenant, pool, **platform_shop()))
+    for kind in ["API", "Platform", "back_office", "web", ""]:
+        assert_rejected_by(db, channel_insert(tenant, pool, kind=kind), KIND_CHECK)
+
+
+def test_a_platform_channel_needs_both_platform_columns(db: Connection):
+    tenant = add_tenant(db)
+    pool = add_pool(db, tenant)
+    for missing in ("platform", "platform_shop_id"):
+        rejected = channel_insert(tenant, pool, **(platform_shop() | {missing: None}))
+        assert_rejected_by(db, rejected, PAIR_CHECK)
+    bare = channel_insert(tenant, pool, kind=PLATFORM)
+    assert_rejected_by(db, bare, PAIR_CHECK)
+
+
+def test_api_and_backoffice_channels_have_no_platform_columns(db: Connection):
+    tenant = add_tenant(db)
+    pool = add_pool(db, tenant)
+    for kind in (API, BACKOFFICE):
+        for present in ({"platform": SHOPEE}, {"platform_shop_id": "shop-1"}):
+            rejected = channel_insert(tenant, pool, kind=kind, **present)
+            assert_rejected_by(db, rejected, PAIR_CHECK)
+        both = channel_insert(tenant, pool, **(platform_shop() | {"kind": kind}))
+        assert_rejected_by(db, both, PAIR_CHECK)
+
+
+def test_platform_must_be_an_exact_known_value(db: Connection):
+    tenant = add_tenant(db)
+    pool = add_pool(db, tenant)
+    for platform in PLATFORMS:
+        db.execute(channel_insert(tenant, pool, **platform_shop(platform)))
+    for platform in ["Shopee", "SHOPEE", "tiktok", "tiktok-shop", "lazada", ""]:
+        rejected = channel_insert(tenant, pool, **platform_shop(platform))
+        assert_rejected_by(db, rejected, PLATFORM_CHECK)
+
+
+def test_platform_shop_id_uses_the_allowed_characters(db: Connection):
+    tenant = add_tenant(db)
+    pool = add_pool(db, tenant)
+    for shop_id in ["1", "a" * 64, "Shop.01_my:main-2"]:
+        db.execute(channel_insert(tenant, pool, **platform_shop(shop_id=shop_id)))
+    for shop_id in ["shop 1", "shop/1", "shop\n", "shöp", "shop@1"]:
+        rejected = channel_insert(tenant, pool, **platform_shop(shop_id=shop_id))
+        assert_rejected_by(db, rejected, SHOP_ID_CHECK)
+    # 空串不是 NULL：pair 那条放过，由店铺 ID 那条拒绝。
+    rejected = channel_insert(tenant, pool, **(platform_shop() | {"platform_shop_id": ""}))
+    assert_rejected_by(db, rejected, SHOP_ID_CHECK)
+
+
+def test_a_platform_shop_is_registered_once_per_tenant(db: Connection):
+    tenant = add_tenant(db)
+    shop = platform_shop(SHOPEE, "shop-1")
+    db.execute(channel_insert(tenant, add_pool(db, tenant), **shop))
+    # 同一个池或另一个池都不行。
+    for pool in (add_pool(db, tenant), add_pool(db, tenant)):
+        assert_rejected_by(db, channel_insert(tenant, pool, **shop), SHOP_UNIQUE)
+    # 别的平台的同号店铺、别的租户的同一店铺照样可以。
+    tiktok = platform_shop(TIKTOK_SHOP, "shop-1")
+    db.execute(channel_insert(tenant, add_pool(db, tenant), **tiktok))
+    other = add_tenant(db)
+    db.execute(channel_insert(other, add_pool(db, other), **shop))
 
 
 def test_channel_cannot_sell_another_tenants_pool(db: Connection):
@@ -353,3 +464,69 @@ def test_idempotency_record_credential_must_exist_in_the_same_tenant(db: Connect
             idempotency_insert(tenant, credential),
             "fk_idempotency_records_tenant_id_credentials",
         )
+
+
+# 0013 的升降（production 库）：照 test_demo_reset_schema 的先例，不动共享的 demo 库；
+# 无论成败都在 finally 里升回 head，提交进去的行也在 finally 里删掉。
+
+POOL_UNIQUE = "uq_sales_channels_tenant_id_pool_id"
+
+
+def has_channel_kind(engine: Engine) -> bool:
+    return "kind" in {column["name"] for column in inspect(engine).get_columns("sales_channels")}
+
+
+def test_downgrade_to_0012_and_back_restores_one_channel_per_pool(production_engine: Engine):
+    try:
+        migrate_production(command.downgrade, "0012", PRODUCTION)
+        assert alembic_version(production_engine) == "0012"
+        assert not has_channel_kind(production_engine)
+        # 0002 的唯一约束回来了：一个池只有一个入口。
+        with rolled_back(production_engine) as conn:
+            tenant = add_tenant(conn)
+            pool = add_pool(conn, tenant)
+            add_channel(conn, tenant, pool)
+            assert_rejected_by(conn, channel_insert(tenant, pool), POOL_UNIQUE)
+
+        migrate_production(command.upgrade, "head", PRODUCTION)
+        assert alembic_version(production_engine) == head_revision()
+        assert has_channel_kind(production_engine)
+        # 升回之后同一个池可以有多个入口，新约束也回来了；写入的行回滚。
+        with rolled_back(production_engine) as conn:
+            tenant = add_tenant(conn)
+            pool = add_pool(conn, tenant)
+            conn.execute(channel_insert(tenant, pool, **platform_shop()))
+            conn.execute(channel_insert(tenant, pool, kind=BACKOFFICE))
+            assert_rejected_by(conn, channel_insert(tenant, pool, kind=PLATFORM), PAIR_CHECK)
+    finally:
+        migrate_production(command.upgrade, "head", PRODUCTION)
+    assert alembic_version(production_engine) == head_revision()
+
+
+def test_downgrade_fails_without_changes_while_a_pool_has_several_channels(
+    production_engine: Engine,
+):
+    with production_engine.begin() as conn:
+        tenant = add_tenant(conn)
+        location = add_location(conn, tenant)
+        pool = new_id("pool")
+        conn.execute(pool_insert(tenant, location, pool_id=pool))
+        channels = [new_id("chn"), new_id("chn")]
+        conn.execute(channel_insert(tenant, pool, channel_id=channels[0], **platform_shop()))
+        conn.execute(channel_insert(tenant, pool, channel_id=channels[1], kind=BACKOFFICE))
+    try:
+        with pytest.raises(RuntimeError):
+            migrate_production(command.downgrade, "0012", PRODUCTION)
+        assert alembic_version(production_engine) == head_revision()
+        assert has_channel_kind(production_engine)
+        with production_engine.connect() as conn:
+            kinds = conn.execute(select(SalesChannel.kind).where(SalesChannel.pool_id == pool))
+            assert sorted(kinds.scalars()) == sorted([PLATFORM, BACKOFFICE])
+    finally:
+        # 这些行没有别的行引用。
+        with production_engine.begin() as conn:
+            conn.execute(delete(SalesChannel).where(SalesChannel.channel_id.in_(channels)))
+            conn.execute(delete(StockPool).where(StockPool.pool_id == pool))
+            conn.execute(delete(Location).where(Location.location_id == location))
+            conn.execute(delete(Tenant).where(Tenant.tenant_id == tenant))
+        migrate_production(command.upgrade, "head", PRODUCTION)

@@ -22,6 +22,7 @@ from sqlalchemy.exc import OperationalError
 from app.api.auth import authorize, get_access
 from app.api.errors import ok
 from app.config import Settings
+from app.domain.channels import BACKOFFICE, PLATFORM, SHOPEE
 from app.domain.environment import PRODUCTION
 from app.domain.service_auth import (
     ADMIN,
@@ -43,7 +44,16 @@ from app.models.service_auth import Credential, CredentialToken, SecurityEvent
 from app.services import security_events
 from app.services.security_events import SecurityEventRecord, record_security_event
 from tests.integration.conftest import TEST_DATABASE_URL, instance_marked, new_id
-from tests.integration.test_cli_provisioning import Provisioned, Result, create, provision, run_cli
+from tests.integration.test_cli_provisioning import (
+    Provisioned,
+    Result,
+    bare_pool,
+    channel_argv,
+    create,
+    platform_tenants,
+    provision,
+    run_cli,
+)
 
 ACTOR = "ops-7"
 REASON = "demo shop launch"
@@ -52,6 +62,7 @@ SCOPES = (CATALOG_READ, STOCK_READ)
 LOGGER = "app.services.security_events"
 DB_NOW = literal_column("UTC_TIMESTAMP(6)", DateTime())
 A_SECOND_AGO = literal_column("UTC_TIMESTAMP(6) - INTERVAL 1 SECOND")
+API_CHANNELS_ONLY = "error: credentials can only be bound to api channels\n"
 
 
 # --- 夹具 ---
@@ -302,6 +313,26 @@ def test_an_ops_credential_has_no_channel(cli, engine, shop):
     credential = credential_row(engine, output["credential_id"])
     assert credential["scopes"] == [OPS_READ]
     assert credential["kind"] == SERVICE
+
+
+def test_issue_binds_only_api_channels(cli, engine):
+    """platform 与 backoffice 入口没有凭据（契约第 3 节）；退出时删掉它们与 system 主体。"""
+    with platform_tenants(engine) as tenants:
+        tenant_id, pool_id = bare_pool(cli)
+        tenants.append(tenant_id)
+        platform = cli(*channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shop-1")).json()
+        backoffice = cli(*channel_argv(tenant_id, pool_id, BACKOFFICE)).json()
+        before = counts(engine)
+        for channel in (platform["channel_id"], backoffice["channel_id"]):
+            result = cli(*issue_argv(tenant_id, channel=channel))
+            assert result.code == 2
+            assert result.one_error_line() == API_CHANNELS_ONLY
+        assert counts(engine) == before
+    # api 入口照常。
+    shop = provision(cli)
+    output = issue(cli, shop)
+    assert credential_row(engine, output["credential_id"])["channel_id"] == shop.channel_id
+    assert len(events_of(engine, output["credential_id"])) == 1
 
 
 @dataclass
