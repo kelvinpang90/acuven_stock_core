@@ -661,7 +661,7 @@ def test_concurrent_receipts_with_one_ref_book_once(
     lock_balances = stock_document_service.lock_balances
 
     def gated(execution, pool_id, sku_ids):
-        late = execution.request.state.request_id == late_rid
+        late = execution.context.request_id == late_rid
         if late:
             before_lock.pass_through()
         balances = lock_balances(execution, pool_id, sku_ids)

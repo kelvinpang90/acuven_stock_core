@@ -502,6 +502,7 @@ def test_concurrent_confirms_of_the_same_sku_open_it_once(client, engine, monkey
     [sku_id] = add_skus(engine, caller.tenant_id, 1)
     late = preview(client, caller, [line(sku_id, 3)])["import_id"]
     early = preview(client, caller, [line(sku_id, 7)])["import_id"]
+    late_rid, early_rid = request_id(), request_id()
 
     # late 在锁余额行之前停住（读快照已建立）；early 锁住余额行后停住。
     # 放行 late，它在 early 持有的行锁上等待；再放行 early 提交。
@@ -509,11 +510,11 @@ def test_concurrent_confirms_of_the_same_sku_open_it_once(client, engine, monkey
     lock_balances = stock_import_service.lock_balances
 
     def gated(execution, pool_id, sku_ids):
-        import_id = execution.request.path_params["import_id"]
-        if import_id == late:
+        rid = execution.context.request_id
+        if rid == late_rid:
             before_lock.pass_through()
         balances = lock_balances(execution, pool_id, sku_ids)
-        if import_id == early:
+        if rid == early_rid:
             holding_lock.pass_through()
         return balances
 
@@ -521,9 +522,9 @@ def test_concurrent_confirms_of_the_same_sku_open_it_once(client, engine, monkey
     other_client = TestClient(client.app)
     with ThreadPoolExecutor(max_workers=2) as pool:
         try:
-            late_response = pool.submit(post_confirm, client, caller, late)
+            late_response = pool.submit(post_confirm, client, caller, late, rid=late_rid)
             assert before_lock.reached.wait(10)
-            early_response = pool.submit(post_confirm, other_client, caller, early)
+            early_response = pool.submit(post_confirm, other_client, caller, early, rid=early_rid)
             assert holding_lock.reached.wait(10)
             before_lock.proceed.set()
             time.sleep(0.5)

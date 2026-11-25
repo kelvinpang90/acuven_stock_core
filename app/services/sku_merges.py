@@ -307,12 +307,12 @@ def current_representation(connection: Connection, tenant_id: str, merge_id: str
 
 
 def _tenant_id(execution: Execution) -> str:
-    return execution.access.principal.tenant_id
+    return execution.context.tenant_id
 
 
 def _actor(execution: Execution) -> Actor:
     """合并单命令都要求角色（§10 第 3 条），操作者必在。"""
-    actor = execution.access.actor
+    actor = execution.context.actor
     if actor is None:
         raise RuntimeError("a sku merge command needs the actor headers")
     return actor
@@ -322,10 +322,10 @@ def _signature(execution: Execution, prefix: str, now: datetime) -> dict[str, An
     """命令记在合并单上的凭据、操作者、角色、请求 ID 与时间，列名带 prefix。"""
     actor = _actor(execution)
     return {
-        f"{prefix}_credential_id": execution.access.principal.credential_id,
+        f"{prefix}_credential_id": execution.context.credential_id,
         f"{prefix}_actor_ref": actor.ref,
         f"{prefix}_actor_role": actor.role,
-        f"{prefix}_request_id": execution.request.state.request_id,
+        f"{prefix}_request_id": execution.context.request_id,
         f"{prefix}_at": now,
     }
 
@@ -482,10 +482,10 @@ def create_merge(
             canonical_sku_id=canonical_sku_id,
             status=record.status,
             reason=reason,
-            credential_id=execution.access.principal.credential_id,
+            credential_id=execution.context.credential_id,
             actor_ref=actor.ref,
             actor_role=actor.role,
-            request_id=execution.request.state.request_id,
+            request_id=execution.context.request_id,
             created_at=now,
         )
     )
@@ -595,7 +595,7 @@ def _require_granted_pool(execution: Execution, merge: MergeRecord) -> None:
     """第 1 步锁内复核池：已录入的池不是凭据获准的池，403 FORBIDDEN，
     登记 forbidden 事件（被拒的类别为池，记合并单的 pool_id）。
     """
-    if merge.pool_id is None or merge.pool_id == execution.access.principal.pool_id:
+    if merge.pool_id is None or merge.pool_id == execution.context.pool_id:
         return
     details = {
         "category": "pool",
@@ -792,12 +792,13 @@ def _mark_source_merged(
         )
     )
     actor = _actor(execution)
+    context = execution.context
     author = ChangeAuthor(
-        credential_id=execution.access.principal.credential_id,
+        credential_id=context.credential_id,
         actor_ref=actor.ref,
         actor_role=actor.role,
-        request_id=execution.request.state.request_id,
-        idempotency_key=execution.access.idempotency_key,
+        request_id=context.request_id,
+        idempotency_key=context.idempotency_key,
         reason=merge.reason,
     )
     record_change(

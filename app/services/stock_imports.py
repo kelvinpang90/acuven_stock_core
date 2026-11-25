@@ -217,7 +217,7 @@ def _locked_lookup(execution: Execution, balances: Mapping[str, LockedBalance]) 
 
     不在本租户的 SKU 不出现，plan_confirm 会把它记为 sku_not_found。
     """
-    tenant_id = execution.access.principal.tenant_id
+    tenant_id = execution.context.tenant_id
     lookup = {}
     for sku_id in sorted(balances):
         statement = (
@@ -265,19 +265,19 @@ def confirm_import(execution: Execution, record: ImportRecord, actor: Actor) -> 
             )
             line["entry_id"] = entry["entry_id"]
 
-    principal = execution.access.principal
+    context = execution.context
     execution.connection.execute(
         update(StockImport)
         .where(
-            StockImport.tenant_id == principal.tenant_id,
+            StockImport.tenant_id == context.tenant_id,
             StockImport.import_id == record.import_id,
         )
         .values(
             status=CONFIRMED,
             result=plan,
-            confirmed_credential_id=principal.credential_id,
+            confirmed_credential_id=context.credential_id,
             confirmed_actor_ref=actor.ref,
-            confirmed_request_id=execution.request.state.request_id,
+            confirmed_request_id=context.request_id,
             confirmed_at=now,
         )
     )
@@ -292,8 +292,8 @@ def go_live(execution: Execution, pool_id: str, actor: Actor) -> PoolRecord:
     返回池的当前表示所需的字段，取自加锁读（普通读读的是快照，可能看不到并发的切换）。
     池已由池授权确认属于本租户。
     """
-    principal = execution.access.principal
-    where = (StockPool.tenant_id == principal.tenant_id, StockPool.pool_id == pool_id)
+    context = execution.context
+    where = (StockPool.tenant_id == context.tenant_id, StockPool.pool_id == pool_id)
     statement = (
         select(
             StockPool.pool_id,
@@ -316,9 +316,9 @@ def go_live(execution: Execution, pool_id: str, actor: Actor) -> PoolRecord:
         .values(
             status=LIVE,
             went_live_at=now,
-            went_live_credential_id=principal.credential_id,
+            went_live_credential_id=context.credential_id,
             went_live_actor_ref=actor.ref,
-            went_live_request_id=execution.request.state.request_id,
+            went_live_request_id=context.request_id,
         )
     )
     return replace(pool, status=LIVE, went_live_at=now)

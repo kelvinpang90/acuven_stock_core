@@ -110,7 +110,7 @@ Deltas = tuple[int, int, int, int]
 
 
 def _tenant_id(execution: Execution) -> str:
-    return execution.access.principal.tenant_id
+    return execution.context.tenant_id
 
 
 # --- 命令时间 ---
@@ -317,15 +317,14 @@ class EntryIdentity:
 
 def entry_identity(execution: Execution) -> EntryIdentity:
     """本请求的身份：凭据的销售入口、幂等键、凭据、操作者与请求 ID。"""
-    access = execution.access
-    principal = access.principal
+    context = execution.context
     return EntryIdentity(
-        channel_id=principal.channel_id,
-        idempotency_key=access.idempotency_key,
-        credential_id=principal.credential_id,
-        actor_ref=None if access.actor is None else access.actor.ref,
-        actor_role=None if access.actor is None else access.actor.role,
-        request_id=execution.request.state.request_id,
+        channel_id=context.channel_id,
+        idempotency_key=context.idempotency_key,
+        credential_id=context.credential_id,
+        actor_ref=None if context.actor is None else context.actor.ref,
+        actor_role=None if context.actor is None else context.actor.role,
+        request_id=context.request_id,
     )
 
 
@@ -557,7 +556,7 @@ def new_document_id(document_type: str) -> str:
 
 def find_document(execution: Execution, document_type: str, document_ref: str) -> Document | None:
     """按租户与凭据的销售入口用普通读查单据。"""
-    principal = execution.access.principal
+    context = execution.context
     statement = select(
         StockDocument.document_id,
         StockDocument.document_type,
@@ -565,8 +564,8 @@ def find_document(execution: Execution, document_type: str, document_ref: str) -
         StockDocument.request_hash,
         StockDocument.result,
     ).where(
-        StockDocument.tenant_id == principal.tenant_id,
-        StockDocument.channel_id == principal.channel_id,
+        StockDocument.tenant_id == context.tenant_id,
+        StockDocument.channel_id == context.channel_id,
         StockDocument.document_type == document_type,
         StockDocument.document_ref == document_ref,
     )
@@ -611,21 +610,20 @@ def insert_document(
     """写一行单据：池取凭据销售入口绑定的池（池授权已确认命令的池就是它），
     request_hash 是本请求的摘要。撞唯一约束时抛 BusinessRefTaken，在 with_document 里重新判定。
     """
-    access = execution.access
-    principal = access.principal
+    context = execution.context
     values = {
         "document_id": document_id,
-        "tenant_id": principal.tenant_id,
-        "channel_id": principal.channel_id,
-        "pool_id": principal.pool_id,
+        "tenant_id": context.tenant_id,
+        "channel_id": context.channel_id,
+        "pool_id": context.pool_id,
         "document_type": document_type,
         "document_ref": document_ref,
         "request_hash": execution.request_digest,
         "result": result,
-        "credential_id": principal.credential_id,
-        "actor_ref": None if access.actor is None else access.actor.ref,
-        "actor_role": None if access.actor is None else access.actor.role,
-        "request_id": execution.request.state.request_id,
+        "credential_id": context.credential_id,
+        "actor_ref": None if context.actor is None else context.actor.ref,
+        "actor_role": None if context.actor is None else context.actor.role,
+        "request_id": context.request_id,
         "created_at": created_at,
     }
     try:

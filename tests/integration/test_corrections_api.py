@@ -515,7 +515,7 @@ def test_concurrent_corrections_of_one_entry_apply_once(
     locked = stock_document_service.lock_balances
 
     def gated(execution, pool_id, sku_ids):
-        late = execution.request.state.request_id == late_rid
+        late = execution.context.request_id == late_rid
         if late:
             before_lock.pass_through()
         balances = locked(execution, pool_id, sku_ids)

@@ -298,7 +298,7 @@ def _read_original(execution: Execution, entry_id: str) -> _Original:
         *(getattr(LedgerEntry, f"{name}_delta") for name in QUANTITIES),
         LedgerEntry.balance_version_after,
     ).where(
-        LedgerEntry.tenant_id == execution.access.principal.tenant_id,
+        LedgerEntry.tenant_id == execution.context.tenant_id,
         LedgerEntry.entry_id == entry_id,
     )
     row = execution.connection.execute(statement).mappings().first()
