@@ -2,7 +2,8 @@
 
 幂等记录与流水指向凭据的外键见 test_inventory_schema。
 连接夹具 db 与 assert_rejected_by 见 conftest。
-0012 的升降照 test_demo_reset_schema 的先例在 production 库上做，不动共享的 demo 库；
+0012 的升降照 test_demo_reset_schema 的先例在 production 库上做，不动共享的 demo 库
+（降到 0011 时先经过 0013 的降级）；
 无论成败都在 finally 里升回 head，提交进去的行也在 finally 里删掉。
 """
 
@@ -263,9 +264,11 @@ def test_downgrade_fails_without_changes_while_admin_or_system_principals_exist(
         tenant = add_tenant(conn)
         committed = [(tenant, add_credential(conn, tenant, kind=SYSTEM, scopes=[]))]
     try:
+        # MySQL 的 DDL 不在事务里：从 head 降到 0011 时，0013 的降级先成功并提交版本 0012，
+        # 0012 的降级再因 system 主体失败，所以版本停在 0012。
         with pytest.raises(RuntimeError):
             migrate_production(command.downgrade, "0011", PRODUCTION)
-        assert alembic_version(production_engine) == head_revision()
+        assert alembic_version(production_engine) == "0012"
         assert has_kind(production_engine)
         with production_engine.connect() as conn:
             assert kind_of(conn, committed[0][1]) == SYSTEM

@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import Connection, DateTime, Row, insert, literal_column, select, update
 
 from app.cli import ACTIVE, Audited, CliError, clean_name, require_channel, require_tenant
+from app.domain.channels import API
 from app.domain.environment import PRODUCTION
 from app.domain.ids import new_id
 from app.domain.requests import is_reference
@@ -31,6 +32,7 @@ from app.domain.service_auth import (
     tokens_to_expire,
     validate_issued_scopes,
 )
+from app.models.inventory import SalesChannel
 from app.models.service_auth import Credential, CredentialToken
 from app.services.security_events import SecurityEventRecord
 
@@ -110,6 +112,20 @@ def _add_token(conn: Connection, tenant_id: str, credential_id: str) -> tuple[st
     return token_id, token
 
 
+def _require_api_channel(conn: Connection, tenant_id: str, channel_id: str) -> None:
+    """凭据只绑 api 入口（契约第 3 节）：platform 与 backoffice 入口不能经 /v1 写。
+
+    require_channel 不取种类，这里另查；那一行已加共享锁，再取共享锁不是锁升级。
+    """
+    kind = conn.execute(
+        select(SalesChannel.kind)
+        .where(SalesChannel.tenant_id == tenant_id, SalesChannel.channel_id == channel_id)
+        .with_for_update(read=True)
+    ).scalar_one()
+    if kind != API:
+        raise CliError("credentials can only be bound to api channels")
+
+
 def issue_credential(conn: Connection, args: Namespace) -> Audited:
     actor, reason = _operator(args)
     name = clean_name(args.name)
@@ -126,6 +142,7 @@ def issue_credential(conn: Connection, args: Namespace) -> Audited:
     require_tenant(conn, args.tenant, active=True)
     if args.channel is not None:
         require_channel(conn, args.tenant, args.channel, active=True)
+        _require_api_channel(conn, args.tenant, args.channel)
     credential = {
         "credential_id": new_id("cred"),
         "tenant_id": args.tenant,
@@ -328,7 +345,7 @@ def register(subparsers: Any) -> None:
     issue.add_argument("--tenant", required=True, help="tenant ID")
     issue.add_argument("--name", required=True)
     issue.add_argument("--scope", action="append", help="repeat for each scope")
-    issue.add_argument("--channel", help="sales channel ID of the same tenant")
+    issue.add_argument("--channel", help="api channel ID of the same tenant")
     _add_operator_options(issue)
     issue.set_defaults(handler=issue_credential)
 
