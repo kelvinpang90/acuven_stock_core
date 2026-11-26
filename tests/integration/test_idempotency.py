@@ -18,6 +18,7 @@
 
 import ast
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -103,7 +104,7 @@ HOOKS: dict[str, Callable[[Execution], None]] = {}
 # 重做路由按 marker 换的预建函数与开事务前的钩子；没挂时预建请求体的 rows、不调钩子。
 BALANCE_ROWS: dict[str, BalanceRows] = {}
 BEFORE_TRANSACTION: dict[str, BeforeTransaction] = {}
-# 上下文路由按 marker 取的命令上下文，与它收到的请求（看兼容属性 request 是不是它）。
+# 上下文路由按 marker 取的命令上下文；上下文路由与带路径参数的路由按 marker 记下收到的请求。
 CONTEXTS: dict[str, CommandContext] = {}
 ROUTE_REQUESTS: dict[str, Request] = {}
 
@@ -218,6 +219,7 @@ def add_test_routes(app) -> None:
 
     @app.post("/test/folders/{folder_id}/notes", dependencies=[WRITE])
     def create_folder_note(request: Request, folder_id: str, body: NoteBody) -> Response:
+        ROUTE_REQUESTS[body.model.marker] = request
         return run_idempotent(
             request,
             operation=FOLDER_NOTES,
@@ -1513,15 +1515,29 @@ def test_the_command_context_is_immutable(engine):
         context.tenant_id = "other"
 
 
+def test_the_execution_does_not_hold_the_request(client, engine):
+    caller = issue(engine)
+    seen: list[Execution] = []
+    HOOKS["m"] = seen.append
+
+    response = send(client, caller, json={"marker": "m"})
+    assert response.status_code == 201
+
+    # 命令体只经 execution.context 取身份与入口；构造时也不收请求。
+    [execution] = seen
+    assert not hasattr(execution, "access")
+    assert not hasattr(execution, "request")
+    assert "request" not in inspect.signature(Execution).parameters
+
+
 def test_the_http_wrapper_builds_the_context_from_the_request(client, engine):
     caller = issue(engine)
     seen: dict[str, object] = {}
 
     def look(execution: Execution) -> None:
-        request = execution.request
+        request = ROUTE_REQUESTS["m"]
         seen["context"] = execution.context
-        seen["access"] = execution.access
-        seen["state_access"] = request.state.access
+        seen["access"] = request.state.access
         seen["request_id"] = request.state.request_id
         seen["ttl"] = request.app.state.reservation_ttl_seconds
 
@@ -1536,9 +1552,8 @@ def test_the_http_wrapper_builds_the_context_from_the_request(client, engine):
     assert response.status_code == 201
 
     context = seen["context"]
+    # 第 4–6 步放进 request.state 的鉴权结果。
     access = seen["access"]
-    # 兼容属性 access 照旧是第 4–6 步放进 request.state 的那一个。
-    assert access is seen["state_access"]
     principal = access.principal
     assert context.tenant_id == principal.tenant_id == caller.tenant_id
     assert context.credential_id == principal.credential_id == caller.credential_id
@@ -1578,9 +1593,6 @@ def test_the_core_takes_identity_from_the_context_not_the_token(client, engine):
             name = note_lock(caller, operation=CONTEXT_NOTES)
             seen["token_lock"] = db.execute(used, {"name": name}).scalar()
         seen["context"] = execution.context
-        seen["same_request"] = execution.request is ROUTE_REQUESTS["m"]
-        seen["access"] = execution.access
-        seen["state_access"] = execution.request.state.access
 
     HOOKS["m"] = look
     body = {"marker": "m", "event": True}
@@ -1592,10 +1604,6 @@ def test_the_core_takes_identity_from_the_context_not_the_token(client, engine):
     assert seen["context_lock"] is not None
     assert seen["token_lock"] is None
     assert seen["context"] is context
-    # 兼容属性照旧是请求与令牌的鉴权结果。
-    assert seen["same_request"] is True
-    assert seen["access"] is seen["state_access"]
-    assert seen["access"].principal.credential_id == caller.credential_id
 
     # 幂等记录的作用域、credential_id 与 request_id 取自上下文；响应按请求写。
     assert records(engine, caller, operation=CONTEXT_NOTES) == []
