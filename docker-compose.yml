@@ -7,12 +7,14 @@
 # 不经 instance.sh 的 compose 命令因变量缺失直接报错，不会悄悄落到 Demo 的名字上。
 # 其余变量从服务器上本目录的 .env 读（模板见 .env.example），不进仓库。
 #
-# Core 不开公网入口（契约 §10 第 5 条）：不挂 proxy_net、不发布端口。
+# 公网入口（契约 §10 第 5 条）：Demo 不开公网入口；生产挂代理网络，由一个只转发后台与平台接口两个路径前缀的
+# vhost 对外。两个实例都不发布端口。
 # 两个实例都恰好挂两条网络：
 # - 数据网络连共享数据库：Demo 是 data_net（多个项目共用，所以服务名带 core_ 前缀，compose 把服务名注册成网络上的 DNS 别名）；
 #   生产是只有 infra_mysql 与生产 Core 的 infra_mysql_core_production_net，不挂 data_net。都由 vps_infra 建。
-# - 调用方内部网络只给 Core 与它的调用方用：Demo 是 stock_core_net（别名 core_api），生产是 stock_core_production_net
-#   （别名 stock_core_production），由 deploy/deploy.sh 确保存在。
+# - callers 这一条按实例不同：Demo 是调用方内部网络 stock_core_net（别名 core_api），只给 Core 与它的调用方用，
+#   由 deploy/deploy.sh 确保存在；生产没有外部调用方，是边缘反向代理所在的代理网络 proxy_net（别名 stock_core_production，
+#   vhost 按它转发），由 vps_infra 建，deploy/deploy.sh 只核对、不建。
 
 x-logging: &logging
   driver: json-file

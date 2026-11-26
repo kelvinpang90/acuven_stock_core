@@ -3,7 +3,8 @@
 #
 # 部署后健康检查（部署观察契约 D3）。由 .github/workflows/deploy.yml 经 SSH 调用。
 #
-# Core 没有公网入口，所以不能像网店那样从 GitHub 访问健康地址：在服务器上进容器取 /healthz，
+# 健康检查端点不经反向代理转发（Demo 没有公网入口，生产的 vhost 只转发后台与平台接口两个前缀），
+# 所以不能像网店那样从 GitHub 访问健康地址：仍在服务器上进容器取 /healthz，
 # 要求返回体里带着本次提交的 SHA——检查通过即证明线上跑的就是这个提交。
 #
 # 经 deploy/instance.sh 找本实例、本检出的 core_api 容器（按 .env 的 CORE_ENV）再 docker exec；不是恰好一个就算没找到。

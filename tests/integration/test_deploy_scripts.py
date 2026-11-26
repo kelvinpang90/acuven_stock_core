@@ -1,5 +1,5 @@
-"""deploy/instance.sh、deploy.sh、healthcheck.sh 与 docker-compose.yml 的场景测试（CORE-TASK-067，
-docs/PRODUCTION_AND_RECOVERY.md 第 1.1、1.2 节）。
+"""deploy/instance.sh、deploy.sh、healthcheck.sh 与 docker-compose.yml 的场景测试
+（CORE-TASK-067、072，docs/PRODUCTION_AND_RECOVERY.md 第 1.1、1.2 节）。
 
 脚本与 docker-compose.yml 拷进临时目录里搭的假检出，.env 也写在那里。用 bash 跑脚本；
 PATH 最前面放假的 docker、timeout 与 sleep，都把收到的参数记进假工具的目录：
@@ -45,14 +45,18 @@ INSTANCES = {
         "data": "data_net",
         "callers": "stock_core_net",
         "alias": "core_api",
+        "kind": "internal",
     },
     "production": {
         "project": "acuven_stock_core_production",
         "data": "infra_mysql_core_production_net",
-        "callers": "stock_core_production_net",
+        "callers": "proxy_net",
         "alias": "stock_core_production",
+        "kind": "external",
     },
 }
+# CORE-TASK-067 时生产的调用方内部网络；服务器上可能还留着，部署脚本既不挂、也不建、也不删。
+OLD_PRODUCTION_CALLERS = "stock_core_production_net"
 NETWORK_KEYS = ("data", "callers")
 COMPOSE_VARS = ("CORE_DATA_NETWORK", "CORE_CALLER_NETWORK", "CORE_CALLER_ALIAS")
 
@@ -227,6 +231,10 @@ class Result:
                 found.append("prune")
         return found
 
+    def network_changes(self) -> list[list[str]]:
+        """除 network inspect 之外的 docker network 调用（建、删、连接……）。"""
+        return [argv for argv in self.docker() if argv[0] == "network" and argv[1] != "inspect"]
+
     def tool(self, name: str) -> list[dict]:
         return [call for call in self.calls if call["tool"] == name]
 
@@ -324,6 +332,7 @@ printf 'project=%s\\n' "$CORE_COMPOSE_PROJECT"
 printf 'data=%s\\n' "$(printenv CORE_DATA_NETWORK || true)"
 printf 'callers=%s\\n' "$(printenv CORE_CALLER_NETWORK || true)"
 printf 'alias=%s\\n' "$(printenv CORE_CALLER_ALIAS || true)"
+printf 'kind=%s\\n' "$CORE_CALLER_NETWORK_KIND"
 printf 'checkout=%s\\n' "$CORE_CHECKOUT_DIR"
 printf 'error=%s\\n' "$CORE_INSTANCE_ERROR"
 """
@@ -360,6 +369,7 @@ def test_instance_values(fakes: Fakes, tmp_path: Path, name: str) -> None:
     assert values["data"] == expected["data"]
     assert values["callers"] == expected["callers"]
     assert values["alias"] == expected["alias"]
+    assert values["kind"] == expected["kind"]
     assert values["checkout"] == str(checkout.resolve())
     assert values["error"] == ""
 
@@ -404,10 +414,14 @@ def test_instance_values(fakes: Fakes, tmp_path: Path, name: str) -> None:
 def test_instance_rejects(fakes: Fakes, tmp_path: Path, text: str | None) -> None:
     checkout = make_checkout(tmp_path / "checkout", text)
     # 调用方环境里留着的旧值不算数。
-    fakes.extra_env = {"CORE_DATA_NETWORK": "data_net", "CORE_CALLER_ALIAS": "core_api"}
+    fakes.extra_env = {
+        "CORE_DATA_NETWORK": "data_net",
+        "CORE_CALLER_ALIAS": "core_api",
+        "CORE_CALLER_NETWORK_KIND": "internal",
+    }
     values = show_instance(fakes, checkout)
     assert values["instance"] == values["project"] == ""
-    assert values["data"] == values["callers"] == values["alias"] == ""
+    assert values["data"] == values["callers"] == values["alias"] == values["kind"] == ""
     assert "must be exactly one line CORE_ENV=demo or CORE_ENV=production" in values["error"]
 
 
@@ -540,22 +554,52 @@ def test_deploy_production_backs_up_before_migrating(fakes: Fakes, production: P
     assert not directory.is_relative_to(production)
 
 
-@pytest.mark.parametrize("name", INSTANCES)
-def test_deploy_creates_the_callers_network_only_when_missing(
-    fakes: Fakes, tmp_path: Path, name: str
+def test_deploy_demo_creates_the_callers_network_only_when_missing(
+    fakes: Fakes, tmp_path: Path
 ) -> None:
-    env = f"CORE_ENV={name}\nCORE_DATABASE_URL={DB_URL}\n"
-    checkout = make_checkout(tmp_path / "checkout", env)
-    callers = INSTANCES[name]["callers"]
-    fakes.config["networks"].remove(callers)
+    checkout = make_checkout(tmp_path / "checkout")
+    fakes.config["networks"].remove("stock_core_net")
     result = fakes.deploy(checkout)
     assert result.returncode == 0, result.output
-    assert ["network", "create", "--internal", callers] in result.docker()
+    assert ["network", "create", "--internal", "stock_core_net"] in result.docker()
     assert result.steps()[0] == "network create"
 
-    fakes.config["networks"].append(callers)
+    fakes.config["networks"].append("stock_core_net")
     result = fakes.deploy(checkout)
+    assert result.returncode == 0, result.output
     assert "network create" not in result.steps()
+
+
+@pytest.mark.parametrize("old_network", [False, True], ids=["fresh", "old-network-left"])
+def test_deploy_production_attaches_to_the_proxy_network(
+    fakes: Fakes, production: Path, old_network: bool
+) -> None:
+    if old_network:
+        fakes.config["networks"].append(OLD_PRODUCTION_CALLERS)
+    result = fakes.deploy(production)
+    assert result.returncode == 0, result.output
+    assert ["network", "inspect", "proxy_net"] in result.docker()
+    assert result.network_changes() == []
+    assert result.steps() == ["pull", "backup", "run", "up", "prune"]
+
+
+@pytest.mark.parametrize("old_network", [False, True], ids=["fresh", "old-network-left"])
+def test_deploy_production_without_the_proxy_network(
+    fakes: Fakes, production: Path, old_network: bool
+) -> None:
+    fakes.config["networks"].remove("proxy_net")
+    if old_network:
+        fakes.config["networks"].append(OLD_PRODUCTION_CALLERS)
+    result = fakes.deploy(production)
+    assert result.returncode == 1
+    assert "proxy_net does not exist" in result.output
+    assert "nothing has been changed" in result.output
+    # 不建、不删任何网络，不拉镜像、不备份、不迁移、不换容器。
+    assert result.network_changes() == []
+    assert result.steps() == []
+    assert result.compose() == []
+    assert result.tool("mysqldump") == []
+    assert not fakes.backup_dir().exists()
 
 
 def test_deploy_production_without_its_data_network(fakes: Fakes, production: Path) -> None:
@@ -775,7 +819,11 @@ def test_compose_resolves_through_the_instance(tmp_path: Path, name: str) -> Non
     aliases = {networks[key]: (value or {}).get("aliases") for key, value in attached.items()}
     assert aliases[expected["callers"]] == [expected["alias"]]
     if name == "production":
+        assert sorted(networks.values()) == ["infra_mysql_core_production_net", "proxy_net"]
         assert "data_net" not in networks.values()
+        assert OLD_PRODUCTION_CALLERS not in networks.values()
+    else:
+        assert sorted(networks.values()) == ["data_net", "stock_core_net"]
 
 
 def go_duration_seconds(value: object) -> float:
