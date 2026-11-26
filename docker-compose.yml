@@ -26,6 +26,9 @@ services:
     restart: unless-stopped
     logging: *logging
     mem_limit: 256m
+    # 停止宽限（契约 8.6 第 4、5 条）：uvicorn 收尾上限 10 秒（Dockerfile 的 --timeout-graceful-shutdown）
+    # ＋ 定时任务停止的截止时间 30 秒（app/services/periodic.py 的 DEFAULT_STOP_TIMEOUT）＋ 5 秒余量 = 45 秒。
+    stop_grace_period: 45s
     environment:
       CORE_ENV: ${CORE_ENV:?set CORE_ENV in .env (demo or production)}
       CORE_DATABASE_URL: ${CORE_DATABASE_URL:?set CORE_DATABASE_URL in .env (see .env.example)}

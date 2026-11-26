@@ -34,7 +34,7 @@ from app.db import make_engine
 from app.domain.environment import DEMO, health_payload
 from app.domain.periodic import periodic_status
 from app.services.instance import instance_check_error
-from app.services.periodic import PeriodicTask
+from app.services.periodic import PeriodicTask, stop_all
 from app.services.reservations import sweep_expired_reservations
 from app.services.security_events import purge_expired_security_events
 
@@ -113,18 +113,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             purge.start()
             app.state.security_event_purge = purge
-            try:
-                expiry.start()
-                app.state.reservation_expiry = expiry
-                try:
-                    yield
-                finally:
-                    expiry.stop()
-            finally:
-                purge.stop()
+            expiry.start()
+            app.state.reservation_expiry = expiry
+            yield
         finally:
-            # 线程只能启动一次：换上没启动的新任务，再次进入 lifespan 时启动它们。
-            periodic_tasks.update(make_periodic_tasks())
+            try:
+                # 一次停掉全部任务，共用一个截止时间（契约 8.6 第 5 条）；没启动的任务直接算停下。
+                stop_all([expiry, purge])
+            finally:
+                # 线程只能启动一次：换上没启动的新任务，再次进入 lifespan 时启动它们。
+                periodic_tasks.update(make_periodic_tasks())
 
     def periodic_payload() -> dict[str, object]:
         """就绪检查正文的 periodic（契约 8.5）：判定只用单调时钟，不碰数据库。"""

@@ -38,4 +38,7 @@ USER 10001:10001
 EXPOSE 8000
 # 迁移不是启动副作用：由 deploy/deploy.sh 在换容器之前显式跑一次。
 # --factory：create_app() 启动时才读配置，导入模块本身不读环境变量。
-CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+# --no-access-log：uvicorn 自带的访问日志记完整请求行（含查询串），关掉；Core 按路径记的 app.api.access 不变。
+# --timeout-graceful-shutdown 10：收到停止信号后给正在处理的请求最多 10 秒收尾（契约 8.6 第 4 条）。
+# 保持 exec 形式：uvicorn 是 PID 1，直接收到 docker stop 的 SIGTERM。
+CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--timeout-graceful-shutdown", "10"]
