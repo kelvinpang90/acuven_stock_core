@@ -3300,7 +3300,7 @@ tasks:
       二，catalog_changes 的检查约束 object_type 重建为取 product、sku、listing（先删再建，同一条迁移；模型 app/models/catalog.py 同步）。product_object 约束不变。
       downgrade 反向：删 sku_listings，把 object_type 约束复原（库里已有 listing 记录时降级失败，降级只用于 CI 与开发库）。
       明确不做：平台商品命令与目录事件类型的登记（CORE-TASK-084）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-080
     acceptance_criteria:
