@@ -18,11 +18,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import Settings
 from app.db import Base
 from app.domain.periodic import FAILED, SUCCEEDED, is_stale
-from app.main import SECURITY_EVENT_PURGE, create_app
+from app.main import RESERVATION_EXPIRY, SECURITY_EVENT_PURGE, create_app
 from app.models.catalog import Tenant
 from app.models.service_auth import Credential, SecurityEvent
 from app.services import security_events
-from app.services.periodic import PeriodicTask, TaskState
+from app.services.periodic import PeriodicTask, TaskState, stop_all
 from app.services.security_events import PURGE_BATCH_SIZE, purge_expired_security_events
 from tests.integration.conftest import TEST_DATABASE_URL, add_credential, new_id
 from tests.integration.test_inventory_schema import add_tenant
@@ -304,6 +304,73 @@ def test_periodic_task_stop_before_the_first_run_never_calls():
     assert calls == []
 
 
+def test_stop_all_waits_for_every_task_against_one_deadline(caplog: pytest.LogCaptureFixture):
+    release = threading.Event()
+    entered = [threading.Event(), threading.Event()]
+
+    def blocking(index: int) -> Callable[[], None]:
+        def run() -> None:
+            entered[index].set()
+            release.wait(10)
+
+        return run
+
+    tasks = [
+        PeriodicTask(f"blocked-{index}", blocking(index), interval=60, first_delay=0)
+        for index in range(2)
+    ]
+    for task in tasks:
+        task.start()
+    try:
+        for flag in entered:
+            wait_until(flag.is_set)
+        started = time.monotonic()
+        stop_all(tasks, timeout=0.5)
+        elapsed = time.monotonic() - started
+        # 共用一个截止时间：不是两个 0.5 秒之和。
+        assert elapsed < 0.9
+        assert all(task.is_alive() for task in tasks)
+    finally:
+        release.set()
+        stop_all(tasks)
+    assert not any(task.is_alive() for task in tasks)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert sorted(r.getMessage() for r in warnings) == [
+        "periodic task blocked-0 did not stop within 0.5 seconds",
+        "periodic task blocked-1 did not stop within 0.5 seconds",
+    ]
+    assert all(r.name.startswith("app.api.") for r in warnings)
+
+
+def test_stop_all_ends_both_threads_when_the_functions_return_quickly(
+    caplog: pytest.LogCaptureFixture,
+):
+    calls: list[str] = []
+    tasks = [
+        PeriodicTask(name, lambda name=name: calls.append(name), interval=0.01, first_delay=0)
+        for name in ("quick-a", "quick-b")
+    ]
+    for task in tasks:
+        task.start()
+    wait_until(lambda: {"quick-a", "quick-b"} <= set(calls))
+    stop_all(tasks)
+    assert not any(task.is_alive() for task in tasks)
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_stop_all_accepts_tasks_that_never_started(caplog: pytest.LogCaptureFixture):
+    calls: list[None] = []
+    never = PeriodicTask("never-started", lambda: calls.append(None), first_delay=0)
+    running = PeriodicTask("started", lambda: None, interval=60, first_delay=60)
+    running.start()
+    stop_all([never, running])
+    assert not never.is_alive()
+    assert not running.is_alive()
+    assert calls == []
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
 def assert_state_matches_the_domain_rule(task: PeriodicTask, now: float) -> TaskState:
     state = task.state(now)
     assert state.stale == is_stale(
@@ -433,6 +500,35 @@ def test_lifespan_starts_and_stops_the_purge_when_the_database_is_configured(
             task.function()
             assert len(seen) == 1
         assert not task.is_alive()
+        assert purge_threads() == []
+    finally:
+        app.state.engine.dispose()
+
+
+def test_lifespan_exit_stops_both_tasks_and_swaps_in_unstarted_ones(migrated_engine: Engine):
+    app = create_app(Settings(env="demo", git_sha="d" * 40, database_url=TEST_DATABASE_URL))
+    try:
+        with TestClient(app) as client:
+            purge = app.state.security_event_purge
+            expiry = app.state.reservation_expiry
+            assert purge.is_alive() and expiry.is_alive()
+            # 记一次成功：换上的新任务没有这条记录，就绪检查据此看得出换过。
+            purge.function = lambda: None
+            purge.run_once()
+        assert not purge.is_alive()
+        assert not expiry.is_alive()
+        # app.state 上的两项不换，仍是停下的那两个任务。
+        assert app.state.security_event_purge is purge
+        assert app.state.reservation_expiry is expiry
+
+        response = client.get("/readyz")
+        assert response.status_code == 200
+        tasks = {task["name"]: task for task in response.json()["periodic"]["tasks"]}
+        assert set(tasks) == {SECURITY_EVENT_PURGE, RESERVATION_EXPIRY}
+        for task in tasks.values():
+            assert task["alive"] is False
+            assert task["last_success_at"] is None
+            assert task["stale"] is True
         assert purge_threads() == []
     finally:
         app.state.engine.dispose()

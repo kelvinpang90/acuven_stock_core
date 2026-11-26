@@ -778,6 +778,49 @@ def test_compose_resolves_through_the_instance(tmp_path: Path, name: str) -> Non
         assert "data_net" not in networks.values()
 
 
+def go_duration_seconds(value: object) -> float:
+    """compose 的时长：字符串如 "45s"、"1m30s"，或整数纳秒。"""
+    if isinstance(value, int | float):
+        return value / 1e9
+    assert isinstance(value, str)
+    parts = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", value)
+    assert parts and value, value
+    hours, minutes, seconds = (float(part or 0) for part in parts.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+@pytest.mark.parametrize("name", INSTANCES)
+def test_compose_stop_grace_period(tmp_path: Path, name: str) -> None:
+    # 10 秒 uvicorn 收尾 + 30 秒定时任务停止的截止时间 + 5 秒余量（契约 8.6 第 4、5 条）。
+    assert shutil.which("docker"), "docker is not installed"
+    checkout = compose_checkout(tmp_path, name)
+    script = (
+        '. deploy/instance.sh && docker compose -p "$CORE_COMPOSE_PROJECT" config --format json'
+    )
+    completed = subprocess.run(
+        ["bash", "-c", script],
+        cwd=checkout,
+        env=real_env(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    config = json.loads(completed.stdout)
+    assert config["name"] == INSTANCES[name]["project"]
+    assert go_duration_seconds(config["services"]["core_api"]["stop_grace_period"]) == 45
+
+
+def test_dockerfile_cmd_turns_off_uvicorn_access_log_and_bounds_graceful_shutdown() -> None:
+    lines = (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+    (cmd,) = [line for line in lines if line.startswith("CMD")]
+    # exec 形式：JSON 数组，uvicorn 直接收到停止信号，不经 shell。
+    argv = json.loads(cmd.removeprefix("CMD").strip())
+    assert isinstance(argv, list) and argv[0] == "uvicorn"
+    assert "--no-access-log" in argv
+    assert argv[argv.index("--timeout-graceful-shutdown") + 1] == "10"
+
+
 def test_shellcheck_all_deploy_scripts() -> None:
     shellcheck = shutil.which("shellcheck")
     assert shellcheck, "shellcheck is not installed"

@@ -9,7 +9,7 @@
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -77,11 +77,7 @@ class PeriodicTask:
 
     def stop(self, timeout: float = DEFAULT_STOP_TIMEOUT) -> None:
         """通知线程停止并等它结束；正在跑的那一次跑完才结束，最多等 timeout 秒。"""
-        self._stopping.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout)
-        if self._thread.is_alive():
-            _log.warning("periodic task %s did not stop within %s seconds", self.name, timeout)
+        stop_all([self], timeout)
 
     def is_alive(self) -> bool:
         return self._thread.is_alive()
@@ -144,3 +140,21 @@ class PeriodicTask:
         while not self._stopping.wait(delay):
             self.run_once()
             delay = self.interval
+
+
+def stop_all(tasks: Iterable[PeriodicTask], timeout: float = DEFAULT_STOP_TIMEOUT) -> None:
+    """先通知全部任务停止，再用同一个截止时间等它们全部结束（契约 8.6 第 5 条）。
+
+    总共最多等 timeout 秒，不是每个任务各等 timeout 秒；没启动过的任务直接算停下。
+    过了截止时间仍没结束的任务各记一行警告。
+    """
+    tasks = list(tasks)
+    for task in tasks:
+        task._stopping.set()
+    deadline = time.monotonic() + timeout
+    for task in tasks:
+        if task._thread.is_alive():
+            task._thread.join(max(0.0, deadline - time.monotonic()))
+    for task in tasks:
+        if task._thread.is_alive():
+            _log.warning("periodic task %s did not stop within %s seconds", task.name, timeout)
