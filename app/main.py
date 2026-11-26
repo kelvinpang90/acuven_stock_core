@@ -31,7 +31,7 @@ from app.api.errors import install_error_handlers
 from app.api.requests import RequestMiddleware
 from app.config import Settings
 from app.db import make_engine
-from app.domain.environment import DEMO, health_payload
+from app.domain.environment import DEMO, PRODUCTION, health_payload
 from app.domain.periodic import periodic_status
 from app.services.instance import instance_check_error
 from app.services.periodic import PeriodicTask, stop_all
@@ -157,19 +157,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.reservation_expiry = None
     app.add_middleware(RequestMiddleware)
     install_error_handlers(app)
-    app.include_router(catalog.router)
-    app.include_router(catalog_imports.router)
-    app.include_router(catalog_changes.router)
-    app.include_router(stock_queries.router)
-    app.include_router(stock_imports.router)
-    app.include_router(stock_documents.router)
-    app.include_router(counts.router)
-    app.include_router(sku_merges.router)
-    app.include_router(reservations.router)
-    app.include_router(sale_commits.router)
-    app.include_router(fulfilment.router)
-    app.include_router(reconciliation.router)
-    app.include_router(ops.router)
+    if settings.env == PRODUCTION:
+        # 生产实例的 /v1 只挂不变量自查（契约 8.6 第 1 条、4.4）；别的 /v1 路径同不存在的
+        # 路径一样 404、不鉴权。只看 CORE_ENV。
+        app.include_router(ops.router)
+    else:
+        app.include_router(catalog.router)
+        app.include_router(catalog_imports.router)
+        app.include_router(catalog_changes.router)
+        app.include_router(stock_queries.router)
+        app.include_router(stock_imports.router)
+        app.include_router(stock_documents.router)
+        app.include_router(counts.router)
+        app.include_router(sku_merges.router)
+        app.include_router(reservations.router)
+        app.include_router(sale_commits.router)
+        app.include_router(fulfilment.router)
+        app.include_router(reconciliation.router)
+        app.include_router(ops.router)
     # Demo 重置只在 Demo 实例上存在；生产实例不挂，该路径同不存在的路径 404（契约 6.1）。
     if settings.env == DEMO:
         app.include_router(demo_resets.router)
