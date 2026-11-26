@@ -137,7 +137,7 @@ READ COMMITTED（契约 §4.1 下文、§6.6）：
   再调核心 run_with_context。
 - 核心的作用域、锁名、幂等记录、安全事件与日志里的身份、入口、操作者与 request_id
   一律从上下文取；取连接、作废连接与写响应仍按请求。后台执行器以后共用这个核心。
-- execution.context 是这个上下文。execution.access 与 execution.request 是暂时保留的兼容属性。
+- execution.context 是这个上下文；命令体只经它取身份与入口，execution 不持有请求。
 """
 
 import json
@@ -154,7 +154,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.sql.expression import Executable
 
-from app.api.auth import Access, get_access
+from app.api.auth import get_access
 from app.api.errors import ApiError, error_response, internal_error, ok
 from app.api.requests import (
     ParsedBody,
@@ -217,30 +217,21 @@ class _Scope:
 
 
 class Execution:
-    """交给命令的执行上下文：命令上下文、事务已开的连接，以及登记事件与被拒仍保留的写入的方法。
-
-    request 与 access 是暂时保留的兼容属性（命令改读 context 之后去掉）。
-    """
+    """交给命令的执行上下文：命令上下文、事务已开的连接，以及登记事件与被拒仍保留的写入的方法。"""
 
     def __init__(
         self,
-        request: Request,
         context: CommandContext,
         connection: Connection,
         operation: str,
         digest: str,
     ):
-        self.request = request
         self.context = context
         self.connection = connection
         self.operation = operation
         self._digest = digest
         self.events: list[SecurityEventRecord] = []
         self.kept_writes: list[Callable[[Connection], None]] = []
-
-    @property
-    def access(self) -> Access:
-        return get_access(self.request)
 
     @property
     def request_digest(self) -> str:
@@ -616,7 +607,7 @@ def _execute(
     may_redo 为真时把它传出，由调用方重做；否则（最后一遍）503，事件都丢弃。
     """
     request_id = context.request_id
-    execution = Execution(request, context, connection, scope.operation, digest)
+    execution = Execution(context, connection, scope.operation, digest)
     transaction = connection.begin()
     try:
         stored = _find(connection, scope)
@@ -626,7 +617,7 @@ def _execute(
             return _answer(request, context, scope, stored, decision)
 
         try:
-            response, final = _run_command(execution, command)
+            response, final = _run_command(request, execution, command)
         except BusinessRefTaken as taken:
             # 并发撞上业务引用（§7.1 第 2 条最后一段）：撤销命令，
             # 丢弃它登记的事件与被拒仍保留的写入，在新事务里按已生效的那一条重新判定；
@@ -635,7 +626,7 @@ def _execute(
             execution.events = []
             execution.kept_writes = []
             transaction = connection.begin()
-            response, final = _run_command(execution, taken.rejudge)
+            response, final = _run_command(request, execution, taken.rejudge)
         if not final:
             transaction.rollback()
             return response, execution.events
@@ -668,10 +659,9 @@ def _execute(
 
 
 def _run_command(
-    execution: Execution, command: Callable[[Execution], CommandResult]
+    request: Request, execution: Execution, command: Callable[[Execution], CommandResult]
 ) -> tuple[Response, bool]:
-    """在保存点里执行命令；返回响应与它是否作为确定结果保存。"""
-    request = execution.request
+    """在保存点里执行命令；返回响应与它是否作为确定结果保存。响应按请求写。"""
     savepoint = execution.connection.begin_nested()
     try:
         result = command(execution)
