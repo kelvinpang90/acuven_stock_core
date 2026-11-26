@@ -3027,7 +3027,7 @@ tasks:
       三，接线：create_app 把开关记在 app.state 上，命令行在 run_command 交给子命令的参数上也能读到，供之后的后台登录、后台接口与平台任务按它挂路由与作业；本任务不挂任何路由、不加空的占位函数。生产的 /v1 只挂不变量自查仍只由 CORE_ENV 决定（CORE-TASK-071），开关为 true 时也一样。
       四，docker-compose.yml 的 environment 加 CORE_ADMIN_ENABLED，取 .env 的值、没设时为 false（写成 compose 的带默认值的变量），注释写明 Demo 不设或设为 false。.env.example 的这一项由登记 PR 写好，本任务不改。
       明确不做：后台页面、登录、平台接口与平台作业、管理员账号命令（之后的任务）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-071
       - CORE-TASK-072
