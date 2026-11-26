@@ -3333,7 +3333,7 @@ tasks:
       order_ref 照契约不超过 112；单据引用超长时怎么派生、补拉以状态时间作 event_key 时同一时刻两个单据怎么不撞去重键，分别由 CORE-TASK-083 与 086 处理，不在表上解决。
       downgrade 删这三张表。
       明确不做：运营表（CORE-TASK-081）；任何服务、命令、接口。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-092
     acceptance_criteria:
