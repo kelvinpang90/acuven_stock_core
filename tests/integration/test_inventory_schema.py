@@ -515,9 +515,11 @@ def test_downgrade_fails_without_changes_while_a_pool_has_several_channels(
         conn.execute(channel_insert(tenant, pool, channel_id=channels[0], **platform_shop()))
         conn.execute(channel_insert(tenant, pool, channel_id=channels[1], kind=BACKOFFICE))
     try:
+        # 0013 之后的修订先降掉，被拒的是 0013 自己的降级。
+        migrate_production(command.downgrade, "0013", PRODUCTION)
         with pytest.raises(RuntimeError):
             migrate_production(command.downgrade, "0012", PRODUCTION)
-        assert alembic_version(production_engine) == head_revision()
+        assert alembic_version(production_engine) == "0013"
         assert has_channel_kind(production_engine)
         with production_engine.connect() as conn:
             kinds = conn.execute(select(SalesChannel.kind).where(SalesChannel.pool_id == pool))
