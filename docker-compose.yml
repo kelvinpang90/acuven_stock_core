@@ -36,6 +36,8 @@ services:
       CORE_DATABASE_URL: ${CORE_DATABASE_URL:?set CORE_DATABASE_URL in .env (see .env.example)}
       # 预留有效期（秒），60–3600；没设时取 900（契约 5.6）。
       CORE_RESERVATION_TTL_SECONDS: ${CORE_RESERVATION_TTL_SECONDS:-900}
+      # 后台开关（契约 6.1），true 或 false；没设时取 false。Demo 不设或设为 false：为 true 时 Core 拒绝启动。
+      CORE_ADMIN_ENABLED: ${CORE_ADMIN_ENABLED:-false}
     networks:
       data: {}
       callers:

@@ -74,8 +74,8 @@ def run_process() -> int:
         # 校验异常的文本带配置值，也不打印堆栈。
         fail(
             sys.stderr,
-            "invalid configuration"
-            " (check CORE_ENV, CORE_DATABASE_URL and CORE_RESERVATION_TTL_SECONDS)",
+            "invalid configuration (check CORE_ENV, CORE_DATABASE_URL,"
+            " CORE_RESERVATION_TTL_SECONDS and CORE_ADMIN_ENABLED)",
         )
         return EXIT_FAILURE
     return main(sys.argv[1:], settings, sys.stdout, sys.stderr)

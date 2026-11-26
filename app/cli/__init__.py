@@ -4,7 +4,8 @@
 
 子命令模块只 import 本模块、不 import __main__，并提供 register(subparsers)：给每个子命令
 set_defaults(handler=...)。handler 收到同一事务里的连接与解析好的参数，返回要输出的 JSON 对象；
-参数里另有 args.core_env，即 CORE_ENV。改变权限的命令返回 Audited：
+参数里另有 args.core_env，即 CORE_ENV；args.admin_enabled，即 CORE_ADMIN_ENABLED。
+改变权限的命令返回 Audited：
 提交之后另开短事务写它的安全事件（契约 7.2）。
 校验不过就抛 CliError，事务回滚、什么也不写。
 
@@ -30,6 +31,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from app.config import Settings
 from app.db import make_engine
+from app.domain.environment import admin_enabled_error
 from app.models.catalog import Tenant
 from app.models.inventory import SalesChannel
 from app.services.instance import instance_check_error
@@ -151,6 +153,11 @@ def run_command(
     settings: Settings, handler: Handler, args: Namespace, stdout: TextIO, stderr: TextIO
 ) -> int:
     """一个命令一个数据库事务：handler 抛错时回滚，提交成功后才写安全事件、输出结果。"""
+    # Demo 实例不开后台（契约 6.1，Q-87）：连库之前判出，不执行命令、不写安全事件。
+    admin_error = admin_enabled_error(settings.env, settings.admin_enabled)
+    if admin_error is not None:
+        fail(stderr, admin_error)
+        return EXIT_FAILURE
     if not settings.database_url:
         fail(stderr, "database not configured (CORE_DATABASE_URL is empty)")
         return EXIT_FAILURE
@@ -166,6 +173,7 @@ def run_command(
         fail(stderr, error)
         return EXIT_FAILURE
     args.core_env = settings.env
+    args.admin_enabled = settings.admin_enabled
     try:
         try:
             with engine.begin() as conn:

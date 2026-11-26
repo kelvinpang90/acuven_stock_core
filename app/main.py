@@ -31,7 +31,7 @@ from app.api.errors import install_error_handlers
 from app.api.requests import RequestMiddleware
 from app.config import Settings
 from app.db import make_engine
-from app.domain.environment import DEMO, PRODUCTION, health_payload
+from app.domain.environment import DEMO, PRODUCTION, admin_enabled_error, health_payload
 from app.domain.periodic import periodic_status
 from app.services.instance import instance_check_error
 from app.services.periodic import PeriodicTask, stop_all
@@ -75,6 +75,10 @@ def _refuse_to_start(reason: str) -> NoReturn:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
+    # Demo 实例不开后台（契约 6.1，Q-87）：连库之前判出。
+    admin_error = admin_enabled_error(settings.env, settings.admin_enabled)
+    if admin_error is not None:
+        _refuse_to_start(admin_error)
     # 连接串必填（契约 0.11）；建好引擎之后、构造应用之前做启动核对。
     if not settings.database_url:
         _refuse_to_start(f"CORE_DATABASE_URL is empty; CORE_ENV is {settings.env}")
@@ -152,6 +156,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     # 预留命令从这里取有效期（app.api.reservations）。
     app.state.reservation_ttl_seconds = settings.reservation_ttl_seconds
+    # 后台开关：之后的后台登录、后台接口与平台任务按它挂路由与作业；/v1 仍只看 CORE_ENV。
+    app.state.admin_enabled = settings.admin_enabled
     # 进入 lifespan 时设置。
     app.state.security_event_purge = None
     app.state.reservation_expiry = None
