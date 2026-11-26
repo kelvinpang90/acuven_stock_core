@@ -1,5 +1,5 @@
 """deploy/instance.sh、deploy.sh、healthcheck.sh 与 docker-compose.yml 的场景测试
-（CORE-TASK-067、072，docs/PRODUCTION_AND_RECOVERY.md 第 1.1、1.2 节）。
+（CORE-TASK-067、072、073，docs/PRODUCTION_AND_RECOVERY.md 第 1.1、1.2 节）。
 
 脚本与 docker-compose.yml 拷进临时目录里搭的假检出，.env 也写在那里。用 bash 跑脚本；
 PATH 最前面放假的 docker、timeout 与 sleep，都把收到的参数记进假工具的目录：
@@ -824,6 +824,34 @@ def test_compose_resolves_through_the_instance(tmp_path: Path, name: str) -> Non
         assert OLD_PRODUCTION_CALLERS not in networks.values()
     else:
         assert sorted(networks.values()) == ["data_net", "stock_core_net"]
+
+
+@pytest.mark.parametrize("name", INSTANCES)
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", "false"), ("CORE_ADMIN_ENABLED=true\n", "true")],
+    ids=["unset", "true"],
+)
+def test_compose_admin_switch(tmp_path: Path, name: str, line: str, expected: str) -> None:
+    # 后台开关（契约 6.1）：.env 不设时为 false，设了就原样传进容器。
+    assert shutil.which("docker"), "docker is not installed"
+    env = f"CORE_ENV={name}\nCORE_DATABASE_URL={DB_URL}\n{line}"
+    checkout = make_checkout(tmp_path / f"compose_{name}", env)
+    script = (
+        '. deploy/instance.sh && docker compose -p "$CORE_COMPOSE_PROJECT" config --format json'
+    )
+    completed = subprocess.run(
+        ["bash", "-c", script],
+        cwd=checkout,
+        env=real_env(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    config = json.loads(completed.stdout)
+    assert config["name"] == INSTANCES[name]["project"]
+    assert config["services"]["core_api"]["environment"]["CORE_ADMIN_ENABLED"] == expected
 
 
 def go_duration_seconds(value: object) -> float:

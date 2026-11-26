@@ -1,7 +1,7 @@
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.domain.environment import parse_core_env
+from app.domain.environment import parse_admin_enabled, parse_core_env
 from app.domain.reservations import TTL_DEFAULT, parse_ttl_seconds
 
 
@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # 预留有效期（秒，契约 5.6，Q-53）：60–3600 的整数，不设为 900；
     # 不合格时构造失败，API 与命令行都拒绝启动。只在启动时读。
     reservation_ttl_seconds: int = TTL_DEFAULT
+    # 后台开关（契约 6.1，Q-87）：只认 true 与 false，不设为 false；不合格时构造失败，
+    # API 与命令行都拒绝启动。只在启动时读；Demo 实例上为 true 时拒绝启动。
+    admin_enabled: bool = False
 
     @field_validator("env")
     @classmethod
@@ -33,3 +36,13 @@ class Settings(BaseSettings):
                 raise ValueError("CORE_RESERVATION_TTL_SECONDS must be an integer")
             value = int(value)
         return parse_ttl_seconds(value)
+
+    @field_validator("admin_enabled", mode="before")
+    @classmethod
+    def _check_admin_enabled(cls, value):
+        # 环境变量读进来是字符串，严格按 true 与 false 判；代码里直接传布尔值时原样收下。
+        if isinstance(value, bool):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("CORE_ADMIN_ENABLED must be true or false")
+        return parse_admin_enabled(value)

@@ -1,11 +1,28 @@
+import ast
 import unittest
+from pathlib import Path
 
+from app.domain import environment
 from app.domain.environment import (
     InstanceMismatch,
+    admin_enabled_error,
     check_instance_marker,
     health_payload,
+    parse_admin_enabled,
     parse_core_env,
 )
+
+
+class ModuleTest(unittest.TestCase):
+    def test_module_has_no_io_imports(self):
+        source = Path(environment.__file__).read_text(encoding="utf-8")
+        imported = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        self.assertEqual(imported, set())
 
 
 class ParseCoreEnvTest(unittest.TestCase):
@@ -19,6 +36,36 @@ class ParseCoreEnvTest(unittest.TestCase):
         for bad in ("", "Demo", "prod", " demo", "staging"):
             with self.subTest(value=bad), self.assertRaises(ValueError):
                 parse_core_env(bad)
+
+
+class ParseAdminEnabledTest(unittest.TestCase):
+    def test_accepts_true_and_false(self):
+        self.assertIs(parse_admin_enabled("true"), True)
+        self.assertIs(parse_admin_enabled("false"), False)
+
+    def test_rejects_anything_else_instead_of_guessing(self):
+        # 写错时启动失败：猜成 true 会在不该开的实例上开后台，猜成 false 会让运维以为开了。
+        bad_values = ("TRUE", "True", "FALSE", "False", " true", "true ", " false ", "1", "0")
+        for bad in (*bad_values, "yes", "no", "on", ""):
+            with self.subTest(value=bad), self.assertRaises(ValueError) as caught:
+                parse_admin_enabled(bad)
+            self.assertIn("CORE_ADMIN_ENABLED", str(caught.exception))
+
+
+class AdminEnabledErrorTest(unittest.TestCase):
+    def test_demo_with_the_switch_on_is_refused(self):
+        message = admin_enabled_error("demo", True)
+        self.assertIsInstance(message, str)
+        self.assertNotIn("\n", message)
+        self.assertIn("CORE_ADMIN_ENABLED", message)
+        self.assertIn("demo", message)
+        for leak in ("mysql", "://", "@"):
+            self.assertNotIn(leak, message)
+
+    def test_other_combinations_start(self):
+        for env, enabled in (("demo", False), ("production", False), ("production", True)):
+            with self.subTest(env=env, enabled=enabled):
+                self.assertIsNone(admin_enabled_error(env, enabled))
 
 
 class CheckInstanceMarkerTest(unittest.TestCase):

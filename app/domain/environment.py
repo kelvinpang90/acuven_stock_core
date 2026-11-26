@@ -16,6 +16,28 @@ def parse_core_env(value: str) -> str:
     return value
 
 
+def parse_admin_enabled(value: str) -> bool:
+    """后台开关 CORE_ADMIN_ENABLED（契约 6.1，Q-87）：只认 true 与 false。
+
+    区分大小写、不去空格、不收空串：写错时启动失败，而不是猜一个值。
+    """
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError("CORE_ADMIN_ENABLED must be true or false")
+
+
+def admin_enabled_error(core_env: str, admin_enabled: bool) -> str | None:
+    """Demo 实例不开后台（契约 6.1）：开关为 true 时返回拒绝启动的一行原因，否则为 None。
+
+    消息只含键名与环境名，不带连接串。
+    """
+    if core_env == DEMO and admin_enabled:
+        return f"CORE_ADMIN_ENABLED is true; CORE_ENV is {core_env}"
+    return None
+
+
 class InstanceMismatch(ValueError):
     """库里的实例标记与执行进程的 CORE_ENV 不一致，或库里没有标记（契约 6.1）。"""
 

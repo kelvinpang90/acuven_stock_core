@@ -4,6 +4,8 @@
 删掉标记行的测试退出时把它写回去，所以之后的测试照常以 demo 通过核对。
 """
 
+import io
+from argparse import Namespace
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -11,6 +13,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, delete, func, insert, make_url, select
 
+from app.cli import EXIT_FAILURE, run_command
+from app.cli.__main__ import run_process
 from app.config import Settings
 from app.domain.environment import DEMO, PRODUCTION
 from app.main import create_app
@@ -23,6 +27,7 @@ from tests.integration.test_cli_provisioning import create, provision, run_cli
 from tests.integration.test_cli_service_auth import issue_argv
 
 TABLES = (Tenant, Credential, CredentialToken, SecurityEvent)
+ADMIN_VARIABLE = "CORE_ADMIN_ENABLED"
 
 
 @contextmanager
@@ -83,8 +88,8 @@ def test_read_instance_marker_returns_the_row_or_none(migrated_engine):
 # --- API ---
 
 
-def api_settings(env: str = DEMO, database_url: str = TEST_DATABASE_URL) -> Settings:
-    return Settings(env=env, git_sha="e" * 40, database_url=database_url)
+def api_settings(env: str = DEMO, database_url: str = TEST_DATABASE_URL, **extra) -> Settings:
+    return Settings(env=env, git_sha="e" * 40, database_url=database_url, **extra)
 
 
 @pytest.mark.parametrize("env", [DEMO, PRODUCTION])
@@ -187,3 +192,128 @@ def test_help_and_argument_errors_do_not_touch_the_database(migrated_engine):
             assert wrong.code == 2
             assert "invalid arguments" in assert_one_line_without_secrets(wrong.err, url)
     assert marker(migrated_engine) == DEMO
+
+
+# --- 后台开关（契约 6.1，Q-87）---
+
+
+def test_settings_read_the_admin_switch_from_the_environment(monkeypatch):
+    monkeypatch.setenv("CORE_ENV", PRODUCTION)
+    monkeypatch.delenv(ADMIN_VARIABLE, raising=False)
+    assert Settings().admin_enabled is False
+    for value, expected in (("true", True), ("false", False)):
+        monkeypatch.setenv(ADMIN_VARIABLE, value)
+        assert Settings().admin_enabled is expected
+
+
+@pytest.mark.parametrize("value", ["TRUE", "True", " true", "true ", "1", "yes", ""])
+def test_the_cli_names_the_admin_switch_when_the_configuration_is_invalid(
+    monkeypatch, capsys, value
+):
+    monkeypatch.setenv("CORE_ENV", DEMO)
+    monkeypatch.setenv(ADMIN_VARIABLE, value)
+    assert run_process() == EXIT_FAILURE
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    err = assert_one_line_without_secrets(captured.err)
+    assert err.startswith("error: invalid configuration")
+    assert ADMIN_VARIABLE in err
+    # 只写键名，不写配置值。
+    if value.strip():
+        assert value.strip() not in err
+
+
+def test_the_app_refuses_to_start_on_demo_with_the_admin_switch_on(migrated_engine, capsys):
+    with pytest.raises(SystemExit) as exited:
+        create_app(api_settings(DEMO, admin_enabled=True))
+    assert exited.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    line = assert_one_line_without_secrets(captured.err)
+    assert ADMIN_VARIABLE in line and DEMO in line
+    assert marker(migrated_engine) == DEMO
+
+
+def test_the_admin_switch_is_judged_before_connecting(capsys):
+    # 连不上的库也在连库之前就被开关拒绝：原因是开关，而不是数据库。
+    url = unreachable_url()
+    with pytest.raises(SystemExit) as exited:
+        create_app(api_settings(DEMO, database_url=url, admin_enabled=True))
+    assert exited.value.code == 1
+    line = assert_one_line_without_secrets(capsys.readouterr().err, url)
+    assert ADMIN_VARIABLE in line and DEMO in line
+
+    settings = Settings(env=DEMO, database_url=url, admin_enabled=True)
+    result = run_cli(settings, *create("tenant", "Shop"))
+    assert result.code == 1
+    line = assert_one_line_without_secrets(result.err, url)
+    assert ADMIN_VARIABLE in line and DEMO in line
+
+
+@pytest.mark.parametrize(
+    ("env", "admin_enabled"),
+    [(DEMO, False), (DEMO, None), (PRODUCTION, False), (PRODUCTION, True), (PRODUCTION, None)],
+)
+def test_the_app_starts_with_the_admin_switch(migrated_engine, env, admin_enabled):
+    # None：不设，取默认的 false。
+    extra = {} if admin_enabled is None else {"admin_enabled": admin_enabled}
+    with instance_marked(migrated_engine, env):
+        app = create_app(api_settings(env, **extra))
+    try:
+        assert app.state.admin_enabled is bool(admin_enabled)
+        assert TestClient(app).get("/healthz").json()["env"] == env
+    finally:
+        app.state.engine.dispose()
+    assert marker(migrated_engine) == DEMO
+
+
+def test_the_cli_refuses_a_command_on_demo_with_the_admin_switch_on(migrated_engine):
+    demo = Settings(env=DEMO, database_url=TEST_DATABASE_URL)
+    shop = provision(lambda *argv: run_cli(demo, *argv))
+    # 改变权限的命令：执行了就会写安全事件。
+    issue = issue_argv(shop.tenant_id, channel=shop.channel_id)
+    before = counts(migrated_engine)
+    switched_on = Settings(env=DEMO, database_url=TEST_DATABASE_URL, admin_enabled=True)
+    for argv in (create("tenant", "Shop"), issue):
+        result = run_cli(switched_on, *argv)
+        assert result.code == 1
+        assert result.out == ""
+        line = assert_one_line_without_secrets(result.err)
+        assert ADMIN_VARIABLE in line and DEMO in line
+    # 命令没有执行，也没有写安全事件。
+    assert counts(migrated_engine) == before
+
+    # 开关为 false 或不设时同样的命令照常执行。
+    switched_off = Settings(env=DEMO, database_url=TEST_DATABASE_URL, admin_enabled=False)
+    for settings in (switched_off, demo):
+        assert run_cli(settings, *issue).json()["tenant_id"] == shop.tenant_id
+
+
+def test_help_and_argument_errors_ignore_the_admin_switch():
+    settings = Settings(env=DEMO, database_url=TEST_DATABASE_URL, admin_enabled=True)
+    helped = run_cli(settings, "--help")
+    assert helped.code == 0
+    assert helped.err == ""
+    wrong = run_cli(settings, "tenant", "create")
+    assert wrong.code == 2
+    assert "invalid arguments" in assert_one_line_without_secrets(wrong.err)
+
+
+@pytest.mark.parametrize(
+    ("env", "admin_enabled"), [(DEMO, False), (PRODUCTION, False), (PRODUCTION, True)]
+)
+def test_the_cli_hands_the_admin_switch_to_the_command(migrated_engine, env, admin_enabled):
+    seen: list[Namespace] = []
+
+    def handler(conn, args: Namespace) -> dict:
+        seen.append(args)
+        return {}
+
+    settings = Settings(env=env, database_url=TEST_DATABASE_URL, admin_enabled=admin_enabled)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with instance_marked(migrated_engine, env):
+        code = run_command(settings, handler, Namespace(), stdout, stderr)
+    assert code == 0, stderr.getvalue()
+    (args,) = seen
+    assert args.admin_enabled is admin_enabled
+    assert args.core_env == env

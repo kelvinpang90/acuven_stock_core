@@ -145,6 +145,21 @@ def test_a_production_instance_mounts_only_the_invariant_check(production):
     assert v1_routes(production.app) == {("GET", INVARIANTS)}
 
 
+def test_the_admin_switch_does_not_change_the_production_v1_routes(migrated_engine):
+    # /v1 只看 CORE_ENV（CORE-TASK-071）：后台开关为 true 时同样只挂不变量自查。
+    settings = Settings(
+        env=PRODUCTION, git_sha="d" * 40, database_url=TEST_DATABASE_URL, admin_enabled=True
+    )
+    with instance_marked(migrated_engine, PRODUCTION):
+        app = create_app(settings)
+    try:
+        assert app.state.admin_enabled is True
+        assert v1_routes(app) == {("GET", INVARIANTS)}
+        assert TestClient(app).get("/healthz").json()["env"] == PRODUCTION
+    finally:
+        app.state.engine.dispose()
+
+
 def test_other_v1_routes_do_not_exist_on_a_production_instance(demo, production, engine):
     caller = issue(engine)
     routes = sorted(v1_routes(demo.app) - {("GET", INVARIANTS)})
