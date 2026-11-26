@@ -2994,7 +2994,7 @@ tasks:
       三，docker-compose.yml：网络写法不变（网络名与别名仍是必填变量、不给默认值）；更新过时的注释：“Core 不开公网入口、不挂 proxy_net”改为 Demo 不开公网入口，生产挂代理网络、由一个只转发后台与平台接口两个路径前缀的 vhost 对外；“调用方内部网络”的说明按实例分开写（Demo 是调用方内部网络，生产是代理网络）。
       四，过时的注释：deploy/healthcheck.sh 与 .github/workflows/deploy.yml 里“Core 没有公网入口”改为健康检查端点不经反向代理转发（Demo 没有公网入口，生产的 vhost 只转发两个前缀），所以仍在服务器上进容器取 /healthz；deploy/deploy.sh 与 deploy/instance.sh 里“调用方内部网络”的说法按实例分开写。deploy.yml 与 healthcheck.sh 只改注释。
       明确不做：vps_infra 的 vhost 与网络（由人与 vps_infra 做）；应用代码；ci.yml（compose 解析那一步用的是 Demo 的值，不受影响）；运行手册（已在设计 0.7 里写好）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-070
     acceptance_criteria:
