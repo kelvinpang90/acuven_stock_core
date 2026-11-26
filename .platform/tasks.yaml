@@ -2961,7 +2961,7 @@ tasks:
       复用这三个读接口已在用的 app/services 与 app/domain 里的读函数、表示函数与参数解析函数，标准输出写一份 JSON，内容与对应读接口响应里的 data 相同。只读：读完回滚，不写库、不写安全事件、不用令牌；照现有子命令经 run_command 做启动核对，两个实例都能用。
       --tenant 指的租户里找不到池、SKU、预留或订单（不存在或属于别的租户，不区分）时以退出码 2、标准错误一行原因结束，不回显参数值；参数不合格照现有子命令的参数错误处理。
       明确不做：平台订单的子命令（第 2 组之后的任务补）；改读接口与 services 里的读函数；后台开关（CORE-TASK-073）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-070
     acceptance_criteria:
