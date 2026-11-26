@@ -3127,7 +3127,7 @@ tasks:
       三，四个测试里经兼容属性取值的钩子改读上下文：tests/integration/test_corrections_api.py、test_counts_api.py、test_stock_documents_api.py 按 request_id 区分请求的改用 execution.context.request_id；test_stock_imports_api.py 的并发确认钩子现在按 execution.request.path_params 取导入 ID，改为不经请求对象区分两个请求（例如按上下文里的 request_id，测试自己发请求时知道各自的 request_id）。
       工作包 P1c 原本还含“去掉兼容属性”：加上 idempotency.py 允许路径会到 13 个，超过拆分规则的 12 个，所以拆到 CORE-TASK-079；本任务之后兼容属性仍在，app 与 tests 里除执行器自己（app/services/idempotency.py，不在本任务的允许路径里，由 079 一并改）之外不再有人用。
       明确不做：去掉兼容属性（079）；判定与写入的任何改动；入口种类的检查；平台事件执行器。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-074
       - CORE-TASK-075
