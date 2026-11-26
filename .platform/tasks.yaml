@@ -3241,7 +3241,7 @@ tasks:
       app/services/idempotency.py 的 Execution 删掉 CORE-TASK-074 暂留的 access 与 request 两个兼容属性，不再持有请求对象，构造时也不收它；命令体只经 execution.context 取身份与入口。执行器自己里经 execution.request 取值的地方（例如执行命令时组响应）改为直接用核心手里的请求或上下文。核心照旧按请求取连接、作废连接与写响应（074），HTTP 包装与核心的其余行为不变。
       tests/integration/test_idempotency.py：074 加的“兼容属性返回与改动前相同的对象”的测试删掉，改成一条断言 Execution 上没有 access 与 request 属性；这个文件里还有经兼容属性取值的地方一并改读上下文。
       明确不做：服务层与接口层（075、076 已改完，本任务不应再碰它们）；判定与写入的任何改动。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-075
       - CORE-TASK-076
