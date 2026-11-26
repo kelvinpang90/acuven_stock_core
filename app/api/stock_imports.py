@@ -159,17 +159,17 @@ def _preview(execution: Execution, actor: Actor, pool_id: str, rows: list[dict])
     """池已 live：409 POOL_ALREADY_LIVE（保存）；否则逐行判定、保存导入，201。"""
     require_initializing(execution, pool_id)
     connection = execution.connection
-    principal = execution.access.principal
+    context = execution.context
     import_id = stock_imports.save_preview(
         connection,
-        principal.tenant_id,
+        context.tenant_id,
         pool_id,
         rows,
-        credential_id=principal.credential_id,
+        credential_id=context.credential_id,
         actor_ref=actor.ref,
-        request_id=execution.request.state.request_id,
+        request_id=context.request_id,
     )
-    record = stock_imports.read_import(connection, principal.tenant_id, import_id)
+    record = stock_imports.read_import(connection, context.tenant_id, import_id)
     return CommandResult(import_representation(record), 201)
 
 
@@ -206,7 +206,7 @@ _import_pool = require_object_pool(
 def _confirm(execution: Execution, actor: Actor, import_id: str) -> CommandResult:
     """判定顺序照 §6.3：已确认过原样返回 → 已过期 409 → 池已 live 409 → 逐行确认。"""
     connection = execution.connection
-    tenant_id = execution.access.principal.tenant_id
+    tenant_id = execution.context.tenant_id
     record = stock_imports.lock_import(connection, tenant_id, import_id)
     if record is None:
         # 池授权已确认导入属于本租户，导入又不删除。

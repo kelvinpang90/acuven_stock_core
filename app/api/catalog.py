@@ -469,13 +469,13 @@ def _sku_fields(sku: NewSku) -> SkuFields:
 
 def _author(execution: Execution, actor: Actor, reason: str | None) -> ChangeAuthor:
     """变更记录的凭据、操作者、角色、请求 ID 与幂等键取自本请求，原因取正文。"""
-    access = execution.access
+    context = execution.context
     return ChangeAuthor(
-        credential_id=access.principal.credential_id,
+        credential_id=context.credential_id,
         actor_ref=actor.ref,
         actor_role=actor.role,
-        request_id=execution.request.state.request_id,
-        idempotency_key=access.idempotency_key,
+        request_id=context.request_id,
+        idempotency_key=context.idempotency_key,
         reason=reason,
     )
 
@@ -490,7 +490,7 @@ def _conflict(error: CatalogConflict) -> ApiError:
 
 def _create_product(execution: Execution, actor: Actor, body: NewProduct) -> CommandResult:
     connection = execution.connection
-    tenant_id = execution.access.principal.tenant_id
+    tenant_id = execution.context.tenant_id
     skus = [_sku_fields(sku) for sku in body.skus]
     author = _author(execution, actor, body.reason)
     try:
@@ -517,7 +517,7 @@ def _add_sku(execution: Execution, actor: Actor, product_id: str, body: AddedSku
     inactive 的商品照样能加。
     """
     connection = execution.connection
-    tenant_id = execution.access.principal.tenant_id
+    tenant_id = execution.context.tenant_id
     owner = catalog.product_owner(connection, product_id)
     if owner != tenant_id:
         raise _missing(
@@ -573,7 +573,7 @@ def create_sku(
 def _locked_product(execution: Execution, product_id: str) -> LockedProduct:
     """SELECT … FOR UPDATE 读要改的商品；不存在与属于别的租户同一个 404。"""
     connection = execution.connection
-    product = catalog.lock_product(connection, execution.access.principal.tenant_id, product_id)
+    product = catalog.lock_product(connection, execution.context.tenant_id, product_id)
     if product is None:
         raise _missing(
             execution,
@@ -588,7 +588,7 @@ def _locked_product(execution: Execution, product_id: str) -> LockedProduct:
 def _locked_sku(execution: Execution, sku_id: str) -> LockedSku:
     """同 _locked_product，读要改的 SKU（已合并的照常读到）。"""
     connection = execution.connection
-    sku = catalog.lock_sku(connection, execution.access.principal.tenant_id, sku_id)
+    sku = catalog.lock_sku(connection, execution.context.tenant_id, sku_id)
     if sku is None:
         raise _missing(
             execution,
@@ -617,13 +617,13 @@ def _sku_merged(sku: LockedSku) -> ApiError:
 
 
 def _product_result(execution: Execution, product_id: str) -> CommandResult:
-    tenant_id = execution.access.principal.tenant_id
+    tenant_id = execution.context.tenant_id
     product = catalog.read_product(execution.connection, tenant_id, product_id)
     return CommandResult(product_representation(product))
 
 
 def _sku_result(execution: Execution, sku_id: str) -> CommandResult:
-    tenant_id = execution.access.principal.tenant_id
+    tenant_id = execution.context.tenant_id
     sku = catalog.read_sku(execution.connection, tenant_id, sku_id)
     return CommandResult(sku_representation(sku))
 
@@ -639,7 +639,7 @@ def _update_product(
     _check_version(body.expected_version, product.version)
     changes = diff_fields(product.current(), requested)
     if changes:
-        tenant_id = execution.access.principal.tenant_id
+        tenant_id = execution.context.tenant_id
         author = _author(execution, actor, body.reason)
         catalog.update_product(
             execution.connection, tenant_id, product, changes, author, PRODUCT_UPDATED
@@ -661,7 +661,7 @@ def _update_sku(
     _check_version(body.expected_version, sku.version)
     changes = diff_fields(sku.current(), requested)
     if changes:
-        tenant_id = execution.access.principal.tenant_id
+        tenant_id = execution.context.tenant_id
         author = _author(execution, actor, body.reason)
         try:
             catalog.update_sku(execution.connection, tenant_id, sku, changes, author, SKU_UPDATED)
@@ -680,7 +680,7 @@ def _set_product_status(
     product = _locked_product(execution, product_id)
     changes = status_changes(product.status, target)
     if changes:
-        tenant_id = execution.access.principal.tenant_id
+        tenant_id = execution.context.tenant_id
         author = _author(execution, actor, None)
         catalog.update_product(
             execution.connection, tenant_id, product, changes, author, event_type
@@ -700,7 +700,7 @@ def _set_sku_status(
         raise _sku_merged(sku)
     changes = status_changes(sku.status, target)
     if changes:
-        tenant_id = execution.access.principal.tenant_id
+        tenant_id = execution.context.tenant_id
         author = _author(execution, actor, None)
         catalog.update_sku(execution.connection, tenant_id, sku, changes, author, event_type)
     return _sku_result(execution, sku_id)

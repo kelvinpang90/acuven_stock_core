@@ -324,7 +324,7 @@ def test_concurrent_openings_with_one_ref_open_one_count(
     require_live = count_service.require_live
 
     def gated(execution, pool_id):
-        if execution.request.state.request_id == late_rid:
+        if execution.context.request_id == late_rid:
             before_live.pass_through()
         return require_live(execution, pool_id)
 

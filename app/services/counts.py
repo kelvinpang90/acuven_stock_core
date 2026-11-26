@@ -247,12 +247,12 @@ def current_representation(connection: Connection, tenant_id: str, count_id: str
 
 
 def _tenant_id(execution: Execution) -> str:
-    return execution.access.principal.tenant_id
+    return execution.context.tenant_id
 
 
 def _actor_ref(execution: Execution) -> str:
     """盘点单命令都要求角色（§10 第 3 条），操作者必在。"""
-    actor = execution.access.actor
+    actor = execution.context.actor
     if actor is None:
         raise RuntimeError("a count command needs the actor headers")
     return actor.ref
@@ -299,20 +299,19 @@ def _answer_existing(execution: Execution, count: CountRecord) -> CommandResult:
 
 def _insert_count(execution: Execution, record: CountRecord) -> None:
     """撞唯一约束时抛 BusinessRefTaken，由 create_count 重新判定。"""
-    access = execution.access
-    principal = access.principal
+    context = execution.context
     values = {
         "count_id": record.count_id,
-        "tenant_id": principal.tenant_id,
-        "channel_id": principal.channel_id,
+        "tenant_id": context.tenant_id,
+        "channel_id": context.channel_id,
         "pool_id": record.pool_id,
         "count_ref": record.count_ref,
         "status": record.status,
         "note": record.note,
         "request_hash": record.request_hash,
-        "credential_id": principal.credential_id,
+        "credential_id": context.credential_id,
         "actor_ref": _actor_ref(execution),
-        "request_id": execution.request.state.request_id,
+        "request_id": context.request_id,
         "created_at": record.created_at,
     }
     try:
@@ -331,11 +330,11 @@ def create_count(
     命令被业务规则拒绝或撞唯一约束时抛 BusinessRefTaken：执行器在新事务里调用 judge，
     重新找 count_ref，有则回答，没有则再运行一次命令，这一次的结果（含拒绝）就是确定结果。
     """
-    principal = execution.access.principal
+    context = execution.context
 
     def find(execution: Execution) -> CountRecord | None:
         connection = execution.connection
-        return find_count_by_ref(connection, principal.tenant_id, principal.channel_id, count_ref)
+        return find_count_by_ref(connection, context.tenant_id, context.channel_id, count_ref)
 
     def command(execution: Execution) -> CommandResult:
         now = command_now(execution)
@@ -410,7 +409,7 @@ def _write_line(
     values = {
         **{field.name: getattr(line, field.name) for field in fields(CountLineRecord)},
         "actor_ref": _actor_ref(execution),
-        "request_id": execution.request.state.request_id,
+        "request_id": execution.context.request_id,
     }
     connection = execution.connection
     tenant_id = _tenant_id(execution)
@@ -587,9 +586,9 @@ def confirm_count(
         .where(StockCount.tenant_id == tenant_id, StockCount.count_id == count_id)
         .values(
             status=CONFIRMED,
-            confirmed_credential_id=execution.access.principal.credential_id,
+            confirmed_credential_id=execution.context.credential_id,
             confirmed_actor_ref=_actor_ref(execution),
-            confirmed_request_id=execution.request.state.request_id,
+            confirmed_request_id=execution.context.request_id,
             confirmed_at=now,
             confirmed_reason_code=reason_code,
             confirm_note=note,
@@ -620,9 +619,9 @@ def cancel_count(execution: Execution, count_id: str) -> CommandResult:
         .where(*where)
         .values(
             status=CANCELLED,
-            cancelled_credential_id=execution.access.principal.credential_id,
+            cancelled_credential_id=execution.context.credential_id,
             cancelled_actor_ref=_actor_ref(execution),
-            cancelled_request_id=execution.request.state.request_id,
+            cancelled_request_id=execution.context.request_id,
             cancelled_at=now,
         )
     )

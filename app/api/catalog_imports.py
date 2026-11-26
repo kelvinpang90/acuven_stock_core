@@ -153,14 +153,15 @@ import_rows_body = json_body(ImportRows)
 
 def _preview(execution: Execution, actor: Actor, rows: list[dict]) -> CommandResult:
     connection = execution.connection
-    tenant_id = execution.access.principal.tenant_id
+    context = execution.context
+    tenant_id = context.tenant_id
     import_id = catalog_imports.save_preview(
         connection,
         tenant_id,
         rows,
-        credential_id=execution.access.principal.credential_id,
+        credential_id=context.credential_id,
         actor_ref=actor.ref,
-        request_id=execution.request.state.request_id,
+        request_id=context.request_id,
     )
     record = catalog_imports.read_import(connection, tenant_id, import_id)
     return CommandResult(import_representation(record), 201)
@@ -189,8 +190,8 @@ def _confirm(execution: Execution, actor: Actor, import_id: str) -> CommandResul
     不存在与属于别的租户同一个 404，后者经执行器登记 cross_tenant。
     """
     connection = execution.connection
-    access = execution.access
-    tenant_id = access.principal.tenant_id
+    context = execution.context
+    tenant_id = context.tenant_id
     record = catalog_imports.lock_import(connection, tenant_id, import_id)
     if record is None:
         if catalog_imports.import_owner(connection, import_id) is not None:
@@ -201,11 +202,11 @@ def _confirm(execution: Execution, actor: Actor, import_id: str) -> CommandResul
     if record.expired:
         raise ApiError(409, IMPORT_EXPIRED, "import has expired, preview it again")
     author = ChangeAuthor(
-        credential_id=access.principal.credential_id,
+        credential_id=context.credential_id,
         actor_ref=actor.ref,
         actor_role=actor.role,
-        request_id=execution.request.state.request_id,
-        idempotency_key=access.idempotency_key,
+        request_id=context.request_id,
+        idempotency_key=context.idempotency_key,
         reason=None,
         import_id=import_id,
     )
