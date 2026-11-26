@@ -2928,7 +2928,7 @@ tasks:
       二，docker-compose.yml 给 core_api 设 stop_grace_period 为 45s：uvicorn 收尾上限 10 秒，加定时任务停止的截止时间 30 秒（app/services/periodic.py 的 DEFAULT_STOP_TIMEOUT），加 5 秒余量；算式写进注释。
       三，定时任务并行停止：app/services/periodic.py 提供“先通知全部任务停止，再用同一个截止时间等它们全部结束”的停止方式（截止时间默认 DEFAULT_STOP_TIMEOUT），过了截止时间仍没结束的任务各记一行警告（同现在 stop 的写法）；app/main.py 的 lifespan 退出时用它一次停掉全部定时任务，不再逐个等。启动的先后、启动出错时的收尾、退出后在 periodic_tasks 里换上没启动的新任务对象（就绪检查读它；app.state 上的 security_event_purge 与 reservation_expiry 照现在不换），都照现在的做法。
       明确不做：部署脚本与部署工作流（正常关停几秒内完成，45 秒只在作业正在跑时才会用满，不改超时算式）；平台的定时作业与命名锁（第 4 组）；网络与注释（CORE-TASK-072）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - Dockerfile 的 CMD 仍是 exec 形式，带 --no-access-log 与 --timeout-graceful-shutdown 10；docker-compose.yml 的 core_api 设了 stop_grace_period 为 45s，注释写明 10＋30＋5 的算式
