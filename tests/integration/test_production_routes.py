@@ -6,7 +6,7 @@ Demo 应用的每个 /v1 路由与方法（不变量自查除外）在生产应�
 """
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from uuid import uuid4
 
 import pytest
@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
+from starlette.routing import BaseRoute
 
 from app.config import Settings
 from app.domain.environment import PRODUCTION
@@ -108,11 +109,21 @@ def production(migrated_engine: Engine) -> Iterator[TestClient]:
         app.state.engine.dispose()
 
 
+def _api_routes(routes: Sequence[BaseRoute], prefix: str = "") -> Iterator[tuple[str, APIRoute]]:
+    """展开 include_router 挂上的路由：FastAPI 0.141 起它们包在 _IncludedRouter 里。"""
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield prefix + route.path, route
+        included = getattr(route, "original_router", None)
+        if included is not None:
+            yield from _api_routes(included.routes, prefix + route.include_context.prefix)
+
+
 def v1_routes(app: FastAPI) -> set[tuple[str, str]]:
     return {
-        (method, route.path)
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.path.startswith("/v1/")
+        (method, path)
+        for path, route in _api_routes(app.routes)
+        if path.startswith("/v1/")
         for method in route.methods
     }
 
