@@ -3,6 +3,6 @@
 instance 是库里的实例标记（契约 6.1）。
 """
 
-from app.models import catalog, instance, inventory, merges, orders, service_auth
+from app.models import catalog, instance, inventory, merges, orders, platform, service_auth
 
-__all__ = ["catalog", "instance", "inventory", "merges", "orders", "service_auth"]
+__all__ = ["catalog", "instance", "inventory", "merges", "orders", "platform", "service_auth"]
