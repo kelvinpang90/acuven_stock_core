@@ -3269,7 +3269,7 @@ tasks:
       allocation_changes：只追加，id 自增主键；tenant_id、pool_id、sku_id（复合外键到 pool_allocations）、changes（JSON，检查 JSON_TYPE 为 OBJECT）、reason（非空，VARCHAR 500，检查长度大于 0）、credential_id（复合外键到 credentials）、actor_ref、actor_role（都可空，同空同非空）、request_id（非空）、created_at；普通索引 (tenant_id, pool_id, sku_id, id)。
       downgrade 删这三张表。
       明确不做：平台商品与目录变更（CORE-TASK-092）；平台订单与收件箱（093）；运营表（081）；任何服务。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-078
     acceptance_criteria:
