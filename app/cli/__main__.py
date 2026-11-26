@@ -15,6 +15,7 @@ from app.cli import (
     EXIT_USAGE,
     CliError,
     fail,
+    inspect,
     provisioning,
     quiet_security_event_log,
     run_command,
@@ -48,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     provisioning.register(subparsers)
     service_auth.register(subparsers)
+    inspect.register(subparsers)
     return parser
 
 
