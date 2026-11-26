@@ -240,9 +240,8 @@ def upgrade() -> None:
         ),
         _not_empty("platform_events", "result_code"),
         sa.CheckConstraint(
-            "CASE WHEN result = 'applied' THEN TRUE"
-            " WHEN result IN ('held', 'attention') THEN result_code IS NOT NULL"
-            " ELSE result_code IS NULL END",
+            "COALESCE(result, '') = 'applied'"
+            " OR (COALESCE(result, '') IN ('held', 'attention')) = (result_code IS NOT NULL)",
             name=op.f("ck_platform_events_result_code_by_result"),
         ),
         **TABLE_OPTIONS,

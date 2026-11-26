@@ -423,9 +423,9 @@ class PlatformEvent(Base):
         _not_empty("result_code"),
         # applied 时可有可无（成功但另标缺陷时记 defect）；未处理时为空。
         CheckConstraint(
-            "CASE WHEN result = 'applied' THEN TRUE"
-            " WHEN result IN ('held', 'attention') THEN result_code IS NOT NULL"
-            " ELSE result_code IS NULL END",
+            # MySQL 不接受 CASE 作 CHECK 表达式；COALESCE 免得 result 为空时判定落成 NULL 而放行。
+            "COALESCE(result, '') = 'applied'"
+            " OR (COALESCE(result, '') IN ('held', 'attention')) = (result_code IS NOT NULL)",
             name="result_code_by_result",
         ),
         TABLE_OPTIONS,
