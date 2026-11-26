@@ -238,6 +238,7 @@ class CatalogChange(Base):
 
     id 按提交顺序递增靠目录写锁保证，不靠表结构。event_type 不加检查约束，由应用校验，
     以后加事件类型不改表。SKU 事件的 object_id 属于 product_id 由服务层保证。
+    平台商品事件的 object_id 是 listing_id，product_id 是所映射 SKU 的商品（契约 2.9）。
     """
 
     __tablename__ = "catalog_changes"
@@ -255,7 +256,7 @@ class CatalogChange(Base):
         # 变更流按租户、按 id 翻页；按对象查历史。
         Index("ix_catalog_changes_tenant_id_id", "tenant_id", "id"),
         Index("ix_catalog_changes_tenant_id_object_id_id", "tenant_id", "object_id", "id"),
-        CheckConstraint("object_type IN ('product', 'sku')", name="object_type"),
+        CheckConstraint("object_type IN ('product', 'sku', 'listing')", name="object_type"),
         CheckConstraint(
             "object_type <> 'product' OR object_id = product_id", name="product_object"
         ),

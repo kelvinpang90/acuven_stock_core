@@ -341,7 +341,17 @@ def test_change_object_type_must_be_an_exact_known_value(db: Connection):
         tenant, product, credential, event_type="sku_created", object_type="sku", object_id=sku
     )
     db.execute(sku_change)
-    for object_type in ["variant", "SKU", "Product"]:
+    # 平台商品事件（契约 2.9）：object_id 是平台商品，product_id 是所映射 SKU 的商品。
+    listing_change = change_insert(
+        tenant,
+        product,
+        credential,
+        event_type="listing_linked",
+        object_type="listing",
+        object_id=new_id("lst"),
+    )
+    db.execute(listing_change)
+    for object_type in ["variant", "SKU", "Product", "Listing", "listings"]:
         assert_rejected_by(
             db,
             change_insert(tenant, product, credential, object_type=object_type),
