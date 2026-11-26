@@ -14,8 +14,11 @@
 #   CORE_INSTANCE         demo 或 production
 #   CORE_COMPOSE_PROJECT  compose 项目名；所有 compose 调用都带 -p "$CORE_COMPOSE_PROJECT"
 #   CORE_DATA_NETWORK     数据网络（导出给 docker-compose.yml）
-#   CORE_CALLER_NETWORK   调用方用的内部网络（导出）
-#   CORE_CALLER_ALIAS     Core 在调用方内部网络上的别名（导出）
+#   CORE_CALLER_NETWORK   Core 对外的那条网络（导出）：Demo 是调用方内部网络 stock_core_net，
+#                         生产是边缘反向代理所在的代理网络 proxy_net（生产没有外部调用方）
+#   CORE_CALLER_ALIAS     Core 在这条网络上的别名（导出）：Demo 是 core_api，生产是 stock_core_production（vhost 按它转发）
+#   CORE_CALLER_NETWORK_KIND  这条网络归谁建（不导出）：internal 是部署脚本确保存在的内部网络（Demo），
+#                         external 是 vps_infra 建的外部网络、部署脚本不建（生产）
 #   CORE_CHECKOUT_DIR     本检出的根目录（realpath；读不对时也有）
 
 CORE_CHECKOUT_DIR="$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null)" || CORE_CHECKOUT_DIR=""
@@ -37,8 +40,8 @@ core_instance_env_value() {
 }
 
 core_instance_load() {
-    local value data_network caller_network caller_alias
-    CORE_INSTANCE="" CORE_COMPOSE_PROJECT="" CORE_INSTANCE_ERROR=""
+    local value data_network caller_network caller_alias caller_kind
+    CORE_INSTANCE="" CORE_COMPOSE_PROJECT="" CORE_INSTANCE_ERROR="" CORE_CALLER_NETWORK_KIND=""
     # 调用方环境里留着的旧值不能顶替这里没读对的实例。
     unset CORE_DATA_NETWORK CORE_CALLER_NETWORK CORE_CALLER_ALIAS
     CORE_INSTANCE_ERROR="CORE_ENV in ${CORE_CHECKOUT_DIR:-this checkout}/.env must be exactly one line CORE_ENV=demo or CORE_ENV=production"
@@ -46,19 +49,19 @@ core_instance_load() {
     case "$value" in
         demo)
             CORE_COMPOSE_PROJECT=acuven_stock_core
-            data_network=data_net caller_network=stock_core_net caller_alias=core_api
+            data_network=data_net caller_network=stock_core_net caller_alias=core_api caller_kind=internal
             ;;
         production)
             CORE_COMPOSE_PROJECT=acuven_stock_core_production
             data_network=infra_mysql_core_production_net
-            caller_network=stock_core_production_net caller_alias=stock_core_production
+            caller_network=proxy_net caller_alias=stock_core_production caller_kind=external
             ;;
         *)
             CORE_COMPOSE_PROJECT=""
             return 1
             ;;
     esac
-    CORE_INSTANCE="$value" CORE_INSTANCE_ERROR=""
+    CORE_INSTANCE="$value" CORE_INSTANCE_ERROR="" CORE_CALLER_NETWORK_KIND="$caller_kind"
     export CORE_DATA_NETWORK="$data_network" CORE_CALLER_NETWORK="$caller_network" CORE_CALLER_ALIAS="$caller_alias"
 }
 

@@ -9,8 +9,8 @@
 # 实例（Demo 或生产）只由本检出 .env 里的 CORE_ENV 决定，经 deploy/instance.sh 读出；读不对就退出，什么也不碰。
 # 所有 compose 调用都在本检出的根目录里跑，并带 -p 本实例的项目名（docs/PRODUCTION_AND_RECOVERY.md 第 1.2 节）。
 #
-# 顺序：主机锁 → 核对数据网络 → 确保调用方内部网络 → 记下正在跑的版本 → 拉新镜像 →（只生产）备份本库 → 迁移 → 换容器 →
-# 等健康 → 不健康则回滚。
+# 顺序：主机锁 → 核对数据网络 → 确保 Demo 的调用方内部网络（生产：核对代理网络）→ 记下正在跑的版本 → 拉新镜像 →
+#（只生产）备份本库 → 迁移 → 换容器 → 等健康 → 不健康则回滚。
 # 成功才以 0 退出；备份失败、迁移失败、换容器失败、不健康、回滚（无论回滚成败）都以非零退出（部署观察契约 D3）。
 # 迁移只能是向后兼容的（加表、加列、加索引）：迁移跑完而新容器没起来时，旧版本要能继续对着新表结构工作。
 #
@@ -146,8 +146,14 @@ if ! docker network inspect "$CORE_DATA_NETWORK" >/dev/null 2>&1; then
     die "data network $CORE_DATA_NETWORK does not exist (vps_infra creates it); nothing has been changed"
 fi
 
-# Core 与调用方之间的内部网络（--internal：不出宿主机）。只在不存在时创建，已存在的不动。
+# Core 对外的那条网络，按 instance.sh 给的标记：
+# - Demo（internal）：Core 与调用方之间的内部网络（--internal：不出宿主机）。只在不存在时创建，已存在的不动。
+# - 生产（external）：边缘反向代理所在的代理网络，由 vps_infra 建：同数据网络，只核对，不存在就失败，从不自己建。
+#   以前建的 stock_core_production_net 不由这里删除，留给人处理。
 if ! docker network inspect "$CORE_CALLER_NETWORK" >/dev/null 2>&1; then
+    if [ "$CORE_CALLER_NETWORK_KIND" != internal ]; then
+        die "network $CORE_CALLER_NETWORK does not exist (vps_infra creates it); nothing has been changed"
+    fi
     log "creating internal network $CORE_CALLER_NETWORK"
     docker network create --internal "$CORE_CALLER_NETWORK" >/dev/null || die "could not create $CORE_CALLER_NETWORK"
 fi

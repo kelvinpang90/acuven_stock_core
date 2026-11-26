@@ -10,7 +10,8 @@
 #            `git checkout --detach` 到它再跑它自己的 deploy/deploy.sh，不 `git pull` 分支最新。
 #   D3 结论：只有新版本已上线、且上线后健康检查报出 DEPLOY_SHA 才以 success 结束；迁移失败、
 #            不健康、回滚（无论回滚是否成功）、中断都以失败结束。没有 continue-on-error。
-#            Core 没有公网入口，健康检查经 SSH 在服务器上进容器取 /healthz（deploy/healthcheck.sh）。
+#            健康检查端点不经反向代理转发（Demo 没有公网入口，生产的 vhost 只转发两个前缀），
+#            所以仍经 SSH 在服务器上进容器取 /healthz（deploy/healthcheck.sh）。
 #   D4 并发：不取消进行中的部署（被取消的运行按失败处理）。
 #   D5 期限：两个 job 的 timeout-minutes 合计 28 分钟（build 10 + deploy 18），30 分钟内给出结论；不用需要人工批准的 environment。
 # OpenClaw 只读结论：不部署、不回滚、不重跑，也不登录生产。
@@ -206,7 +207,8 @@ jobs:
             trap 'docker logout ghcr.io >/dev/null 2>&1' EXIT
             CORE_IMAGE_REPO="$IMAGE_REPO" bash deploy/deploy.sh "$DEPLOY_SHA"
 
-      # D3：上线后健康检查。Core 没有公网入口，经 SSH 在服务器上进容器取 /healthz，
+      # D3：上线后健康检查。健康检查端点不经反向代理转发（Demo 没有公网入口，生产的 vhost 只转发两个前缀），
+      # 所以仍经 SSH 在服务器上进容器取 /healthz，
       # 要求返回体带着 DEPLOY_SHA——通过即同时证明上线的就是这个提交（D2）。
       - name: Post-deploy health check
         uses: appleboy/ssh-action@v1.0.3
