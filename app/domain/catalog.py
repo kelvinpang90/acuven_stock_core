@@ -58,6 +58,10 @@ SKU_DEACTIVATED = "sku_deactivated"
 SKU_REACTIVATED = "sku_reactivated"
 # SKU 合并执行时给来源 SKU 写（§2.8 执行第 8 步）。
 SKU_MERGED = "sku_merged"
+# 平台商品的挂上、改挂与解除（0.22，§2.5、§2.9），object_type 为 listing。
+LISTING_LINKED = "listing_linked"
+LISTING_RELINKED = "listing_relinked"
+LISTING_UNLINKED = "listing_unlinked"
 EVENT_TYPES = frozenset(
     {
         PRODUCT_CREATED,
@@ -69,6 +73,9 @@ EVENT_TYPES = frozenset(
         SKU_DEACTIVATED,
         SKU_REACTIVATED,
         SKU_MERGED,
+        LISTING_LINKED,
+        LISTING_RELINKED,
+        LISTING_UNLINKED,
     }
 )
 
