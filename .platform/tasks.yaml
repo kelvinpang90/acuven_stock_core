@@ -3530,7 +3530,7 @@ tasks:
       二，在三个服务模块里“按业务引用返回原结果”的分支上调它，只限内容相同、返回原结果的分支（内容不同报 BUSINESS_REF_CONFLICT 的分支不调）：app/services/reservations.py 的 _answer_existing 返回原结果处；app/services/sale_commits.py 的 _answer_committed 与 _answer_by_payment_ref 返回原结果处；app/services/fulfilment.py 的 answer_existing_order_document 返回原结果处。这几个函数也被 rejudge 用，同样打标记。
       三，测试：tests/integration/test_idempotency.py 加标记的默认值与不跨执行的用例；订单类在各自测试文件里加用例，经测试路由调执行器核心，断言新生效时标记为假、换幂等键重报同一业务引用且内容相同时为真、内容不同（409）时为假。
       明确不做：平台事件执行器读它（CORE-TASK-088、089）；改 HTTP 的响应。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-079
     acceptance_criteria:
