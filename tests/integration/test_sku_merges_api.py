@@ -26,6 +26,12 @@ from tests.integration.conftest import TEST_DATABASE_URL, new_id
 from tests.integration.test_api_auth import Caller, add_other_pool, error_of, events, issue
 from tests.integration.test_catalog_create_api import created
 from tests.integration.test_catalog_queries_api import data_of
+from tests.integration.test_catalog_updates_api import (
+    add_listing,
+    listing_ids,
+    platform_channels,
+    unlink,
+)
 from tests.integration.test_counts_api import balance_row, live_caller, preset_balance, receive
 from tests.integration.test_idempotency import add_skus, catalog_lock, get_lock, release_lock
 from tests.integration.test_reservations_api import deactivate_product_of, deactivate_sku
@@ -448,6 +454,38 @@ def test_a_sku_in_another_open_merge_is_409(client, engine, caller):
     error = error_of(create(client, caller, e, c), 409)
     assert error["details"] == in_progress(second)
     assert len(merges_of(engine, caller)) == 2
+
+
+def test_skus_with_active_listings_cannot_be_merged(client, engine, caller):
+    source, canonical, other = add_skus(engine, caller.tenant_id, 3)
+    with platform_channels(engine, caller) as (first, second):
+        low, high = listing_ids(2)
+        add_listing(engine, caller, first, canonical, status="inactive")
+        on_canonical = add_listing(engine, caller, second, canonical)
+
+        error = error_of(create(client, caller, source, canonical), 409)
+        assert error["code"] == "SKU_HAS_ACTIVE_LISTINGS"
+        assert error["details"] == {"sku_id": canonical, "listing_ids": [on_canonical]}
+
+        # 来源与规范都挂着：取来源；先插较大的 ID，响应仍按升序。
+        add_listing(engine, caller, second, source, high)
+        add_listing(engine, caller, first, source, low)
+        error = error_of(create(client, caller, source, canonical), 409)
+        assert error["details"] == {"sku_id": source, "listing_ids": [low, high]}
+        assert merges_of(engine, caller) == []
+
+        # 平台商品都解除之后照常新建。
+        unlink(engine, [low, high, on_canonical])
+        data = created(create(client, caller, source, canonical))
+        assert data["status"] == "selling_paused"
+
+        # 别的未结束合并单在前：先报 SKU_MERGE_IN_PROGRESS；同一对照旧返回原单。
+        add_listing(engine, caller, first, other)
+        add_listing(engine, caller, first, canonical)
+        error = error_of(create(client, caller, other, canonical), 409)
+        assert error["code"] == "SKU_MERGE_IN_PROGRESS"
+        assert data_of(create(client, caller, source, canonical)) == data
+        assert len(merges_of(engine, caller)) == 1
 
 
 def test_after_cancelling_the_same_pair_can_be_created_again(client, engine, caller):

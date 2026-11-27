@@ -74,6 +74,7 @@ from app.services.catalog import (
 )
 from app.services.idempotency import CommandResult, Execution, run_idempotent
 from app.services.security_events import CROSS_TENANT
+from app.services.sku_merges import has_active_listings, read_active_listings
 
 PRODUCT_NOT_FOUND = "PRODUCT_NOT_FOUND"
 SKU_NOT_FOUND = "SKU_NOT_FOUND"
@@ -675,12 +676,22 @@ def _set_product_status(
 ) -> CommandResult:
     """已是目标状态时原样返回；不改它的 SKU 的状态，不检查库存与未结订单。
 
+    要停用时它的 SKU 里有 active 平台商品的 409 SKU_HAS_ACTIVE_LISTINGS，
+    details 带 sku_id 最小的那个与它的 listing_ids（§2.6 第 5 条，0.22）。
     没有请求体，变更记录的 reason 为空。
     """
     product = _locked_product(execution, product_id)
     changes = status_changes(product.status, target)
     if changes:
         tenant_id = execution.context.tenant_id
+        if target == INACTIVE:
+            # 商品行已锁住：它的 SKU 只在目录写锁内新增，普通读出的就是全部。
+            skus = catalog.read_product(execution.connection, tenant_id, product_id).skus
+            sku_ids = [sku.sku_id for sku in skus]
+            listings = read_active_listings(execution.connection, tenant_id, sku_ids)
+            if listings:
+                sku_id = min(listings)
+                raise has_active_listings({"sku_id": sku_id, "listing_ids": listings[sku_id]})
         author = _author(execution, actor, None)
         catalog.update_product(
             execution.connection, tenant_id, product, changes, author, event_type
@@ -693,7 +704,9 @@ def _set_sku_status(
 ) -> CommandResult:
     """重新启用已合并的 SKU 409 SKU_MERGED；已是目标状态时原样返回（停用已合并的 SKU 也是）。
 
-    所属商品 inactive 时照样可以重新启用。没有请求体，变更记录的 reason 为空。
+    所属商品 inactive 时照样可以重新启用。要停用时 SKU 在任何入口上有 active 平台商品
+    409 SKU_HAS_ACTIVE_LISTINGS，details.listing_ids 升序（§2.6 第 5 条，0.22）。
+    没有请求体，变更记录的 reason 为空。
     """
     sku = _locked_sku(execution, sku_id)
     if sku.merged_into_sku_id is not None and target == ACTIVE:
@@ -701,6 +714,10 @@ def _set_sku_status(
     changes = status_changes(sku.status, target)
     if changes:
         tenant_id = execution.context.tenant_id
+        if target == INACTIVE:
+            listings = read_active_listings(execution.connection, tenant_id, [sku_id])
+            if listings:
+                raise has_active_listings({"listing_ids": listings[sku_id]})
         author = _author(execution, actor, None)
         catalog.update_sku(execution.connection, tenant_id, sku, changes, author, event_type)
     return _sku_result(execution, sku_id)
