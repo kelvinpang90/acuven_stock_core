@@ -3,7 +3,8 @@
 
 在真 MySQL 上跑；每个测试建自己的租户、池、销售入口与凭据，池先切到 live，
 预留、确认销售、发货与退款回库经接口建立；预留的其他状态由测试直接改库模拟。
-与发货、退款回库共用的请求与观察辅助函数在 conftest.py。
+与发货、退款回库共用的请求与观察辅助函数在 conftest.py；
+标记的测试用 test_fulfilment_api.py 的 mount_flagged 挂测试路由，记下 answered_by_reference。
 """
 
 from collections.abc import Iterator
@@ -13,7 +14,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
+from app.api.fulfilment import return_receipt_body
 from app.models.orders import OrderLine
+from app.services import fulfilment as fulfilment_service
 from app.services.stock import format_timestamp
 from tests.integration.conftest import (
     COMMON_KEYS,
@@ -30,7 +33,8 @@ from tests.integration.conftest import (
     snapshot,
 )
 from tests.integration.test_api_auth import Caller, error_of, events
-from tests.integration.test_idempotency import records, rid_of
+from tests.integration.test_fulfilment_api import FLAGS, mount_flagged, post_flagged
+from tests.integration.test_idempotency import Flag, overtake, records, rid_of
 from tests.integration.test_reservation_release_api import reserved_order
 from tests.integration.test_reservations_api import (
     ACTOR,
@@ -521,3 +525,81 @@ def test_more_than_100_lines_is_too_large(client, engine, caller):
     assert error_of(response, 413)["code"] == "REQUEST_TOO_LARGE"
     assert records(engine, caller, key, RETURN_RECEIPTS_CREATE) == []
     assert returns(engine, caller) == []
+
+
+# --- 按业务引用返回原结果的标记 ---
+
+
+@pytest.fixture
+def flagged_client(migrated_engine: Engine) -> Iterator[TestClient]:
+    """挂了退货验收标记路由的客户端（路由见 test_fulfilment_api.py 的 mount_flagged）。"""
+    test_client = make_client()
+    mount_flagged(
+        test_client.app,
+        RETURN_RECEIPTS,
+        RETURN_RECEIPTS_CREATE,
+        return_receipt_body,
+        "return_ref",
+        fulfilment_service.create_return_receipt,
+    )
+    try:
+        yield test_client
+    finally:
+        test_client.app.state.engine.dispose()
+        FLAGS.clear()
+
+
+def receive_flagged(client: TestClient, caller: Caller, order_ref: str, body: dict):
+    return post_flagged(client, caller, RETURN_RECEIPTS, order_ref, body)
+
+
+def test_the_mark_is_set_only_when_the_same_return_ref_answers_with_the_original(
+    flagged_client, engine, caller
+):
+    created, _ = dispatched_order(flagged_client, engine, caller, [3])
+    order_ref = created["order_ref"]
+    body = return_body([rline("l1", 1, 0)])
+
+    first = receive_flagged(flagged_client, caller, order_ref, body)
+    document = data_of(first, 201)
+    assert FLAGS[rid_of(first)] == Flag(answered_by_reference=False, rejudged=False)
+
+    # 换键重报同一 return_ref、内容相同：返回原单据，打标记。
+    again = receive_flagged(flagged_client, caller, order_ref, body)
+    assert data_of(again, 200) == document
+    assert FLAGS[rid_of(again)] == Flag(answered_by_reference=True, rejudged=False)
+
+    # 内容不同：409 BUSINESS_REF_CONFLICT，不打标记。
+    changed = body | {"lines": [rline("l1", 2, 0)]}
+    conflict = receive_flagged(flagged_client, caller, order_ref, changed)
+    assert error_of(conflict, 409)["code"] == "BUSINESS_REF_CONFLICT"
+    assert FLAGS[rid_of(conflict)] == Flag(answered_by_reference=False, rejudged=False)
+    assert len(receipts(engine, caller)) == 1
+
+
+def test_the_mark_is_set_when_a_taken_return_ref_is_rejudged(
+    flagged_client, engine, caller, monkeypatch
+):
+    # 已发货 4 件，余量够两次：停住的那笔照常写到单据，撞上唯一约束。
+    created, (sku,) = dispatched_order(flagged_client, engine, caller, [4])
+    order_ref = created["order_ref"]
+    body = return_body([rline("l1", 2, 0)])
+    other_client = TestClient(flagged_client.app)
+
+    # 停在第 1 步（按 return_ref 查单据，没有）之后、锁预留行之前，另一笔换键提交同一 return_ref。
+    held, other = overtake(
+        monkeypatch,
+        fulfilment_service,
+        "lock_reservation_by_ref",
+        lambda: receive_flagged(flagged_client, caller, order_ref, body),
+        lambda: receive_flagged(other_client, caller, order_ref, body),
+    )
+
+    document = data_of(other, 201)
+    assert FLAGS[rid_of(other)] == Flag(answered_by_reference=False, rejudged=False)
+    assert data_of(held, 200) == document
+    assert FLAGS[rid_of(held)] == Flag(answered_by_reference=True, rejudged=True)
+    [stored] = receipts(engine, caller)
+    assert stored["document_id"] == document["document_id"]
+    assert returned(engine, caller) == {"l1": (2, 0)}
+    assert [entry["sku_id"] for entry in returns(engine, caller)] == [sku]

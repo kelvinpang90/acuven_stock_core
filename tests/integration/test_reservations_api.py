@@ -5,6 +5,8 @@
 SKU 与余额行由测试直接在库里造（自己提交的连接）。
 并发的测试替换服务层的 require_live（第 1 步之后、锁余额行之前调用），
 按幂等键让两个请求按约定的先后走。配置的测试除日志那条外不碰数据库。
+标记的测试另挂测试路由，经执行器核心 run_with_context 调预留命令体，
+记下 answered_by_reference。
 """
 
 import logging
@@ -12,13 +14,18 @@ import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from typing import Annotated
 from uuid import uuid4
 
 import pytest
+from fastapi import Depends, Request
+from fastapi.responses import Response
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import Engine, select, text, update
+from sqlalchemy import Connection, Engine, select, text, update
 
+from app.api.auth import authorize, get_access, require_sales_pool
+from app.api.reservations import RESERVATIONS_CREATE, ReservationBody
 from app.cli import EXIT_FAILURE
 from app.cli.__main__ import run_process
 from app.config import Settings
@@ -29,9 +36,10 @@ from app.models.catalog import Product, Sku
 from app.models.inventory import StockBalance
 from app.models.orders import OrderLine, Reservation
 from app.services import reservations as reservation_service
+from app.services.idempotency import CommandResult, Execution, http_context, run_with_context
 from tests.integration.conftest import TEST_DATABASE_URL, add_sku, add_tenant, balance_insert
 from tests.integration.test_api_auth import Caller, error_of, events, issue
-from tests.integration.test_idempotency import add_skus, rid_of
+from tests.integration.test_idempotency import Flag, add_skus, flagging, overtake, rid_of
 from tests.integration.test_stock_imports_api import merge, set_live
 from tests.integration.test_stock_service import entries, quantities_of
 
@@ -644,3 +652,120 @@ def test_the_cli_names_the_ttl_when_the_configuration_is_invalid(monkeypatch, ca
     err = capsys.readouterr().err
     assert err.startswith("error: invalid configuration")
     assert TTL_VARIABLE in err
+
+
+# --- 按业务引用返回原结果的标记 ---
+
+FLAGGED_RESERVATIONS = "/test/flagged/reservations"
+# 标记路由按 request_id 记下的标记；flagged_client 结束时清空。
+FLAGS: dict[str, Flag] = {}
+
+
+def add_flagged_route(app) -> None:
+    """标记路由：依赖、请求体与命令同 POST /v1/reservations，
+    经执行器核心 run_with_context 调命令体，按 request_id 在 FLAGS 记下标记。
+    """
+
+    @app.post(FLAGGED_RESERVATIONS, dependencies=[Depends(authorize(ORDERS_WRITE, write=True))])
+    def create_flagged_reservation(
+        request: Request,
+        body: ReservationBody,
+        pool_id: Annotated[str, Depends(require_sales_pool)],
+    ) -> Response:
+        order_ref = body.model.order_ref
+        lines = body.model.reservation_lines()
+        ttl_seconds = request.app.state.reservation_ttl_seconds
+        tenant_id = get_access(request).principal.tenant_id
+        sku_ids = [each.sku_id for each in lines]
+
+        def balance_rows(connection: Connection) -> list[tuple[str, str]]:
+            return [(pool_id, sku_id) for sku_id in sku_ids]
+
+        def close_due(connection: Connection) -> None:
+            reservation_service.close_due_before_reserving(connection, tenant_id, pool_id, sku_ids)
+
+        def command(execution: Execution) -> CommandResult:
+            return reservation_service.create_reservation(
+                execution, pool_id, order_ref, lines, ttl_seconds
+            )
+
+        return run_with_context(
+            request,
+            http_context(request),
+            operation=RESERVATIONS_CREATE,
+            body=body,
+            command=flagging(command, FLAGS),
+            balance_rows=balance_rows,
+            read_committed=True,
+            before_transaction=close_due,
+        )
+
+
+@pytest.fixture
+def flagged_client(migrated_engine: Engine) -> Iterator[TestClient]:
+    test_client = make_client()
+    add_flagged_route(test_client.app)
+    try:
+        yield test_client
+    finally:
+        test_client.app.state.engine.dispose()
+        FLAGS.clear()
+
+
+def reserve_flagged(client: TestClient, caller: Caller, body: dict, key: str | None = None):
+    headers = caller.auth | {
+        "Idempotency-Key": key or new_key(),
+        "X-Request-ID": f"reserve-flag-{uuid4().hex}",
+    }
+    return client.post(FLAGGED_RESERVATIONS, json=body, headers=headers)
+
+
+def test_the_mark_is_set_only_when_the_same_order_answers_with_the_original(
+    flagged_client, engine, caller
+):
+    [sku] = add_skus(engine, caller.tenant_id, 1)
+    stock(engine, caller, sku, 5)
+    body = order([line("l1", sku, 2)])
+
+    first = reserve_flagged(flagged_client, caller, body)
+    created = data_of(first, 201)
+    assert FLAGS[rid_of(first)] == Flag(answered_by_reference=False, rejudged=False)
+
+    # 换键重报同一 order_ref、内容相同：返回原预留，打标记。
+    again = reserve_flagged(flagged_client, caller, body)
+    assert data_of(again, 200) == created
+    assert FLAGS[rid_of(again)] == Flag(answered_by_reference=True, rejudged=False)
+
+    # 内容不同：409，不打标记。
+    changed = body | {"lines": [line("l1", sku, 3)]}
+    conflict = reserve_flagged(flagged_client, caller, changed)
+    assert error_of(conflict, 409)["code"] == "ORDER_REFERENCE_CONFLICT"
+    assert FLAGS[rid_of(conflict)] == Flag(answered_by_reference=False, rejudged=False)
+    assert len(rows_of(engine, Reservation, caller)) == 1
+
+
+def test_the_mark_is_set_when_a_taken_order_ref_is_rejudged(
+    flagged_client, engine, caller, monkeypatch
+):
+    [sku] = add_skus(engine, caller.tenant_id, 1)
+    # 可售量够两单：停住的那笔照常写到预留，撞上 order_ref 的唯一约束。
+    stock(engine, caller, sku, 5)
+    body = order([line("l1", sku, 2)])
+    other_client = TestClient(flagged_client.app)
+
+    # 停在第 1 步（按 order_ref 查预留，没有）之后、写入之前，另一笔换键提交同一 order_ref。
+    held, other = overtake(
+        monkeypatch,
+        reservation_service,
+        "require_live",
+        lambda: reserve_flagged(flagged_client, caller, body),
+        lambda: reserve_flagged(other_client, caller, body),
+    )
+
+    winner = data_of(other, 201)
+    assert FLAGS[rid_of(other)] == Flag(answered_by_reference=False, rejudged=False)
+    assert data_of(held, 200) == winner
+    assert FLAGS[rid_of(held)] == Flag(answered_by_reference=True, rejudged=True)
+    assert len(rows_of(engine, Reservation, caller)) == 1
+    assert quantities_of(engine, caller, sku) == (5, 2, 0, 0)
+    assert len(entries(engine, caller)) == 1
