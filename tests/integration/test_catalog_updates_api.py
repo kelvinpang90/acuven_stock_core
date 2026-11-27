@@ -4,22 +4,31 @@
 “什么也没改”按本租户的商品、SKU、归属行、变更记录与编码历史在请求前后完全相同来判断。
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from typing import NamedTuple
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, text, update
+from sqlalchemy import Engine, delete, insert, text, update
 
 from app.api.catalog import format_timestamp
 from app.config import Settings
 from app.domain.requests import CATALOG_ADMIN
 from app.main import create_app
 from app.models.catalog import Product, Sku, SkuCodeClaim, SkuCodeHistory
-from app.models.inventory import IdempotencyRecord
+from app.models.inventory import IdempotencyRecord, Location, SalesChannel, StockPool
+from app.models.platform import SkuListing
 from app.services import catalog as catalog_service
-from tests.integration.conftest import TEST_DATABASE_URL, new_id
+from tests.integration.conftest import (
+    TEST_DATABASE_URL,
+    add_location,
+    channel_insert,
+    new_id,
+    pool_insert,
+)
 from tests.integration.test_api_auth import Caller, error_of, events, issue
 from tests.integration.test_catalog_create_api import (
     PRICE,
@@ -101,6 +110,86 @@ def claims_of(engine: Engine, tenant_id: str) -> dict[str, str]:
 def db_now(engine: Engine) -> datetime:
     with engine.connect() as db:
         return db.execute(text("SELECT CURRENT_TIMESTAMP(6)")).scalar_one()
+
+
+# --- 平台商品（§2.9，0.22） ---
+
+
+@contextmanager
+def platform_channels(engine: Engine, caller: Caller) -> Iterator[tuple[str, str]]:
+    """调用方的租户里新建两个池，各挂一个 platform 入口，给出两个入口的 ID。
+
+    退出时删掉这两个入口上的平台商品、入口、池与库位：sku_listings 的行与
+    一个池挂多个入口都挡迁移降级，删掉之后会话结束时 migrated_engine 才能降到 base。
+    """
+    tenant_id = caller.tenant_id
+    locations: list[str] = []
+    pools: list[str] = []
+    channels: list[str] = []
+    try:
+        with engine.begin() as db:
+            for _ in range(2):
+                location_id = add_location(db, tenant_id)
+                pool_id = new_id("pool")
+                db.execute(pool_insert(tenant_id, location_id, pool_id=pool_id))
+                channel_id = new_id("chn")
+                platform = {
+                    "kind": "platform",
+                    "platform": "shopee",
+                    "platform_shop_id": uuid4().hex,
+                }
+                db.execute(channel_insert(tenant_id, pool_id, channel_id=channel_id, **platform))
+                locations.append(location_id)
+                pools.append(pool_id)
+                channels.append(channel_id)
+        first, second = channels
+        yield first, second
+    finally:
+        with engine.begin() as db:
+            db.execute(delete(SkuListing).where(SkuListing.channel_id.in_(channels)))
+            db.execute(delete(SalesChannel).where(SalesChannel.channel_id.in_(channels)))
+            db.execute(delete(StockPool).where(StockPool.pool_id.in_(pools)))
+            db.execute(delete(Location).where(Location.location_id.in_(locations)))
+
+
+def listing_ids(count: int) -> list[str]:
+    """count 个新的平台商品 ID，升序。"""
+    return sorted(new_id("lst") for _ in range(count))
+
+
+def add_listing(
+    engine: Engine,
+    caller: Caller,
+    channel_id: str,
+    sku_id: str,
+    listing_id: str | None = None,
+    status: str = "active",
+) -> str:
+    """直接在库里插一条挂在 sku_id 下的平台商品。"""
+    listing_id = listing_id or new_id("lst")
+    with engine.begin() as db:
+        db.execute(
+            insert(SkuListing).values(
+                listing_id=listing_id,
+                tenant_id=caller.tenant_id,
+                channel_id=channel_id,
+                platform_item_id=uuid4().hex,
+                platform_model_id="-",
+                sku_id=sku_id,
+                status=status,
+                version=1,
+                credential_id=caller.credential_id,
+                request_id=new_id("req"),
+            )
+        )
+    return listing_id
+
+
+def unlink(engine: Engine, ids: Sequence[str]) -> None:
+    """直接改库把这些平台商品改为 inactive。"""
+    with engine.begin() as db:
+        statement = update(SkuListing).where(SkuListing.listing_id.in_(list(ids)))
+        db.execute(statement.values(status="inactive", version=2))
 
 
 class Catalog(NamedTuple):
@@ -790,6 +879,79 @@ def test_reaching_a_status_already_held_changes_nothing(client, engine):
         current = get(client, caller, path.rsplit("/", 1)[0])
         assert data_of(command(client, caller, path)) == current
     assert state_of(engine, caller.tenant_id) == stored
+
+
+def test_a_sku_with_active_listings_cannot_be_deactivated(client, engine, existing):
+    caller = existing.caller
+    path = f"/v1/skus/{existing.sku_id}"
+    with platform_channels(engine, caller) as (first, second):
+        low, high = listing_ids(2)
+        # 两个入口上各一条 active；先插较大的 ID，响应仍按升序。
+        add_listing(engine, caller, second, existing.sku_id, high)
+        add_listing(engine, caller, first, existing.sku_id, low)
+        add_listing(engine, caller, first, existing.sku_id, status="inactive")
+        add_listing(engine, caller, second, existing.taken_id)
+        stored = state_of(engine, caller.tenant_id)
+
+        error = error_of(command(client, caller, f"{path}/deactivate"), 409)
+        assert error["code"] == "SKU_HAS_ACTIVE_LISTINGS"
+        assert error["details"] == {"listing_ids": [low, high]}
+        assert state_of(engine, caller.tenant_id) == stored
+
+        # 修改不受影响。
+        body = {"expected_version": 1, "name": "Tee Small"}
+        assert data_of(patch_sku(client, caller, existing.sku_id, body))["version"] == 2
+
+        # 平台商品都解除之后照常停用。
+        unlink(engine, [low, high])
+        data = data_of(command(client, caller, f"{path}/deactivate"))
+        assert (data["status"], data["version"]) == ("inactive", 3)
+
+
+def test_an_inactive_sku_with_active_listings_deactivates_as_before(client, engine, existing):
+    caller = existing.caller
+    with engine.begin() as db:
+        statement = update(Sku).where(Sku.sku_id == existing.sku_id)
+        db.execute(statement.values(status="inactive"))
+    with platform_channels(engine, caller) as (first, _):
+        add_listing(engine, caller, first, existing.sku_id)
+        current = get(client, caller, f"/v1/skus/{existing.sku_id}")
+        stored = state_of(engine, caller.tenant_id)
+
+        # 已是目标状态：200 与当前表示，不查平台商品。
+        response = command(client, caller, f"/v1/skus/{existing.sku_id}/deactivate")
+        assert data_of(response) == current
+        assert state_of(engine, caller.tenant_id) == stored
+
+
+def test_a_product_whose_skus_have_active_listings_cannot_be_deactivated(client, engine, existing):
+    caller = existing.caller
+    path = f"/v1/products/{existing.product_id}"
+    lower, higher = sorted([existing.sku_id, existing.taken_id])
+    with platform_channels(engine, caller) as (first, second):
+        low, high = listing_ids(2)
+        add_listing(engine, caller, second, lower, high)
+        add_listing(engine, caller, first, lower, low)
+        other = add_listing(engine, caller, first, higher)
+        add_listing(engine, caller, second, existing.renamed_id, status="inactive")
+        stored = state_of(engine, caller.tenant_id)
+
+        # 两个 SKU 都挂着：取 sku_id 较小的那个与它的平台商品。
+        error = error_of(command(client, caller, f"{path}/deactivate"), 409)
+        assert error["code"] == "SKU_HAS_ACTIVE_LISTINGS"
+        assert error["details"] == {"sku_id": lower, "listing_ids": [low, high]}
+        assert state_of(engine, caller.tenant_id) == stored
+
+        unlink(engine, [low, high])
+        error = error_of(command(client, caller, f"{path}/deactivate"), 409)
+        assert error["details"] == {"sku_id": higher, "listing_ids": [other]}
+        assert state_of(engine, caller.tenant_id) == stored
+
+        unlink(engine, [other])
+        data = data_of(command(client, caller, f"{path}/deactivate"))
+        assert (data["status"], data["version"]) == ("inactive", 2)
+        # SKU 的状态照旧不变。
+        assert {sku["status"] for sku in data["skus"]} == {"active"}
 
 
 @pytest.mark.parametrize("action", ["deactivate", "reactivate"])

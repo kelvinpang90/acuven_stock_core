@@ -6,7 +6,9 @@
 新建（执行器已取目录写锁）：普通读查两个 SKU，不存在或属于别的租户 404
 → 按 sku_id 升序 FOR UPDATE 锁两个 SKU 行 → 普通读查涉及这两个 SKU 的未结束合并单：
 同一对的返回 200 与它的当前表示 → 已合并 409 → 规范停用 409
-→ 别的未结束单 409 SKU_MERGE_IN_PROGRESS → 写合并单，201。
+→ 别的未结束单 409 SKU_MERGE_IN_PROGRESS
+→ FOR SHARE 读两个 SKU 的 active 平台商品，有的 409 SKU_HAS_ACTIVE_LISTINGS（0.22）
+→ 写合并单，201。
 重叠检查用普通读：READ COMMITTED 下看得到锁 SKU 行之前已提交的合并单，
 涉及同一个 SKU 的两笔新建在 SKU 行锁上排队，所以“合并单互不重叠”不靠数据库约束也成立。
 
@@ -41,7 +43,7 @@ FOR UPDATE 读合并单行，不存在或属于别的租户 404
 
 锁序：合并单行 → 预留行（FOR UPDATE）→ 订单行（FOR UPDATE）→ 池行（FOR SHARE）
 → 余额行（FOR UPDATE）→ SKU 行（FOR UPDATE）；用不到的层跳过。
-新建只锁 SKU 行；录入实数跳过预留行与订单行；执行跳过池行。
+新建只锁 SKU 行（之后 FOR SHARE 读平台商品）；录入实数跳过预留行与订单行；执行跳过池行。
 
 表示由 merge_representation 从合并单行与快照算出，它不读库：
 写命令把锁内读到的行加上本次的改动传进去，查询接口用普通读读出后传进去。
@@ -89,6 +91,7 @@ from app.models.catalog import NOW, Sku
 from app.models.inventory import QUANTITIES
 from app.models.merges import SkuMerge, SkuMergeSnapshot
 from app.models.orders import OrderLine, Reservation
+from app.models.platform import SkuListing
 from app.services import security_events
 from app.services.catalog import ChangeAuthor, record_change
 from app.services.idempotency import CommandResult, Execution, RedoCommand
@@ -116,6 +119,8 @@ STATE_CONFLICT = "STATE_CONFLICT"
 POOL_MISMATCH = "pool_mismatch"
 COUNT_STALE = "COUNT_STALE"
 COUNT_BELOW_COMMITMENTS = "COUNT_BELOW_COMMITMENTS"
+# 停用 SKU 或商品与新建合并共用（§2.6 第 5 条、§2.8，0.22）。
+SKU_HAS_ACTIVE_LISTINGS = "SKU_HAS_ACTIVE_LISTINGS"
 MERGED_INTO_SKU_ID = "merged_into_sku_id"
 
 # 改挂订单行的预留状态，名单与复核都按这四种取（§2.4 第 1 步）；
@@ -433,6 +438,43 @@ def _merge_in_progress(merge: MergeRecord) -> ApiError:
     )
 
 
+def read_active_listings(
+    connection: Connection, tenant_id: str, sku_ids: Iterable[str]
+) -> dict[str, list[str]]:
+    """FOR SHARE 读这些 SKU 在任何入口上 active 的平台商品（§2.9）：
+    有的 SKU 对应它的 listing_id（升序），没有的不出现。
+    调用方先锁住 SKU 或商品行；停用 SKU、商品与新建合并共用。
+    """
+    statement = (
+        select(SkuListing.sku_id, SkuListing.listing_id)
+        .where(
+            SkuListing.tenant_id == tenant_id,
+            SkuListing.sku_id.in_(sorted(set(sku_ids))),
+            SkuListing.status == ACTIVE,
+        )
+        .order_by(SkuListing.listing_id)
+        .with_for_update(read=True)
+    )
+    listings: dict[str, list[str]] = {}
+    for sku_id, listing_id in connection.execute(statement):
+        listings.setdefault(sku_id, []).append(listing_id)
+    return listings
+
+
+def has_active_listings(details: dict[str, Any]) -> ApiError:
+    """409 SKU_HAS_ACTIVE_LISTINGS；details 至少带 listing_ids。"""
+    message = "the sku has active platform listings"
+    return ApiError(409, SKU_HAS_ACTIVE_LISTINGS, message, details=details)
+
+
+def _require_no_active_listings(execution: Execution, sku_ids: Sequence[str]) -> None:
+    """按给定顺序（先来源）第一个有 active 平台商品的：409，details 带 sku_id 与 listing_ids。"""
+    listings = read_active_listings(execution.connection, _tenant_id(execution), sku_ids)
+    for sku_id in sku_ids:
+        if sku_id in listings:
+            raise has_active_listings({"sku_id": sku_id, "listing_ids": listings[sku_id]})
+
+
 def create_merge(
     execution: Execution, source_sku_id: str, canonical_sku_id: str, reason: str | None
 ) -> CommandResult:
@@ -453,6 +495,7 @@ def create_merge(
     _require_active(skus[canonical_sku_id])
     if open_merges:
         raise _merge_in_progress(open_merges[0])
+    _require_no_active_listings(execution, sku_ids)
 
     actor = _actor(execution)
     record = MergeRecord(
