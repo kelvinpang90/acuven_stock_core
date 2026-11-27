@@ -4,18 +4,31 @@
 在真 MySQL 上跑；每个测试建自己的租户、池、销售入口与凭据，池先切到 live，
 预留与确认销售经接口建立；预留的其他状态与 SKU 合并的改挂由测试直接改库模拟（自己提交的连接）。
 并发见 test_fulfilment_concurrency.py。
+标记的测试另挂测试路由（mount_flagged，退货验收的测试也用），经执行器核心 run_with_context
+调单据命令体，记下 answered_by_reference。
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
+from typing import Annotated
 from uuid import uuid4
 
 import pytest
+from fastapi import Depends, Request
+from fastapi.responses import Response
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, update
 
+from app.api.auth import authorize, require_sales_pool
+from app.api.fulfilment import dispatch_body, refund_restock_body
+from app.api.requests import ParsedBody
+from app.domain.fulfilment import QuantityLine, ReturnLine
+from app.domain.service_auth import ORDERS_WRITE
 from app.models.inventory import StockBalance
 from app.models.orders import OrderLine, Reservation
+from app.services import fulfilment as fulfilment_service
+from app.services.fulfilment import CommonFields
+from app.services.idempotency import CommandResult, Execution, http_context, run_with_context
 from app.services.stock import format_timestamp
 from tests.integration.conftest import (
     COMMON_KEYS,
@@ -34,7 +47,7 @@ from tests.integration.conftest import (
     snapshot,
 )
 from tests.integration.test_api_auth import Caller, error_of, events
-from tests.integration.test_idempotency import add_skus, records, rid_of
+from tests.integration.test_idempotency import Flag, add_skus, flagging, overtake, records, rid_of
 from tests.integration.test_reservation_release_api import release, reserved_order
 from tests.integration.test_reservations_api import (
     ACTOR,
@@ -631,3 +644,152 @@ def test_more_than_100_lines_is_too_large(client, engine, caller, kind):
     assert error_of(response, 413)["code"] == "REQUEST_TOO_LARGE"
     assert records(engine, caller, key, KINDS[kind][0]) == []
     assert documents(engine, caller) == []
+
+
+# --- 按业务引用返回原结果的标记 ---
+
+FLAGGED = "/test/flagged"
+# 标记路由按 request_id 记下的标记；flagged_client 结束时清空。
+FLAGS: dict[str, Flag] = {}
+# 一条订单单据命令：(execution, order_ref, 单据引用, lines, 公共字段)。
+Create = Callable[
+    [Execution, str, str, Sequence[QuantityLine | ReturnLine], CommonFields], CommandResult
+]
+
+
+def mount_flagged(
+    app, kind: str, operation: str, parse: Callable, ref_field: str, create: Create
+) -> None:
+    """标记路由：路径参数、依赖、请求体与命令同 POST /v1/orders/{order_ref}/{kind}，
+    经执行器核心 run_with_context 调命令体，按 request_id 在 FLAGS 记下标记。
+    """
+
+    def endpoint(
+        request: Request, order_ref: str, body: Annotated[ParsedBody, Depends(parse)]
+    ) -> Response:
+        model = body.model
+        document_ref = getattr(model, ref_field)
+        lines = model.request_lines()
+        fields = model.common_fields()
+
+        def command(execution: Execution) -> CommandResult:
+            return create(execution, order_ref, document_ref, lines, fields)
+
+        return run_with_context(
+            request,
+            http_context(request),
+            operation=operation,
+            body=body,
+            command=flagging(command, FLAGS),
+            read_committed=True,
+        )
+
+    app.add_api_route(
+        f"{FLAGGED}/orders/{{order_ref}}/{kind}",
+        endpoint,
+        methods=["POST"],
+        dependencies=[
+            Depends(authorize(ORDERS_WRITE, write=True)),
+            Depends(require_sales_pool),
+        ],
+    )
+
+
+def _document_command(document_type: str) -> Create:
+    def create(
+        execution: Execution,
+        order_ref: str,
+        document_ref: str,
+        lines: Sequence[QuantityLine | ReturnLine],
+        fields: CommonFields,
+    ) -> CommandResult:
+        return fulfilment_service.create_document(
+            execution, document_type, order_ref, document_ref, lines, fields
+        )
+
+    return create
+
+
+@pytest.fixture
+def flagged_client(migrated_engine: Engine) -> Iterator[TestClient]:
+    test_client = make_client()
+    parsers = {DISPATCHES: dispatch_body, REFUND_RESTOCKS: refund_restock_body}
+    for kind, parse in parsers.items():
+        operation, ref_field, _, document_type, _, _ = KINDS[kind]
+        command = _document_command(document_type)
+        mount_flagged(test_client.app, kind, operation, parse, ref_field, command)
+    try:
+        yield test_client
+    finally:
+        test_client.app.state.engine.dispose()
+        FLAGS.clear()
+
+
+def post_flagged(
+    client: TestClient,
+    caller: Caller,
+    kind: str,
+    order_ref: str,
+    body: dict,
+    key: str | None = None,
+):
+    headers = caller.auth | {
+        "Idempotency-Key": key or new_key(),
+        "X-Request-ID": f"fulfil-flag-{uuid4().hex}",
+    }
+    return client.post(f"{FLAGGED}/orders/{order_ref}/{kind}", json=body, headers=headers)
+
+
+@pytest.mark.parametrize("kind", [DISPATCHES, REFUND_RESTOCKS])
+def test_the_mark_is_set_only_when_the_same_reference_answers_with_the_original(
+    flagged_client, engine, caller, kind
+):
+    created, _ = committed_order(flagged_client, engine, caller, [2])
+    order_ref = created["order_ref"]
+    body = body_of(kind, [qline("l1", 2)])
+
+    first = post_flagged(flagged_client, caller, kind, order_ref, body)
+    document = data_of(first, 201)
+    assert FLAGS[rid_of(first)] == Flag(answered_by_reference=False, rejudged=False)
+
+    # 换键重报同一引用、内容相同：返回原单据，打标记。
+    again = post_flagged(flagged_client, caller, kind, order_ref, body)
+    assert data_of(again, 200) == document
+    assert FLAGS[rid_of(again)] == Flag(answered_by_reference=True, rejudged=False)
+
+    # 内容不同：409 BUSINESS_REF_CONFLICT，不打标记。
+    changed = body | {"lines": [qline("l1", 1)]}
+    conflict = post_flagged(flagged_client, caller, kind, order_ref, changed)
+    assert error_of(conflict, 409)["code"] == "BUSINESS_REF_CONFLICT"
+    assert FLAGS[rid_of(conflict)] == Flag(answered_by_reference=False, rejudged=False)
+    assert len(documents(engine, caller)) == 1
+
+
+@pytest.mark.parametrize("kind", [DISPATCHES, REFUND_RESTOCKS])
+def test_the_mark_is_set_when_a_taken_reference_is_rejudged(
+    flagged_client, engine, caller, monkeypatch, kind
+):
+    # 余量够两次：停住的那笔照常写到单据，撞上唯一约束。
+    created, (sku,) = committed_order(flagged_client, engine, caller, [4])
+    order_ref = created["order_ref"]
+    body = body_of(kind, [qline("l1", 2)])
+    other_client = TestClient(flagged_client.app)
+
+    # 停在第 1 步（按引用查单据，没有）之后、锁预留行之前，另一笔换键提交同一引用。
+    held, other = overtake(
+        monkeypatch,
+        fulfilment_service,
+        "lock_reservation_by_ref",
+        lambda: post_flagged(flagged_client, caller, kind, order_ref, body),
+        lambda: post_flagged(other_client, caller, kind, order_ref, body),
+    )
+
+    document = data_of(other, 201)
+    assert FLAGS[rid_of(other)] == Flag(answered_by_reference=False, rejudged=False)
+    assert data_of(held, 200) == document
+    assert FLAGS[rid_of(held)] == Flag(answered_by_reference=True, rejudged=True)
+    [stored] = documents(engine, caller)
+    assert stored["document_id"] == document["document_id"]
+    dispatched, restocked = totals(engine, caller)["l1"]
+    assert dispatched + restocked == 2
+    assert quantities_of(engine, caller, sku)[3] == 2

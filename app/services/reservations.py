@@ -333,6 +333,7 @@ def _answer_existing(execution: Execution, reservation: ReservationRecord) -> Co
     if reservation.request_hash == execution.request_digest:
         connection = execution.connection
         representation = current_representation(connection, _tenant_id(execution), reservation)
+        execution.mark_answered_by_reference()
         return CommandResult(representation, 200)
     details = {"ref_type": ORDER, "ref": reservation.order_ref}
     execution.record_security_event(BUSINESS_REF_CONFLICT_EVENT, details)

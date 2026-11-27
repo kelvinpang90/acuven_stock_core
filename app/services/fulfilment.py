@@ -178,6 +178,7 @@ def answer_existing_order_document(
     不同 409 BUSINESS_REF_CONFLICT，ref_type 按单据类型，并登记 business_ref_conflict。
     """
     if document.request_hash == execution.request_digest:
+        execution.mark_answered_by_reference()
         return CommandResult(document.result, 200)
     details = {"ref_type": REF_TYPES[document.document_type], "ref": document.document_ref}
     execution.record_security_event(BUSINESS_REF_CONFLICT_EVENT, details)

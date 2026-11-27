@@ -240,6 +240,7 @@ def _answer_committed(execution: Execution, reservation: ReservationRecord) -> C
     if reservation.commit_request_hash == execution.request_digest:
         connection = execution.connection
         representation = current_representation(connection, _tenant_id(execution), reservation)
+        execution.mark_answered_by_reference()
         return CommandResult(representation, 200)
     raise _payment_ref_conflict(execution, reservation.payment_ref)
 
@@ -250,7 +251,7 @@ def _answer_by_payment_ref(
     """第 1 步：普通读按 payment_ref 查预留。
 
     在别的订单上 409 BUSINESS_REF_CONFLICT；
-    在本订单上且已 committed 按 _answer_committed 回答；
+    在本订单上且已 committed 按 _answer_committed 回答（返回原结果时由它打标记）；
     其他（待审、已结案或没查到）返回 None，继续判定。
     """
     context = execution.context

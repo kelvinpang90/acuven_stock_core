@@ -232,11 +232,24 @@ class Execution:
         self._digest = digest
         self.events: list[SecurityEventRecord] = []
         self.kept_writes: list[Callable[[Connection], None]] = []
+        self._answered_by_reference = False
 
     @property
     def request_digest(self) -> str:
         """本请求的规范化请求摘要（§7.1），与幂等记录的 request_hash 相同。"""
         return self._digest
+
+    @property
+    def answered_by_reference(self) -> bool:
+        """这一次命令执行是否按业务引用返回了已生效的原结果（§5.10 第 4 步）。
+
+        HTTP 执行器不读它；平台事件执行器用它区分新生效与返回原结果。
+        """
+        return self._answered_by_reference
+
+    def mark_answered_by_reference(self) -> None:
+        """命令体在按业务引用返回原结果（内容相同）的分支上调用。"""
+        self._answered_by_reference = True
 
     def record_security_event(self, event_type: str, details: dict[str, Any]) -> None:
         """暂存一条安全事件，事务结束、命名锁释放之后写。"""
@@ -625,6 +638,8 @@ def _execute(
             transaction.rollback()
             execution.events = []
             execution.kept_writes = []
+            # 标记属于这一次命令执行：重新判定从假开始。
+            execution._answered_by_reference = False
             transaction = connection.begin()
             response, final = _run_command(request, execution, taken.rejudge)
         if not final:

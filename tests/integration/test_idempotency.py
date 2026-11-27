@@ -13,6 +13,9 @@
 预建函数与钩子可以按 marker 换掉，用来数调用次数、在重做期间停住。
 三遍路由声明了 READ COMMITTED 与最多做 3 遍，命令同上插地点。
 上下文路由直接调核心 run_with_context，命令上下文按 marker 取测试登记的，命令同上插地点。
+标记路由由用到它的测试挂上：命令记下开头的 answered_by_reference、打标记，
+再运行按 marker 挂的钩子。订单类命令的测试共用这里的 flagging（记下命令执行结束时的标记）
+与 overtake（让另一笔插到中间）。
 造数据与观察都用测试自己的连接；应用用自己的连接池。
 """
 
@@ -24,9 +27,9 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import uuid4
 
 import pytest
@@ -1649,3 +1652,180 @@ def test_the_core_takes_identity_from_the_context_not_the_token(client, engine):
     [kept] = records(engine, other, operation=CONTEXT_NOTES)
     assert kept["request_id"] == context.request_id
     assert_lock_free(engine, note_lock(other, operation=CONTEXT_NOTES))
+
+
+# --- 按业务引用返回原结果的标记 ---
+
+MARKS = "test-marks.create"
+MARKS_URL = "/test/marks"
+# 标记路由的命令按 marker 记下开头时的标记。每个测试结束时清空。
+MARK_SEEN: dict[str, list[bool]] = {}
+
+
+@dataclass(frozen=True)
+class Flag:
+    """一个请求最后一遍命令执行结束时的标记，以及那一遍是不是重新判定（rejudge）。"""
+
+    answered_by_reference: bool
+    rejudged: bool
+
+
+def flagging(
+    command: Callable[[Execution], CommandResult],
+    flags: dict[str, Flag],
+    *,
+    rejudged: bool = False,
+) -> Callable[[Execution], CommandResult]:
+    """包住命令体：返回或业务拒绝时按 request_id 在 flags 记下 answered_by_reference。
+
+    命令抛 BusinessRefTaken 时把它的 rejudge 同样包住（记下的 rejudged 为真）；
+    重做时后一遍覆盖前一遍。
+    """
+
+    def run(execution: Execution) -> CommandResult:
+        def record() -> None:
+            flags[execution.context.request_id] = Flag(execution.answered_by_reference, rejudged)
+
+        try:
+            result = command(execution)
+        except BusinessRefTaken as taken:
+            raise BusinessRefTaken(flagging(taken.rejudge, flags, rejudged=True)) from None
+        except ApiError:
+            record()
+            raise
+        record()
+        return result
+
+    return run
+
+
+def overtake(
+    monkeypatch,
+    module: object,
+    name: str,
+    send_held: Callable[[], Any],
+    send_other: Callable[[], Any],
+) -> tuple[Any, Any]:
+    """让另一笔插到中间：把 module.name 换成包装，第一次调用停住；
+    send_held 在另一个线程里发出，停住之后 send_other 发出并完成，再放行。
+
+    之后的调用（另一笔的、重新判定或重做的）直接通过。返回 (停住的响应, 另一笔的响应)。
+    """
+    reached = threading.Event()
+    proceed = threading.Event()
+    guard = threading.Lock()
+    calls: list[None] = []
+    real = getattr(module, name)
+
+    def held(*args: object, **kwargs: object) -> object:
+        with guard:
+            calls.append(None)
+            first = len(calls) == 1
+        if first:
+            reached.set()
+            assert proceed.wait(10)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, held)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            future = pool.submit(send_held)
+            assert reached.wait(10)
+            other = send_other()
+        finally:
+            proceed.set()
+        return future.result(timeout=20), other
+
+
+def mark_note(execution: Execution, note: Note) -> CommandResult:
+    """记下开头的标记，打标记，再运行按 marker 挂的钩子。"""
+    MARK_SEEN.setdefault(note.marker, []).append(execution.answered_by_reference)
+    execution.mark_answered_by_reference()
+    hook = HOOKS.get(note.marker)
+    if hook is not None:
+        hook(execution)
+    return CommandResult({"marker": note.marker}, status=201)
+
+
+@pytest.fixture
+def mark_client(client) -> Iterator[TestClient]:
+    @client.app.post(MARKS_URL, dependencies=[WRITE])
+    def create_mark(request: Request, body: NoteBody) -> Response:
+        return run_idempotent(
+            request,
+            operation=MARKS,
+            body=body,
+            command=lambda execution: mark_note(execution, body.model),
+        )
+
+    try:
+        yield client
+    finally:
+        MARK_SEEN.clear()
+
+
+def test_the_mark_is_false_until_the_command_sets_it(mark_client, engine):
+    caller = issue(engine)
+    seen: list[Execution] = []
+    HOOKS["m"] = seen.append
+
+    plain = send(mark_client, caller, json={"marker": "m"})
+    assert plain.status_code == 201
+    marked = send(mark_client, caller, "shop:mark:1", url=MARKS_URL, json={"marker": "m"})
+    assert marked.status_code == 201
+    assert marked.json()["data"] == {"marker": "m"}
+    assert "Idempotency-Replayed" not in marked.headers
+
+    [unmarked, execution] = seen
+    assert unmarked.answered_by_reference is False
+    assert MARK_SEEN["m"] == [False]
+    assert execution.answered_by_reference is True
+    # 只读：命令体只能经 mark_answered_by_reference 打标记。
+    with pytest.raises(AttributeError):
+        unmarked.answered_by_reference = True
+
+
+def test_the_mark_is_cleared_before_rejudging_on_the_same_execution(mark_client, engine):
+    caller = issue(engine)
+    marked: list[Execution] = []
+    rejudged: list[tuple[Execution, bool]] = []
+
+    def rejudge(execution: Execution) -> CommandResult:
+        rejudged.append((execution, execution.answered_by_reference))
+        return CommandResult({"rejudged": True})
+
+    def take(execution: Execution) -> None:
+        marked.append(execution)
+        raise BusinessRefTaken(rejudge)
+
+    HOOKS["m"] = take
+    response = send(mark_client, caller, url=MARKS_URL, json={"marker": "m"})
+    assert response.status_code == 200
+    assert response.json()["data"] == {"rejudged": True}
+
+    # 命令打了标记之后撞上业务引用：同一个 Execution 进入重新判定时标记已清为假。
+    [execution] = marked
+    [(rejudging, seen)] = rejudged
+    assert rejudging is execution
+    assert seen is False
+    assert execution.answered_by_reference is False
+
+
+def test_a_redo_runs_on_a_new_unmarked_execution(mark_client, engine):
+    caller = issue(engine)
+    executions: list[Execution] = []
+
+    def redo_once(execution: Execution) -> None:
+        executions.append(execution)
+        if len(executions) == 1:
+            raise RedoCommand()
+
+    HOOKS["m"] = redo_once
+    response = send(mark_client, caller, url=MARKS_URL, json={"marker": "m"})
+    assert response.status_code == 201
+
+    # 第一遍打了标记后要求重做；第二遍是新的 Execution，开头的标记为假。
+    first, second = executions
+    assert first is not second
+    assert MARK_SEEN["m"] == [False, False]
+    assert second.answered_by_reference is True
