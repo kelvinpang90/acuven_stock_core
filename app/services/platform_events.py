@@ -1,8 +1,9 @@
 """平台事件执行器（契约 §5.10，§3.1 下单扣配额、取消加回与恢复条件）。
 
-§5.10 的存放、处理顺序第 1–4、7、8 步（含第 4 步落后、越过阶段的三种情形）与
-“每个动作调哪个命令体”的 created、扣数之前的 cancelled、return_requested 三行。
-只有函数，不挂作业、不挂接口（由以后的任务接）：
+§5.10 的存放、处理顺序第 1–8 步（含第 4 步落后、越过阶段的三种情形）与
+“每个动作调哪个命令体”的 created、ready_to_ship、扣数之前的 cancelled、return_requested 四行。
+调 Core 命令体的动作（建 Execution、派生正文、保存点）在 app/services/platform_commands.py，
+由这里分派。只有函数，不挂作业、不挂接口（由以后的任务接）：
 - record_auto_event：webhook 与补拉把一个事件写进收件箱；
 - orders_with_pending_events：找有未处理事件的订单，供作业用；
 - process_order：处理一个订单这一轮的事件。
@@ -19,7 +20,9 @@ process_order 的先后：
    active 的平台商品，普通读）；
    用短事务预建余额行、pool_allocations 行与这个池全部
    platform 入口在这些 SKU 上的 channel_allocations 行；
-   会话设为 READ COMMITTED，再关这些 SKU 上已到期的预留
+   ready_to_ship 另照确认销售接口的 CommitSkus 算出这些 SKU 的合并去向，
+   一并预建余额行（命令体的 prepared 即这个集合）；
+   会话设为 READ COMMITTED，再关这些 SKU（ready_to_ship 连同合并去向）上已到期的预留
    （close_due_before_reserving，同 HTTP 执行器的先后）。
    之后调模块级钩子 _between_prepare_and_lock（默认为空）。
 4. 开事务，照 §5.10 第 4 步的锁序加锁，用不到的层跳过：
@@ -31,12 +34,16 @@ process_order 的先后：
      与第 3 步不同就回滚、从第 3 步重做一次，
      再不同就回滚、这一轮停下（LISTING_CHANGED）。
    然后按阶段判定：ignored 记 ignored、不改任何量（return_requested 总是这样）；
-   created 的 apply 建平台订单并扣配额；unpaid、held 时 cancelled 的 apply
-   见下面的扣数之前的取消；attention 写 stage_conflict（见下面的待处理）；
-   missing_prior 与 blocked 见下面的乱序；其余的 apply（待发货与已确认之后的动作）
+   created 的 apply 建平台订单并扣配额；ready_to_ship 的 apply 见下面的进入待发货；
+   unpaid、held 时 cancelled 的 apply 见下面的扣数之前的取消；
+   attention 写 stage_conflict（见下面的待处理）；
+   missing_prior 与 blocked 见下面的乱序；其余的 apply（已确认之后的动作）
    还没有处理办法：回滚、这一轮停下、不改任何东西（NOT_HANDLED）。
+5、6. 命令体在一个保存点里（app/services/platform_commands.py）。命令抛 RedoCommand：
+   回滚整笔事务，从第 3 步重做一次；再抛就回滚、这一轮停下（REDO_AGAIN）。
 7. 写收件箱行的 applied_at（数据库时间）与 result，
-   与改动一起提交。一轮全部处理完、这个订单没有未处理的事件了，
+   与改动一起提交；提交之后写命令登记的安全事件（app/services/security_events.py，
+   同 HTTP 执行器；回滚了的不写）。一轮全部处理完、这个订单没有未处理的事件了，
    而 next_pull_at 非空或 pull_attempts 大于 0：用一笔短事务清为空与 0。
    一轮结束时在同一连接上设回隔离级别、
    RELEASE_ALL_LOCKS()，出错就作废这个连接
@@ -68,8 +75,23 @@ unpaid 时再 池行 FOR SHARE → 余额行 → pool_allocations 行
 quota_returned 随之增加，不过就整份不加（进 F）；held 时一件也不加回。
 各行剩余件数都为 0 时阶段改为 cancelled（attention 不清）。
 
+进入待发货（§5.10、§3.1，订单 unpaid，或 held 而 ready_at 未记过）：
+先在保存点之外记 ready_at（payload 的平台时间，没有则用 received_at，截到整秒；
+已记过不改），再 FOR UPDATE 锁订单行。有剩余件数大于 0 的行 sku_id 为空：held、
+attention unmapped，不调 Core。否则用 assign_line_refs 按 SKU 合并、派生两个命令的正文；
+校验不过：held、attention invalid_request、attention_code INVALID_REQUEST，不调 Core。
+然后照第 4 步的锁序先锁 池行 FOR SHARE → 这些 SKU 的余额行 FOR UPDATE → 这个入口在
+这些 SKU 上的配额行 FOR UPDATE → 平台商品 FOR SHARE（SKU 都按升序），命令体之后再锁的
+余额行已持有，SKU 行与商品行排在后面。保存点里预留并确认销售：
+- 成功：写各平台行的 line_ref，pending 减各行剩余件数，阶段 committed，result applied，
+  attention 不动（unpaid 订单上可能有别的原因，留给后台清除）；
+- 业务拒绝：held，attention core_rejected、attention_code 为错误码，pending 不动，result held；
+- 带缺陷标记（见 platform_commands）的拒绝：同上，attention 为 defect；
+  带缺陷标记的成功（rejudge 成功、按业务引用返回原结果）：照成功，result_code 记 defect，
+  attention 写 defect（让人去查的原因，覆盖已有的）、attention_code 为空。
+
 待处理（本任务与之后的平台事件任务都照此）：收件箱行的 result_code 写
-这个事件的 Core 错误码，没有错误码时写原因。让订单进 held 的原因总是覆盖
+这个事件的 Core 错误码，没有错误码时写原因。让订单进 held 的原因与缺陷总是覆盖
 订单上的 attention 与 attention_code（后台照它重试）；其余原因在订单已有
 attention 时不覆盖、没有时写上。
 
@@ -103,6 +125,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.sql.expression import Executable
 
+from app.api.errors import INVALID_REQUEST
 from app.domain.allocations import (
     MANUAL,
     add_back,
@@ -116,11 +139,13 @@ from app.domain.channels import PLATFORM
 from app.domain.ids import new_id
 from app.domain.platform_events import (
     CANCELLED,
+    COMMITTED,
     CREATED,
     HASH_HEX_LENGTH,
     HELD,
     ID_MAX_LENGTH,
     PACKAGE_ID,
+    READY_TO_SHIP,
     REFUND_ID,
     RETURN_ID,
     RETURN_RECEIVED,
@@ -128,8 +153,10 @@ from app.domain.platform_events import (
     CancelledPayload,
     CreatedLine,
     CreatedPayload,
+    LineAssignment,
     Outcome,
     Payload,
+    assign_line_refs,
     classify,
     order_lock_name,
     order_ref,
@@ -149,7 +176,16 @@ from app.models.platform import (
 )
 from app.models.platform_ops import ManualCheck, PlatformConnection
 from app.models.service_auth import Credential
+from app.services.idempotency import RedoCommand
+from app.services.platform_commands import (
+    InvalidDerivedBody,
+    command_context,
+    ready_commands,
+    reserve_and_commit,
+)
 from app.services.reservations import close_due_before_reserving
+from app.services.sale_commits import CommitSkus
+from app.services.security_events import SecurityEventRecord, record_security_event
 from app.services.stock import lock_balance_rows
 
 # 自动来源（§5.10 存放）；manual 由后台登记，不经这里。
@@ -165,6 +201,10 @@ UNMAPPED = "unmapped"
 UNKNOWN_LINE = "unknown_line"
 CANCEL_EXCEEDS_REMAINING = "cancel_exceeds_remaining"
 STAGE_CONFLICT = "stage_conflict"
+CORE_REJECTED = "core_rejected"
+INVALID_REQUEST_REASON = "invalid_request"
+# 引用派生或状态记录有缺陷（§5.10 第 6 步、命令体共用）；成功时也记在 result_code。
+DEFECT = "defect"
 # stage_conflict 的 Core 错误码。
 STATE_CONFLICT = "STATE_CONFLICT"
 
@@ -178,6 +218,8 @@ DOCUMENT_ID_FIELDS = (PACKAGE_ID, REFUND_ID, RETURN_ID)
 ORDER_LOCK_WAIT_SECONDS = 5
 # 第 4 步重新解析的 SKU 与第 3 步不同时最多做几遍第 3、4 步。
 RESOLVE_ATTEMPTS = 2
+# 命令抛 RedoCommand 时最多做几遍第 3 步起的处理（§5.10 命令体共用）。
+REDO_ATTEMPTS = 2
 
 # 这一轮停下的原因。
 LOCK_BUSY = "lock_busy"
@@ -185,6 +227,7 @@ LISTING_CHANGED = "listing_changed"
 NOT_HANDLED = "not_handled"
 MISSING_PRIOR = "missing_prior"  # 缺前序动作、收件箱里也没有：标了补拉（平台订单存在时）
 BLOCKED = "blocked"  # 不标补拉
+REDO_AGAIN = "redo_again"  # 命令两次要求整个重做
 FAILED = "failed"
 
 _NO_REFERENCED_ROW = 1452  # MySQL ER_NO_REFERENCED_ROW_2：外键指向的行不存在
@@ -254,6 +297,11 @@ def _system_credential(connection: Connection, tenant_id: str, channel_id: str) 
         or channel.mode == MANUAL
     ):
         return None
+    return _system_principal(connection, tenant_id)
+
+
+def _system_principal(connection: Connection, tenant_id: str) -> str:
+    """这个租户的 system 主体；没有是开通的缺陷，抛 RuntimeError。"""
     credential_id = connection.execute(
         select(Credential.credential_id)
         .where(Credential.tenant_id == tenant_id, Credential.kind == SYSTEM)
@@ -396,11 +444,12 @@ class _Event:
 @dataclass(frozen=True)
 class _Prepared:
     """第 3 步的结果：created 各行解析出的 SKU（找不到为 None；
-    别的动作为空）与涉及的 SKU。
+    别的动作为空）与涉及的 SKU；ready_to_ship 另有确认销售要的 CommitSkus。
     """
 
     skus: Mapping[str, str | None]
     sku_ids: tuple[str, ...]  # 升序
+    commit_skus: CommitSkus | None = None
 
 
 @dataclass
@@ -456,6 +505,7 @@ class _Missing:
 _DONE = "done"  # 写了 applied_at
 _ALREADY_APPLIED = "already_applied"  # 收件箱行已处理过，提交了空事务
 _RESOLVE_AGAIN = "resolve_again"  # 重新解析的 SKU 与第 3 步不同
+_REDO = "redo"  # 命令抛了 RedoCommand，整笔事务已回滚
 
 
 def _check_ttl(reservation_ttl_seconds) -> None:
@@ -488,7 +538,7 @@ def process_order(
     try:
         if not _acquire(connection, name):
             return RoundResult(0, None, LOCK_BUSY)
-        return _run_round(connection, order)
+        return _run_round(connection, order, reservation_ttl_seconds)
     finally:
         _finish(connection)
 
@@ -556,7 +606,7 @@ def _rollback_quietly(connection: Connection) -> None:
         _log.warning("rolling back failed", exc_info=True)
 
 
-def _run_round(connection: Connection, order: _Order) -> RoundResult:
+def _run_round(connection: Connection, order: _Order, ttl_seconds: int) -> RoundResult:
     try:
         channel = _read_channel(connection, order)
         events = _pending_events(connection, order)
@@ -571,7 +621,7 @@ def _run_round(connection: Connection, order: _Order) -> RoundResult:
     promoted: set[str] = set()
     while queue:
         event = queue[0]
-        outcome = _process_event(connection, order, channel, event)
+        outcome = _process_event(connection, order, channel, event, ttl_seconds)
         if isinstance(outcome, _Missing):
             prior = next(
                 (
@@ -702,10 +752,16 @@ def _pending_events(connection: Connection, order: _Order) -> list[_Event]:
 
 
 def _process_event(
-    connection: Connection, order: _Order, channel: _Channel, event: _Event
+    connection: Connection, order: _Order, channel: _Channel, event: _Event, ttl_seconds: int
 ) -> str | _Missing:
-    """第 3、4、7、8 步；返回 _DONE、_ALREADY_APPLIED、_Missing 或这一轮停下的原因。"""
-    for _attempt in range(RESOLVE_ATTEMPTS):
+    """第 3–8 步；返回 _DONE、_ALREADY_APPLIED、_Missing 或这一轮停下的原因。
+
+    重新解析的 SKU 不同与命令要求重做各最多从第 3 步重做一次；
+    提交了才写命令登记的安全事件。
+    """
+    resolved = redone = 0
+    while True:
+        events: list[SecurityEventRecord] = []
         try:
             prepared = _prepare(connection, order, channel, event)
             hook = _between_prepare_and_lock
@@ -713,14 +769,30 @@ def _process_event(
                 hook(connection)
                 # 结束钩子读库时隐式开的事务：第 4 步的事务在这之后才开。
                 connection.rollback()
-            outcome = _locked(connection, order, channel, event, prepared)
+            outcome = _locked(connection, order, channel, event, prepared, ttl_seconds, events)
         except Exception as error:
             _rollback_quietly(connection)
             _log_failure(order, event.event_row_id, error)
             return FAILED
-        if outcome != _RESOLVE_AGAIN:
-            return outcome
-    return LISTING_CHANGED
+        if outcome == _RESOLVE_AGAIN:
+            resolved += 1
+            if resolved >= RESOLVE_ATTEMPTS:
+                return LISTING_CHANGED
+            continue
+        if outcome == _REDO:
+            redone += 1
+            if redone >= REDO_ATTEMPTS:
+                return REDO_AGAIN
+            continue
+        if outcome == _DONE:
+            _write_security_events(connection, events)
+        return outcome
+
+
+def _write_security_events(connection: Connection, events: Iterable[SecurityEventRecord]) -> None:
+    """事务提交之后在同一连接上写（§7.2，同 HTTP 执行器）；写入失败只记进程日志。"""
+    for event in events:
+        record_security_event(event, engine=connection.engine, connection=connection)
 
 
 # --- 第 3 步：开事务之前 ---
@@ -841,13 +913,19 @@ def _prepare(connection: Connection, order: _Order, channel: _Channel, event: _E
     else:
         skus = {}
         sku_ids = _settled_skus(connection, order)
+    commit_skus = None
+    balance_ids = sku_ids
+    if event.action == READY_TO_SHIP:
+        # 确认销售要的 prepared：这些 SKU 及其合并去向（同 HTTP 接口，§5.7）。
+        commit_skus = CommitSkus(order.tenant_id, channel.pool_id, sku_ids)
+        balance_ids = sorted({sku_id for _pool_id, sku_id in commit_skus.balance_rows(connection)})
     channel_ids = _platform_channels(connection, order.tenant_id, channel.pool_id)
     # 结束读隐式开的事务：预建在自己的短事务里提交。
     connection.rollback()
-    if sku_ids:
+    if balance_ids:
         tenant_id, pool_id = order.tenant_id, channel.pool_id
         with connection.begin():
-            for sku_id in sku_ids:
+            for sku_id in balance_ids:
                 _upsert(connection, _balance_upsert(tenant_id, pool_id, sku_id))
             for sku_id in sku_ids:
                 _upsert(connection, _pool_allocation_upsert(tenant_id, pool_id, sku_id))
@@ -857,30 +935,41 @@ def _prepare(connection: Connection, order: _Order, channel: _Channel, event: _E
                     _upsert(connection, statement)
     connection.execute(text(_READ_COMMITTED))
     connection.rollback()
-    if sku_ids:
-        close_due_before_reserving(connection, order.tenant_id, channel.pool_id, sku_ids)
+    if balance_ids:
+        close_due_before_reserving(connection, order.tenant_id, channel.pool_id, balance_ids)
         connection.rollback()
-    return _Prepared(skus, tuple(sku_ids))
+    return _Prepared(skus, tuple(sku_ids), commit_skus)
 
 
 # --- 第 4、7 步：事务里 ---
 
 
 def _locked(
-    connection: Connection, order: _Order, channel: _Channel, event: _Event, prepared: _Prepared
+    connection: Connection,
+    order: _Order,
+    channel: _Channel,
+    event: _Event,
+    prepared: _Prepared,
+    ttl_seconds: int,
+    events: list[SecurityEventRecord],
 ) -> str | _Missing:
     """开事务加锁、判定、改量并写收件箱行；返回 _DONE、_ALREADY_APPLIED、_RESOLVE_AGAIN、
-    _Missing、BLOCKED 或 NOT_HANDLED。只有 _DONE 与 _ALREADY_APPLIED 提交，其余回滚；
-    异常时回滚再抛出。
+    _REDO、_Missing、BLOCKED 或 NOT_HANDLED。只有 _DONE 与 _ALREADY_APPLIED 提交，其余回滚；
+    异常时回滚再抛出。命令登记的安全事件放进 events，由调用方在提交之后写。
     """
     transaction = connection.begin()
     try:
-        outcome = _decide(connection, order, channel, event, prepared)
+        outcome = _decide(connection, order, channel, event, prepared, ttl_seconds, events)
         if outcome in (_DONE, _ALREADY_APPLIED):
             transaction.commit()
         else:
             transaction.rollback()
         return outcome
+    except RedoCommand:
+        # 回滚整笔事务（含被拒仍保留的写入），这次登记的事件不写；由调用方从第 3 步重做。
+        _rollback_transaction(transaction)
+        events.clear()
+        return _REDO
     except BaseException:
         _rollback_transaction(transaction)
         raise
@@ -896,7 +985,13 @@ def _rollback_transaction(transaction: Transaction) -> None:
 
 
 def _decide(
-    connection: Connection, order: _Order, channel: _Channel, event: _Event, prepared: _Prepared
+    connection: Connection,
+    order: _Order,
+    channel: _Channel,
+    event: _Event,
+    prepared: _Prepared,
+    ttl_seconds: int,
+    events: list[SecurityEventRecord],
 ) -> str | _Missing:
     applied_at = connection.execute(
         select(PlatformEvent.applied_at)
@@ -913,6 +1008,7 @@ def _decide(
     platform_order = connection.execute(
         select(
             PlatformOrder.platform_order_row_id,
+            PlatformOrder.order_ref,
             PlatformOrder.stage,
             PlatformOrder.ready_at,
             PlatformOrder.attention,
@@ -956,7 +1052,22 @@ def _decide(
         )
         _mark_applied(connection, order, event, result, result_code)
         return _DONE
+    if event.action == READY_TO_SHIP:
+        result, result_code = _apply_ready(
+            connection, order, channel, event, platform_order, prepared, ttl_seconds, events
+        )
+        _mark_applied(connection, order, event, result, result_code)
+        return _DONE
     return NOT_HANDLED
+
+
+def _hold(connection: Connection, order: _Order, reason: str, code: str | None) -> None:
+    """订单设为（或保持）held：让订单进 held 的原因总是覆盖 attention 与 attention_code。"""
+    connection.execute(
+        update(PlatformOrder)
+        .where(*_order_where(order))
+        .values(stage=HELD, attention=reason, attention_code=code, updated_at=NOW)
+    )
 
 
 def _write_attention(
@@ -1253,13 +1364,7 @@ def _lock_restore_rows(
     → pool_allocations 行 FOR UPDATE → 这个池全部 platform 入口的 channel_allocations 行
     FOR UPDATE → 这个入口在这些 SKU 上的平台商品 FOR SHARE；SKU 都按升序。
     """
-    pool = connection.execute(
-        select(StockPool.pool_id)
-        .where(StockPool.tenant_id == order.tenant_id, StockPool.pool_id == channel.pool_id)
-        .with_for_update(read=True)
-    ).scalar_one_or_none()
-    if pool is None:
-        raise RuntimeError(f"pool {channel.pool_id} is not in the tenant")
+    _lock_pool(connection, order, channel)
     balances = lock_balance_rows(connection, order.tenant_id, channel.pool_id, sku_ids)
     safety_stock: dict[str, int] = {}
     for sku_id in sku_ids:
@@ -1277,8 +1382,31 @@ def _lock_restore_rows(
         safety_stock[sku_id] = value
     channel_ids = _platform_channels(connection, order.tenant_id, channel.pool_id)
     allocations = _lock_channel_allocations(connection, order.tenant_id, channel_ids, sku_ids)
+    return _RestoreRows(
+        available={sku_id: balances[sku_id].quantities.available for sku_id in sku_ids},
+        safety_stock=safety_stock,
+        allocations=allocations,
+        listed=_lock_listings(connection, order, sku_ids),
+    )
+
+
+def _lock_pool(connection: Connection, order: _Order, channel: _Channel) -> None:
+    """池行 FOR SHARE；池由入口的外键保证在这个租户里，读不到是程序错误。"""
+    pool = connection.execute(
+        select(StockPool.pool_id)
+        .where(StockPool.tenant_id == order.tenant_id, StockPool.pool_id == channel.pool_id)
+        .with_for_update(read=True)
+    ).scalar_one_or_none()
+    if pool is None:
+        raise RuntimeError(f"pool {channel.pool_id} is not in the tenant")
+
+
+def _lock_listings(connection: Connection, order: _Order, sku_ids: Iterable[str]) -> frozenset[str]:
+    """按 sku_id 升序 FOR SHARE 读这个入口在这些 SKU 上的平台商品；
+    返回有 active 平台商品的 SKU。
+    """
     listed = set()
-    for sku_id in sku_ids:
+    for sku_id in sorted(set(sku_ids)):
         statuses = connection.execute(
             select(SkuListing.status)
             .where(
@@ -1291,12 +1419,7 @@ def _lock_restore_rows(
         ).scalars()
         if ACTIVE in set(statuses):
             listed.add(sku_id)
-    return _RestoreRows(
-        available={sku_id: balances[sku_id].quantities.available for sku_id in sku_ids},
-        safety_stock=safety_stock,
-        allocations=allocations,
-        listed=frozenset(listed),
-    )
+    return frozenset(listed)
 
 
 def _receiving(connection: Connection, order: _Order) -> _Receiving | None:
@@ -1385,6 +1508,132 @@ def _quota_returns(
             if lines[line_id].sku_id == sku_id:
                 returned[line_id] = amount
     return returned
+
+
+def _ready_at(event: _Event) -> datetime:
+    """payload 的平台时间，没有则用这个事件的 received_at，截到整秒（§5.10）。"""
+    value = event.payload.platform_time or event.received_at
+    return value.replace(microsecond=0)
+
+
+def _apply_ready(
+    connection: Connection,
+    order: _Order,
+    channel: _Channel,
+    event: _Event,
+    platform_order,
+    prepared: _Prepared,
+    ttl_seconds: int,
+    events: list[SecurityEventRecord],
+) -> tuple[str, str | None]:
+    """进入待发货（§5.10、§3.1，订单 unpaid，或 held 而 ready_at 未记过）；
+    返回收件箱行的 result 与 result_code。
+    """
+    # 写在保存点之外：预留被拒、订单进 held 时也保留，之后重试的确认销售照样用它。
+    ready_at = platform_order.ready_at
+    if ready_at is None:
+        ready_at = _ready_at(event)
+        connection.execute(
+            update(PlatformOrder)
+            .where(*_order_where(order))
+            .values(ready_at=ready_at, updated_at=NOW)
+        )
+    lines = _lock_order_lines(connection, order.tenant_id, platform_order.platform_order_row_id)
+    remaining = [
+        (line_id, line.sku_id, line.quantity - line.cancelled_qty)
+        for line_id, line in lines.items()
+    ]
+    if any(sku_id is None and quantity > 0 for _line_id, sku_id, quantity in remaining):
+        _hold(connection, order, UNMAPPED, None)
+        return HELD, UNMAPPED
+    assignment = assign_line_refs(remaining)
+    try:
+        commands = ready_commands(
+            platform_order.order_ref, assignment.lines, ready_at.replace(microsecond=0)
+        )
+    except InvalidDerivedBody:
+        _hold(connection, order, INVALID_REQUEST_REASON, INVALID_REQUEST)
+        return HELD, INVALID_REQUEST
+    if commands is None:
+        # 整理之后一行都不剩：不调 Core（§5.10 派生的命令正文）。
+        return IGNORED, None
+    if prepared.commit_skus is None:
+        raise RuntimeError("ready_to_ship was prepared without its commit skus")
+
+    sku_ids = [line.sku_id for line in assignment.lines]
+    allocations = _lock_for_commands(connection, order, channel, sku_ids)
+    context = command_context(
+        tenant_id=order.tenant_id,
+        channel_id=order.channel_id,
+        pool_id=channel.pool_id,
+        credential_id=_system_principal(connection, order.tenant_id),
+        event_row_id=event.event_row_id,
+        reservation_ttl_seconds=ttl_seconds,
+    )
+    outcome = reserve_and_commit(connection, context, prepared.commit_skus, commands)
+    events.extend(outcome.events)
+    if outcome.rejection is not None:
+        # 扣数之前被拒（第 6 步）：件数留在 pending。
+        code = outcome.rejection.code
+        _hold(connection, order, DEFECT if outcome.defect else CORE_REJECTED, code)
+        return HELD, code
+
+    _commit_ready(connection, order, platform_order, assignment, allocations)
+    if outcome.defect:
+        # 缺陷是让人去查的原因，同进 held 的原因一样覆盖已有的。
+        _write_attention(connection, order, platform_order.attention, DEFECT, None, holds=True)
+        return APPLIED, DEFECT
+    return APPLIED, None
+
+
+def _lock_for_commands(
+    connection: Connection, order: _Order, channel: _Channel, sku_ids: list[str]
+) -> dict[str, _Allocation]:
+    """调命令体之前照 §5.10 第 4 步的锁序先锁：池行 FOR SHARE → 这些 SKU 的余额行
+    FOR UPDATE → 这个入口在这些 SKU 上的配额行 FOR UPDATE → 平台商品 FOR SHARE
+    （SKU 都按升序）。命令体之后再锁的余额行已持有，SKU 行与商品行排在平台商品之后。
+    """
+    _lock_pool(connection, order, channel)
+    lock_balance_rows(connection, order.tenant_id, channel.pool_id, sku_ids)
+    allocations = _lock_allocations(connection, order, sku_ids)
+    _lock_listings(connection, order, sku_ids)
+    return allocations
+
+
+def _commit_ready(
+    connection: Connection,
+    order: _Order,
+    platform_order,
+    assignment: LineAssignment,
+    allocations: dict[str, _Allocation],
+) -> None:
+    """预留与确认销售都成功：写各平台行的 line_ref，pending 减各行剩余件数，阶段 committed。"""
+    for line_id, line_ref in sorted(assignment.line_refs.items()):
+        connection.execute(
+            update(PlatformOrderLine)
+            .where(
+                PlatformOrderLine.tenant_id == order.tenant_id,
+                PlatformOrderLine.platform_order_row_id == platform_order.platform_order_row_id,
+                PlatformOrderLine.platform_line_id == line_id,
+            )
+            .values(line_ref=line_ref)
+        )
+    # 每个 Core 行即一个 SKU，件数是合并到它的各平台行剩余件数之和。
+    for line in assignment.lines:
+        allocation = allocations[line.sku_id]
+        allocation.pending -= line.quantity
+        connection.execute(
+            update(ChannelAllocation)
+            .where(
+                ChannelAllocation.tenant_id == order.tenant_id,
+                ChannelAllocation.channel_id == order.channel_id,
+                ChannelAllocation.sku_id == line.sku_id,
+            )
+            .values(pending=allocation.pending, updated_at=NOW)
+        )
+    connection.execute(
+        update(PlatformOrder).where(*_order_where(order)).values(stage=COMMITTED, updated_at=NOW)
+    )
 
 
 def _mark_applied(
