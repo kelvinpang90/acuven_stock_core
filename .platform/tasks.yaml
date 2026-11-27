@@ -3405,7 +3405,7 @@ tasks:
       七，validate_allocation_request(body, platform_channel_ids)：正文形状的校验（契约 3.1 改配额的正文）：expected_version 非负整数；safety_stock 与 quotas 至少一个；safety_stock 0 到 1000000；quotas 非空列表、每个入口最多出现一次、channel_id 必须在给定的这个池的 platform 入口里、expected_quota 与 quota 0 到 1000000 的整数（bool 不算）；reason 去掉首尾空白后 1 到 500 个字符、不含控制字符（同契约 2.6 与 6.2 的 reason 惯例，存去空白后的值）。正文另有 pool_id 与 sku_id（必有，格式由服务判，这里只要求它们存在）；有这六个以外的键、或某个键的值为 null 都不合格（null 不当作没给）。先报多出来的键（按键名升序取第一个），再按 pool_id、sku_id（缺或为 null）、expected_version、safety_stock、quotas、reason 的先后报第一个出错的字段；safety_stock 与 quotas 都没给时报 quotas（排在 safety_stock 自身的校验之后、quotas 自身的校验之前）；返回 INVALID_REQUEST 与它。pool_id、sku_id 的格式由服务在调执行器之前判（CORE-TASK-090），不在这里。
       单元测试照契约 3.1 例子一逐行（第 0 到 13 步、第 6′ 步）与例子二逐行写，断言每一步的 Q、pending 与 F 等于表里的值。
       明确不做：读写数据库、锁、命令体（改配额的服务是 CORE-TASK-090，取消加回在平台事件执行器里调这些函数）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 新增 app/domain/allocations.py 与 tests/unit/test_allocations.py，不改别的文件；测试用 ast 读模块的 import，只有标准库里不做 I/O 的模块（dataclasses、datetime、typing、collections 之类）与 app.domain 里的纯模块
