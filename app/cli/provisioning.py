@@ -4,12 +4,15 @@
 这里不另加数量限制；一个池的入口组合在开通入口时检查（契约第 3 节，Q-81）。
 开通不写安全事件（契约 7.2 的事件类型只含凭据与令牌的操作）；开通 platform 入口时顺带建的
 system 主体没有令牌，不是签发，也不记。
+开通 platform 入口时在同一事务里建它的连接行（人工模式、未连接，契约 3.2）与租户的写入暂停行：
+人工模式没有授权这一步，没有别处会建它们。
 """
 
 from argparse import Namespace
 from typing import Any
 
-from sqlalchemy import Connection, insert, select
+from sqlalchemy import Connection, Row, and_, insert, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError
 
 from app.cli import ACTIVE, CliError, clean_name, require_tenant
@@ -25,6 +28,7 @@ from app.domain.ids import new_id
 from app.domain.service_auth import SYSTEM
 from app.models.catalog import Tenant
 from app.models.inventory import Location, SalesChannel, StockPool
+from app.models.platform_ops import PlatformConnection, PlatformWritePause
 from app.models.service_auth import Credential
 
 # 期初只在 initializing 可用（契约第 6 节）；切到 live 随期初任务做。
@@ -152,6 +156,17 @@ def _system_principal(conn: Connection, tenant_id: str) -> str:
     return credential_id
 
 
+def _open_connection(conn: Connection, tenant_id: str, channel_id: str) -> None:
+    """新 platform 入口的连接行，以及这个租户还没有的写入暂停行，都取数据库默认值。
+
+    写入暂停行已有就不动（并发开通也不撞主键）；恢复时运行手册的 SQL 只改已有的行。
+    """
+    conn.execute(insert(PlatformConnection).values(tenant_id=tenant_id, channel_id=channel_id))
+    pause = PlatformWritePause.__table__
+    statement = mysql_insert(pause).values(tenant_id=tenant_id)
+    conn.execute(statement.on_duplicate_key_update(tenant_id=pause.c.tenant_id))
+
+
 def create_channel(conn: Connection, args: Namespace) -> dict[str, Any]:
     name = clean_name(args.name)
     platform, platform_shop_id = _channel_platform(args)
@@ -195,8 +210,18 @@ def create_channel(conn: Connection, args: Namespace) -> dict[str, Any]:
             raise CliError(SHOP_HAS_CHANNEL) from None
         raise
     if args.kind == PLATFORM:
-        return row | {"system_credential_id": _system_principal(conn, args.tenant)}
+        system_credential_id = _system_principal(conn, args.tenant)
+        _open_connection(conn, args.tenant, row["channel_id"])
+        return row | {"system_credential_id": system_credential_id}
     return row
+
+
+def _channel_output(row: Row) -> dict[str, Any]:
+    """platform 入口另带它的连接的模式与状态；别的种类没有连接，不带这两个键。"""
+    channel = dict(row._mapping)
+    if channel["kind"] != PLATFORM:
+        del channel["connection_mode"], channel["connection_status"]
+    return channel
 
 
 def show(conn: Connection, args: Namespace) -> dict[str, Any]:
@@ -232,6 +257,16 @@ def show(conn: Connection, args: Namespace) -> dict[str, Any]:
             SalesChannel.kind,
             SalesChannel.platform,
             SalesChannel.platform_shop_id,
+            PlatformConnection.mode.label("connection_mode"),
+            PlatformConnection.status.label("connection_status"),
+        )
+        .outerjoin_from(
+            SalesChannel,
+            PlatformConnection,
+            and_(
+                PlatformConnection.tenant_id == SalesChannel.tenant_id,
+                PlatformConnection.channel_id == SalesChannel.channel_id,
+            ),
         )
         .where(SalesChannel.tenant_id == args.tenant)
         .order_by(SalesChannel.channel_id)
@@ -240,7 +275,7 @@ def show(conn: Connection, args: Namespace) -> dict[str, Any]:
         "tenant": dict(tenant._mapping),
         "locations": [dict(row._mapping) for row in locations],
         "pools": [dict(row._mapping) for row in pools],
-        "channels": [dict(row._mapping) for row in channels],
+        "channels": [_channel_output(row) for row in channels],
     }
 
 
