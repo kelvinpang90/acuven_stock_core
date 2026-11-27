@@ -3610,7 +3610,7 @@ tasks:
       classify 给出 blocked 时：回滚，这一轮停下，不标补拉。给出 attention 时：订单写 attention 为 stage_conflict、attention_code 为 STATE_CONFLICT，阶段不变，result 记 attention。
       四，一轮结束时这个订单没有未处理的事件了，而 next_pull_at 非空或 pull_attempts 大于 0：用一笔短事务把它们清为空与 0（契约只说“补拉到缺的动作后清零”，这里落实为“缺的动作补齐、全部处理完”，是补的写法）。
       明确不做：待发货与已确认之后的动作（CORE-TASK-088、089）；补拉作业本身（第 4 组）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-086
     acceptance_criteria:
