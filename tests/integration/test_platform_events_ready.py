@@ -300,7 +300,7 @@ def test_example_one_created_then_ready_to_ship_reserves_and_commits(engine, wor
     assert balance(engine, world, sku_id) == (20, 0, 0, 0)
 
     # 第二笔：预留并确认 2 件，pending 2 → 0，阶段 committed。
-    key = record(engine, world, order_id, ready())
+    key = record(engine, world, order_id, ready(), action="ready_to_ship")
     rts_id = event_by_key(engine, world, key)["event_row_id"]
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, key) == ("applied", None)
@@ -343,11 +343,13 @@ def test_example_one_created_then_ready_to_ship_reserves_and_commits(engine, wor
 def test_example_three_the_same_ready_to_ship_from_a_pull_is_ignored(engine, world):
     sku_id, item_id = mapped_sku(engine, world, quota=10, stock_balance=20)
     order_id = new_order(engine, world, item_id)
-    record(engine, world, order_id, ready())
+    record(engine, world, order_id, ready(), action="ready_to_ship")
     assert process(engine, world, order_id) == RoundResult(1)
     before = everything(engine, world)
 
-    pulled = record(engine, world, order_id, ready(T3), event_key=T3, source="pull")
+    pulled = record(
+        engine, world, order_id, ready(T3), action="ready_to_ship", event_key=T3, source="pull"
+    )
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, pulled) == ("ignored", None)
     assert everything(engine, world) == before
@@ -360,7 +362,7 @@ def test_example_three_the_same_ready_to_ship_from_a_pull_is_ignored(engine, wor
 def test_example_six_an_oversold_order_is_held_and_nothing_is_booked(engine, world):
     sku_id, item_id = mapped_sku(engine, world, quota=10, stock_balance=1)
     order_id = new_order(engine, world, item_id)
-    key = record(engine, world, order_id, ready())
+    key = record(engine, world, order_id, ready(), action="ready_to_ship")
 
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, key) == ("held", "INSUFFICIENT_STOCK")
@@ -375,7 +377,9 @@ def test_example_six_an_oversold_order_is_held_and_nothing_is_booked(engine, wor
 
     # 待发货只生效一次：同一动作从补拉再到，订单已在待处理、ready_at 已记过，记 ignored。
     before = everything(engine, world)
-    pulled = record(engine, world, order_id, ready(T3), event_key=T3, source="pull")
+    pulled = record(
+        engine, world, order_id, ready(T3), action="ready_to_ship", event_key=T3, source="pull"
+    )
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, pulled) == ("ignored", None)
     assert everything(engine, world) == before
@@ -391,7 +395,7 @@ def test_example_one_step_eleven_order_e_is_held(engine, world):
 
     # TikTok 新订单 E，3 件，已付款、直接待发货。
     record(engine, world, order_id, created(line("L-1", item_id, 3)), channel_id=tts)
-    key = record(engine, world, order_id, ready(), channel_id=tts)
+    key = record(engine, world, order_id, ready(), action="ready_to_ship", channel_id=tts)
     assert process(engine, world, order_id, tts) == RoundResult(2)
 
     assert result_of(engine, world, key) == ("held", "INSUFFICIENT_STOCK")
@@ -419,7 +423,7 @@ def test_example_one_step_nine_reserving_looks_only_at_available(engine, world):
     assert unallocated_of(engine, world, sku_id) == 0
 
     # 第 9 步：F 为 0、Q 为 0，预留只看 available 22。
-    key = record(engine, world, order_id, ready())
+    key = record(engine, world, order_id, ready(), action="ready_to_ship")
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, key) == ("applied", None)
     assert balance(engine, world, sku_id) == (6, 0, 0, 17)
@@ -440,7 +444,7 @@ def test_lines_of_the_same_sku_are_merged_into_one_core_line(engine, world):
         line("L-1", second_item, 1), line("L-2", first_item, 2), line("L-3", second_item, 3)
     )
     record(engine, world, order_id, payload)
-    record(engine, world, order_id, ready())
+    record(engine, world, order_id, ready(), action="ready_to_ship")
     assert process(engine, world, order_id) == RoundResult(2)
 
     # 按 sku_id 升序编号。
@@ -466,7 +470,7 @@ def test_a_held_unmapped_order_records_ready_at_and_stays_held(engine, world):
     payload = created(line("L-1", item_id, 2), line("L-2", new_item_id(), 1))
     record(engine, world, order_id, payload)
     assert process(engine, world, order_id) == RoundResult(1)
-    key = record(engine, world, order_id, ready(None))
+    key = record(engine, world, order_id, ready(None), action="ready_to_ship")
     received_at = event_by_key(engine, world, key)["received_at"]
 
     assert process(engine, world, order_id) == RoundResult(1)
@@ -497,7 +501,7 @@ def test_webhook_and_pull_derive_the_same_bodies_and_digests(engine, world, monk
     monkeypatch.setattr(platform_events, "reserve_and_commit", capture)
 
     # webhook 先到，可售不够被拒：ready_at 记下 T2、订单进待处理。
-    hook = record(engine, world, order_id, ready(T2))
+    hook = record(engine, world, order_id, ready(T2), action="ready_to_ship")
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, hook) == ("held", "INSUFFICIENT_STOCK")
 
@@ -509,7 +513,9 @@ def test_webhook_and_pull_derive_the_same_bodies_and_digests(engine, world, monk
             .where(PlatformOrder.tenant_id == world.tenant_id)
             .values(stage="unpaid", attention=None, attention_code=None)
         )
-    pulled = record(engine, world, order_id, ready(T3), event_key=T3, source="pull")
+    pulled = record(
+        engine, world, order_id, ready(T3), action="ready_to_ship", event_key=T3, source="pull"
+    )
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, pulled) == ("applied", None)
     assert platform_order(engine, world, order_id)["ready_at"] == T2_AT
@@ -549,7 +555,7 @@ def test_more_than_a_hundred_skus_hold_the_order_without_calling_core(engine, wo
         raise AssertionError("Core must not be called")
 
     monkeypatch.setattr(platform_events, "reserve_and_commit", not_called)
-    key = record(engine, world, order_id, ready())
+    key = record(engine, world, order_id, ready(), action="ready_to_ship")
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, key) == ("held", "INVALID_REQUEST")
     assert attention_of(engine, world, order_id) == ("held", "invalid_request", "INVALID_REQUEST")
@@ -564,7 +570,7 @@ def test_more_than_a_hundred_skus_hold_the_order_without_calling_core(engine, wo
 def test_example_four_a_failure_before_commit_leaves_nothing(engine, world, monkeypatch):
     sku_id, item_id = mapped_sku(engine, world, quota=10, stock_balance=20)
     order_id = new_order(engine, world, item_id)
-    key = record(engine, world, order_id, ready())
+    key = record(engine, world, order_id, ready(), action="ready_to_ship")
     event = event_by_key(engine, world, key)
     before = everything(engine, world)
     real = platform_commands.create_sale_commit
@@ -599,7 +605,7 @@ def test_example_four_a_failure_before_commit_leaves_nothing(engine, world, monk
 def test_a_taken_order_reference_is_rejudged_as_a_defect(engine, world, monkeypatch, rejudged):
     sku_id, item_id = mapped_sku(engine, world, quota=10, stock_balance=20)
     order_id = new_order(engine, world, item_id)
-    key = record(engine, world, order_id, ready())
+    key = record(engine, world, order_id, ready(), action="ready_to_ship")
     real = platform_commands.create_reservation
     executions = []
 
@@ -656,7 +662,7 @@ def _back_to_unpaid(engine: Engine, world: PlatformWorld, sku_id: str) -> None:
 def test_an_order_already_in_core_is_answered_by_reference_as_a_defect(engine, world):
     sku_id, item_id = mapped_sku(engine, world, quota=10, stock_balance=20)
     order_id = new_order(engine, world, item_id)
-    record(engine, world, order_id, ready())
+    record(engine, world, order_id, ready(), action="ready_to_ship")
     assert process(engine, world, order_id) == RoundResult(1)
     booked = (
         reservations_of(engine, world),
@@ -665,7 +671,9 @@ def test_an_order_already_in_core_is_answered_by_reference_as_a_defect(engine, w
     )
     _back_to_unpaid(engine, world, sku_id)
 
-    pulled = record(engine, world, order_id, ready(T3), event_key=T3, source="pull")
+    pulled = record(
+        engine, world, order_id, ready(T3), action="ready_to_ship", event_key=T3, source="pull"
+    )
     assert process(engine, world, order_id) == RoundResult(1)
     # 预留与确认销售都按业务引用返回原结果：照成功，pending 照减，另标缺陷（覆盖已有的原因）。
     assert result_of(engine, world, pulled) == ("applied", "defect")
@@ -679,7 +687,7 @@ def test_an_order_already_in_core_is_answered_by_reference_as_a_defect(engine, w
 def test_an_order_reference_conflict_is_held_as_a_defect(engine, world):
     sku_id, item_id = mapped_sku(engine, world, quota=10, stock_balance=20)
     order_id = new_order(engine, world, item_id, quantity=3)
-    record(engine, world, order_id, ready())
+    record(engine, world, order_id, ready(), action="ready_to_ship")
     assert process(engine, world, order_id) == RoundResult(1)
     # 平台订单行的剩余件数被改了：派生的预留正文与 Core 里记下的不同。
     with engine.begin() as db:
@@ -695,7 +703,9 @@ def test_an_order_reference_conflict_is_held_as_a_defect(engine, world):
         ledger_of(engine, world),
     )
 
-    pulled = record(engine, world, order_id, ready(T3), event_key=T3, source="pull")
+    pulled = record(
+        engine, world, order_id, ready(T3), action="ready_to_ship", event_key=T3, source="pull"
+    )
     pulled_id = event_by_key(engine, world, pulled)["event_row_id"]
     assert process(engine, world, order_id) == RoundResult(1)
     assert result_of(engine, world, pulled) == ("held", "ORDER_REFERENCE_CONFLICT")
