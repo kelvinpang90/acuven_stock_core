@@ -2,8 +2,8 @@
 
 在真 MySQL 上跑：直接调用入口函数 main，传入测试库的 Settings 与两个内存输出流。
 命令行只能建、不能停用，所以「已停用」的租户与地点由测试用自己的连接直接写库。
-提交进共享 demo 库的 platform、backoffice 入口与 system 主体由各测试在退出时删掉
-（platform_tenants）：会话结束时 demo 库要降到 base。
+提交进共享 demo 库的 platform、backoffice 入口、它们的连接与写入暂停行和 system 主体由各测试
+在退出时删掉（platform_tenants）：会话结束时 demo 库要降到 base。
 """
 
 import io
@@ -34,11 +34,20 @@ from app.domain.channels import (
 from app.domain.service_auth import SYSTEM
 from app.models.catalog import Tenant
 from app.models.inventory import WENT_LIVE_COLUMNS, Location, SalesChannel, StockPool
+from app.models.platform_ops import PlatformConnection, PlatformWritePause
 from app.models.service_auth import Credential, SecurityEvent
 from tests.integration.conftest import ROOT, TEST_DATABASE_URL, new_id
 
-# 开通 platform 入口时会建 system 主体，被拒时凭据表也不能多出行。
-TABLES = (Tenant, Location, StockPool, SalesChannel, Credential)
+# 开通 platform 入口时会建 system 主体、连接行与写入暂停行，被拒时这几张表也不能多出行。
+TABLES = (
+    Tenant,
+    Location,
+    StockPool,
+    SalesChannel,
+    Credential,
+    PlatformConnection,
+    PlatformWritePause,
+)
 NOT_PLATFORM = {"kind": API, "platform": None, "platform_shop_id": None}
 
 
@@ -91,16 +100,18 @@ def channel_argv(
 
 
 def remove_platform_channels(engine: Engine, tenant_ids: list[str]) -> None:
-    """删掉这些租户的 platform、backoffice 入口与 system 主体（没有别的行引用它们）。
+    """删掉这些租户的 platform、backoffice 入口、连接行、写入暂停行与 system 主体。
 
     共享的 demo 库在会话结束时要降到 base：0013 的降级在一个池有多个入口时失败，
-    0012 的降级在库里有 system 主体时失败。
+    0012 的降级在库里有 system 主体时失败。连接行引用入口，先删；除此之外没有别的行引用它们。
     """
     if not tenant_ids:
         return
     principals = Credential.tenant_id.in_(tenant_ids), Credential.kind == SYSTEM
     channels = SalesChannel.tenant_id.in_(tenant_ids), SalesChannel.kind != API
     with engine.begin() as conn:
+        conn.execute(delete(PlatformConnection).where(PlatformConnection.tenant_id.in_(tenant_ids)))
+        conn.execute(delete(PlatformWritePause).where(PlatformWritePause.tenant_id.in_(tenant_ids)))
         conn.execute(delete(Credential).where(*principals))
         conn.execute(delete(SalesChannel).where(*channels))
 
@@ -539,6 +550,124 @@ def test_refusals_follow_arguments_tenant_pool_combination_then_shop(cli, world,
         for argv, reason in cases:
             refused(cli(*argv), reason)
         assert counts(migrated_engine) == before
+
+
+# --- 平台连接与写入暂停（契约 3.2） ---
+
+
+def connections_of(engine: Engine, tenant_id: str) -> dict[str, list[dict]]:
+    """这个租户的连接行，按入口分组。"""
+    table = PlatformConnection.__table__
+    with engine.connect() as conn:
+        statement = select(*table.c).where(table.c.tenant_id == tenant_id)
+        found: dict[str, list[dict]] = {}
+        for item in conn.execute(statement).mappings():
+            found.setdefault(item["channel_id"], []).append(dict(item))
+        return found
+
+
+def write_pauses_of(engine: Engine, tenant_id: str) -> list[dict]:
+    table = PlatformWritePause.__table__
+    with engine.connect() as conn:
+        statement = select(*table.c).where(table.c.tenant_id == tenant_id)
+        return [dict(item) for item in conn.execute(statement).mappings()]
+
+
+NOT_PAUSED = {
+    "paused": False,
+    "set_credential_id": None,
+    "set_at": None,
+    "set_reason": None,
+    "cleared_credential_id": None,
+    "cleared_at": None,
+    "cleared_reason": None,
+}
+
+
+def assert_default_connection(connection: dict) -> None:
+    """人工模式、未连接、自用卖家、没有能力与令牌（契约 3.2）。"""
+    assert connection["mode"] == "manual"
+    assert connection["status"] == "not_connected"
+    assert connection["app_profile"] == "self_seller"
+    assert connection["capabilities"] == {}
+    assert connection["mode_changed_at"] is not None
+    for column in (
+        "access_token_ciphertext",
+        "access_token_expires_at",
+        "refresh_token_ciphertext",
+        "refresh_token_expires_at",
+        "pull_cursor",
+        "next_pull_at",
+        "last_refreshed_at",
+        "last_synced_at",
+    ):
+        assert connection[column] is None, column
+
+
+def test_a_platform_channel_gets_exactly_one_default_connection(cli, migrated_engine):
+    with platform_tenants(migrated_engine) as tenants:
+        tenant_id, pool_id = bare_pool(cli)
+        tenants.append(tenant_id)
+        backoffice = cli(*channel_argv(tenant_id, pool_id, BACKOFFICE)).json()
+        # 只有 backoffice 时没有连接，也没有写入暂停行。
+        assert connections_of(migrated_engine, tenant_id) == {}
+        assert write_pauses_of(migrated_engine, tenant_id) == []
+
+        first = cli(*channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shop-1")).json()
+        found = connections_of(migrated_engine, tenant_id)
+        assert list(found) == [first["channel_id"]]
+        [connection] = found[first["channel_id"]]
+        assert_default_connection(connection)
+        [pause] = write_pauses_of(migrated_engine, tenant_id)
+        assert {key: pause[key] for key in NOT_PAUSED} == NOT_PAUSED
+        assert pause["updated_at"] is not None
+
+        # 第二个 platform 入口有自己的连接；写入暂停行已有，不动、不多建。
+        second = cli(*channel_argv(tenant_id, pool_id, PLATFORM, TIKTOK_SHOP, "7001")).json()
+        found = connections_of(migrated_engine, tenant_id)
+        assert set(found) == {first["channel_id"], second["channel_id"]}
+        assert found[first["channel_id"]] == [connection]
+        [second_connection] = found[second["channel_id"]]
+        assert_default_connection(second_connection)
+        assert write_pauses_of(migrated_engine, tenant_id) == [pause]
+        assert backoffice["channel_id"] not in found
+
+        # 被拒的开通不建连接行。
+        before = counts(migrated_engine)
+        same_shop = channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shop-1")
+        refused(cli(*same_shop), SHOP_HAS_CHANNEL)
+        assert counts(migrated_engine) == before
+        assert connections_of(migrated_engine, tenant_id) == found
+
+
+def test_api_channels_get_no_connection_and_refused_platform_channels_none_either(
+    cli, migrated_engine
+):
+    shop = provision(cli)
+    assert connections_of(migrated_engine, shop.tenant_id) == {}
+    assert write_pauses_of(migrated_engine, shop.tenant_id) == []
+    refused(
+        cli(*channel_argv(shop.tenant_id, shop.pool_id, PLATFORM, SHOPEE, "shop-1")),
+        POOL_HAS_API_CHANNEL,
+    )
+    assert connections_of(migrated_engine, shop.tenant_id) == {}
+    assert write_pauses_of(migrated_engine, shop.tenant_id) == []
+
+
+def test_show_lists_the_connection_mode_and_status_of_platform_channels_only(cli, migrated_engine):
+    with platform_tenants(migrated_engine) as tenants:
+        tenant_id, pool_id = bare_pool(cli)
+        tenants.append(tenant_id)
+        platform = cli(*channel_argv(tenant_id, pool_id, PLATFORM, SHOPEE, "shop-1")).json()
+        backoffice = cli(*channel_argv(tenant_id, pool_id, BACKOFFICE)).json()
+        channels = cli("show", "--tenant", tenant_id).json()["channels"]
+        by_id = {channel["channel_id"]: channel for channel in channels}
+        stored = {key: value for key, value in platform.items() if key != "system_credential_id"}
+        assert by_id[platform["channel_id"]] == stored | {
+            "connection_mode": "manual",
+            "connection_status": "not_connected",
+        }
+        assert by_id[backoffice["channel_id"]] == backoffice
 
 
 @contextmanager
