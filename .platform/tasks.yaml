@@ -3500,7 +3500,7 @@ tasks:
       二，app/services/sku_merges.py：新建合并时来源或规范 SKU 有 active 的平台商品，409 SKU_HAS_ACTIVE_LISTINGS（details 带 sku_id 与它的 listing_ids，两个都有时取来源 SKU），放在契约 2.8 新建判定的第 6 步（别的未结束合并单）之后、写合并单之前。
       SKU_HAS_ACTIVE_LISTINGS 的常量照现有错误码的写法定义在 app/services/sku_merges.py，app/api/catalog.py 从那里 import（接口层 import 服务层是现有方向）；读 active 平台商品的那条 FOR SHARE 查询也写在 sku_merges.py 里供两边共用。
       明确不做：平台商品命令（CORE-TASK-084）；后台。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-092
       - CORE-TASK-079
