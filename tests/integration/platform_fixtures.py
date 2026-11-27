@@ -240,8 +240,15 @@ def set_allocation(
     pending: int = 0,
     manual_confirmed_quota: int | None = None,
     channel_id: str | None = None,
+    stock_balance: int | None = None,
+    safety_stock: int | None = None,
+    review_hold: bool = False,
 ) -> None:
-    """建好（或改成）这个 SKU 的余额行、池配额行与这个入口的配额行，提交。"""
+    """建好（或改成）这个 SKU 的余额行、池配额行与这个入口的配额行，提交。
+
+    stock_balance、safety_stock 为 None 时不改（新建取默认值 0 与 2）；
+    stock_balance 直接写进余额行（没有预留与不可售时即 available），不写流水。
+    """
     channel_id = channel_id or world.channel_id
     balance = StockBalance.__table__
     pool = PoolAllocation.__table__
@@ -251,7 +258,12 @@ def set_allocation(
         "pending": pending,
         "manual_confirmed_quota": manual_confirmed_quota,
         "manual_confirmed_at": None if manual_confirmed_quota is None else CONFIRMED_AT,
+        "review_hold": review_hold,
+        "review_reason": "readback mismatch" if review_hold else None,
+        "review_since": CONFIRMED_AT if review_hold else None,
     }
+    balance_values = {} if stock_balance is None else {"stock_balance": stock_balance}
+    pool_values = {} if safety_stock is None else {"safety_stock": safety_stock}
     with engine.begin() as db:
         db.execute(
             mysql_insert(balance)
@@ -260,13 +272,14 @@ def set_allocation(
                 tenant_id=world.tenant_id,
                 pool_id=world.pool_id,
                 sku_id=sku_id,
+                **balance_values,
             )
-            .on_duplicate_key_update(balance_id=balance.c.balance_id)
+            .on_duplicate_key_update(balance_id=balance.c.balance_id, **balance_values)
         )
         db.execute(
             mysql_insert(pool)
-            .values(tenant_id=world.tenant_id, pool_id=world.pool_id, sku_id=sku_id)
-            .on_duplicate_key_update(sku_id=pool.c.sku_id)
+            .values(tenant_id=world.tenant_id, pool_id=world.pool_id, sku_id=sku_id, **pool_values)
+            .on_duplicate_key_update(sku_id=pool.c.sku_id, **pool_values)
         )
         db.execute(
             mysql_insert(channel)
