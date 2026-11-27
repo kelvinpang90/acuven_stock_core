@@ -29,7 +29,6 @@ from app.models.platform_ops import ManualCheck, PlatformConnection
 from app.services.platform_events import (
     BLOCKED,
     MISSING_PRIOR,
-    NOT_HANDLED,
     RoundResult,
     process_order,
     record_auto_event,
@@ -547,13 +546,22 @@ def test_a_cancel_of_a_line_before_ready_to_ship_is_processed_first(engine, worl
     rts = record(engine, world, order_id, {"platform_time": T3}, action="ready_to_ship")
     record(engine, world, order_id, created(line("L-1", item_id, 3)))
     cancel = record(engine, world, order_id, cancelled(("L-1", 1)), action="cancelled")
-    rts_id = event_by_key(engine, world, rts)["event_row_id"]
 
-    assert process(engine, world, order_id) == RoundResult(2, rts_id, NOT_HANDLED)
+    assert process(engine, world, order_id) == RoundResult(3)
     assert result_of(engine, world, cancel) == ("applied", None)
+    assert result_of(engine, world, rts) == ("applied", None)
     assert line_amounts(engine, world, order_id, "L-1") == (1, 3, 1)
-    assert amounts(engine, world, sku_id) == (8, 2)
-    assert event_by_key(engine, world, rts)["applied_at"] is None
+    # 待发货在取消之后：只预留并确认剩下的 2 件，pending 2 → 0。
+    assert amounts(engine, world, sku_id) == (8, 0)
+    assert order_lines(engine, world, order_id)["L-1"]["line_ref"] == "L1"
+    assert platform_order(engine, world, order_id)["stage"] == "committed"
+    with engine.connect() as db:
+        balance = db.execute(
+            select(StockBalance.stock_balance, StockBalance.paid_pending_dispatch).where(
+                StockBalance.tenant_id == world.tenant_id, StockBalance.sku_id == sku_id
+            )
+        ).one()
+    assert tuple(balance) == (48, 2)
 
 
 def test_shipped_without_ready_to_ship_marks_a_pull_once(engine, world):

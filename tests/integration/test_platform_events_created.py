@@ -581,25 +581,32 @@ def test_events_are_processed_by_platform_time(engine, world):
 
 
 def test_an_unhandled_action_stops_the_round_there(engine, world):
-    sku_id, item_id, _ = mapped_sku(engine, world, quota=10)
+    sku_id, item_id, _ = mapped_sku(engine, world, quota=10, stock_balance=10)
     order_id = new_order_id()
     rts, rr = {"platform_time": T2}, {"platform_time": T3}
+    # 交运还没有处理办法（CORE-TASK-089）。
+    ship = {
+        "lines": [{"platform_line_id": "L-1", "quantity": 2}],
+        "package_id": "PKG-1",
+        "platform_time": T3,
+    }
     record(engine, world, order_id, created(line("L-1", item_id, 2)), event_key="evt-created")
     record(engine, world, order_id, rts, action="ready_to_ship", event_key="rts")
+    record(engine, world, order_id, ship, action="shipped", event_key="ship")
     record(engine, world, order_id, rr, action="return_requested", event_key="rr")
-    stopped_at = event_by_key(engine, world, "rts")["event_row_id"]
+    stopped_at = event_by_key(engine, world, "ship|PKG-1")["event_row_id"]
 
-    assert process(engine, world, order_id) == RoundResult(1, stopped_at, NOT_HANDLED)
+    assert process(engine, world, order_id) == RoundResult(2, stopped_at, NOT_HANDLED)
     after = state(engine, world)
-    for key in ("rts", "rr"):
+    for key in ("ship|PKG-1", "rr"):
         event = event_by_key(engine, world, key)
         assert (event["applied_at"], event["result"]) == (None, None)
-    assert platform_order(engine, world, order_id)["stage"] == "unpaid"
+    assert platform_order(engine, world, order_id)["stage"] == "committed"
 
     # 下一轮仍停在它这里，什么也不改。
     assert process(engine, world, order_id) == RoundResult(0, stopped_at, NOT_HANDLED)
     assert state(engine, world) == after
-    assert amounts(engine, world, sku_id) == (8, 2, None)
+    assert amounts(engine, world, sku_id) == (8, 0, None)
 
 
 def test_a_database_error_rolls_the_event_back(engine, world, monkeypatch):
