@@ -3573,7 +3573,7 @@ tasks:
       record_auto_event 收到 source 为 manual 或 action 为 return_received 时报 ValueError（调用方的程序缺陷），入口不对或人工模式时返回假。测试要在第 3、4 步之间插入动作（改挂用直接 UPDATE sku_listings，本任务不依赖平台商品命令）、让某条语句失败：模块里设一个默认为空的模块级钩子 _between_prepare_and_lock(connection)，第 3 步之后、开事务之前调它，测试用 monkeypatch 设它；失败用 monkeypatch 替换本模块里写平台订单的那个函数。
       五，测试辅助模块 tests/integration/platform_fixtures.py：建租户、池、SKU、platform 与 backoffice 入口（直接插行，含 system 主体与连接行）、平台商品，提交；purge_tenant(engine, tenant_id) 在一个连接上 SET SESSION foreign_key_checks = 0，删掉这个租户在所有带 tenant_id 列的表里的行，在 finally 里设回 1、设不回就作废这个连接（use_alter 的外键让按表排序删不干净，例如池行上的 went_live_credential_id；只给测试用）。之后的平台事件任务复用它。
       明确不做：取消、待发货、交运、退货的处理（CORE-TASK-087 到 089）；补拉与退避（087）；作业、webhook、告警（第 4 组）；后台的人工登记（第 3 组）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-081
       - CORE-TASK-082
