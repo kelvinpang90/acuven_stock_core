@@ -3439,7 +3439,7 @@ tasks:
       七，派生正文（契约 5.10 派生的命令正文与请求摘要）：reservation_body、sale_commit_body、dispatch_body、refund_restock_body、return_receipt_body，各返回路径参数与正文，键与契约的表一致，不带 reason_code、note、occurred_at。先整理：映射到同一 Core 行的平台行求和、件数为 0 的行不列、行按 line_ref 升序；整理后一行不剩返回 None（调用方记 ignored）。单据正文收 document_ref 已拼好的引用，平台 ID 缺失由调用方先判（缺了写待处理，不进这些函数）；payload 里的平台行在对照里没有 line_ref 时报 ValueError（调用方先判，写待处理）。sale_commit_body 的 paid_at 取传入的 ready_at，写成 YYYY-MM-DDTHH:MM:SS 加 Z 的文本（ready_at 由执行器截到整秒存），测试用 app/domain 里现有的时间解析函数（例如 app/domain/stock.py 的 parse_occurred_at）断言它能被解析，单元测试不 import app/api。
       八，补拉退避 pull_backoff(attempts)：attempts 是这个订单已经补拉过的次数（非负整数），返回下一次补拉前要等的 timedelta，为 min(2 的 attempts 次方, 60) 分钟，即 0 次 1 分钟、1 次 2 分钟、2 次 4 分钟，6 次起 60 分钟（契约的 1、2、4、8…分钟，最长 60）。
       明确不做：数据库、锁与事务（执行器任务）；用 /v1 请求模型校验派生正文（执行器任务做，它可以 import app/api 的模型，domain 不行）。
-    status: ready
+    status: done
     depends_on: []
     acceptance_criteria:
       - 新增 app/domain/platform_events.py 与 tests/unit/test_platform_events.py，不改别的文件；测试用 ast 读模块的 import，只有标准库里不做 I/O 的模块（hashlib、re、dataclasses、datetime、typing 之类）与 app.domain 里的纯模块
