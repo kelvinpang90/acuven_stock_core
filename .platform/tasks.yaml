@@ -3367,7 +3367,7 @@ tasks:
       downgrade 删这六张表。
       二，app/cli/provisioning.py 的 channel create：kind 为 platform 时，在开通入口的同一事务里插入它的 platform_connections 行（全取默认值，mode_changed_at 为数据库时间），这个租户还没有 platform_write_pause 行时也插入一行（INSERT … ON DUPLICATE KEY UPDATE tenant_id = tenant_id，并发开通也不撞主键；paused 为假，其余为空；契约 12.1 的恢复 SQL 只改已有的行）；api 与 backoffice 入口不建。channel show 对 platform 入口另输出 connection_mode 与 connection_status 两个键。迁移 0017 同样为库里已有的每个 platform 入口补建连接行、为有 platform 入口的租户补建写入暂停行（只在开发库与 CI 上可能有），所以不会有没有连接行的 platform 入口。理由：契约 3.1 恢复条件第 1 项要读入口的连接与人工核对；人工模式（平台获批前）没有授权这一步，没有别处会建这一行。
       明确不做：令牌加密与授权（第 4 组）；写这些表的后台操作与作业（第 3、4 组）；platform_publishes 与 platform_oauth_states（随发布与授权的任务）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-093
     acceptance_criteria:
