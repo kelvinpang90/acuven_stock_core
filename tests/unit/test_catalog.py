@@ -431,7 +431,7 @@ class CatalogLockNameTest(unittest.TestCase):
 
 
 class EventTypeTest(unittest.TestCase):
-    def test_nine_event_types(self):
+    def test_twelve_event_types(self):
         self.assertEqual(
             EVENT_TYPES,
             {
@@ -444,8 +444,12 @@ class EventTypeTest(unittest.TestCase):
                 "sku_deactivated",
                 "sku_reactivated",
                 "sku_merged",
+                "listing_linked",
+                "listing_relinked",
+                "listing_unlinked",
             },
         )
+        self.assertEqual(len(EVENT_TYPES), 12)
 
     def test_sku_merged_is_written_for_the_source_sku_of_a_merge(self):
         self.assertEqual(SKU_MERGED, "sku_merged")
