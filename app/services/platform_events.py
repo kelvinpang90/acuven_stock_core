@@ -1,7 +1,8 @@
-"""平台事件执行器（契约 §5.10，§3.1 下单扣配额）。
+"""平台事件执行器（契约 §5.10，§3.1 下单扣配额、取消加回与恢复条件）。
 
-§5.10 的存放、处理顺序第 1–4、7、8 步与“每个动作调哪个命令体”的
-created 一行。只有函数，不挂作业、不挂接口（由以后的任务接）：
+§5.10 的存放、处理顺序第 1–4、7、8 步（含第 4 步落后、越过阶段的三种情形）与
+“每个动作调哪个命令体”的 created、扣数之前的 cancelled、return_requested 三行。
+只有函数，不挂作业、不挂接口（由以后的任务接）：
 - record_auto_event：webhook 与补拉把一个事件写进收件箱；
 - orders_with_pending_events：找有未处理事件的订单，供作业用；
 - process_order：处理一个订单这一轮的事件。
@@ -14,7 +15,8 @@ process_order 的先后：
 2. 取这个订单全部未处理的事件，按 sort_key 排序，
    逐个处理，每个事件一笔事务。
 3. 开事务之前：解析涉及的订单行的 SKU（已有平台订单行取
-   已定下的，created 的各行按当前 active 的平台商品，普通读）；
+   已定下的、取这个订单的全部订单行，created 的各行按当前
+   active 的平台商品，普通读）；
    用短事务预建余额行、pool_allocations 行与这个池全部
    platform 入口在这些 SKU 上的 channel_allocations 行；
    会话设为 READ COMMITTED，再关这些 SKU 上已到期的预留
@@ -28,12 +30,15 @@ process_order 的先后：
    → 平台商品 FOR SHARE 重新解析 created 各行的 SKU：
      与第 3 步不同就回滚、从第 3 步重做一次，
      再不同就回滚、这一轮停下（LISTING_CHANGED）。
-   然后按阶段判定：ignored 记 ignored、不改任何量；
-   created 的 apply 建平台订单并扣配额；其余情形（别的动作，
-   以及 missing_prior、blocked、attention）还没有处理办法：
-   回滚、这一轮停下、不改任何东西（NOT_HANDLED）。
+   然后按阶段判定：ignored 记 ignored、不改任何量（return_requested 总是这样）；
+   created 的 apply 建平台订单并扣配额；unpaid、held 时 cancelled 的 apply
+   见下面的扣数之前的取消；attention 写 stage_conflict（见下面的待处理）；
+   missing_prior 与 blocked 见下面的乱序；其余的 apply（待发货与已确认之后的动作）
+   还没有处理办法：回滚、这一轮停下、不改任何东西（NOT_HANDLED）。
 7. 写收件箱行的 applied_at（数据库时间）与 result，
-   与改动一起提交。一轮结束时在同一连接上设回隔离级别、
+   与改动一起提交。一轮全部处理完、这个订单没有未处理的事件了，
+   而 next_pull_at 非空或 pull_attempts 大于 0：用一笔短事务清为空与 0。
+   一轮结束时在同一连接上设回隔离级别、
    RELEASE_ALL_LOCKS()，出错就作废这个连接
    （同 app/services/idempotency.py 的 _release_locks）。
 8. 数据库错误或程序异常：整笔回滚，收件箱行仍未处理，
@@ -48,6 +53,32 @@ min(件数, manual_confirmed_quota)，不论入口模式，
 不写 platform_ops_log。有行找不到生效平台商品时订单为 held、
 attention 为 unmapped，那些行不计 pending、不扣配额，
 result 记 held、result_code 记 unmapped。
+
+扣数之前的 cancelled（§3.1，订单 unpaid 或 held）：payload 带 lines 时
+每行这次取消 cancelled_total − cancelled_qty 件（不大于 0 即没有新取消），
+不带时取消各行全部剩余件数；全部行都没有新取消记 ignored、不改任何量。
+有这个订单没有的行（unknown_line），或 cancelled_total 超过 quantity
+（cancel_exceeds_remaining）时不改任何量、写待处理、result 记 attention；
+两者都有记 unknown_line。锁序：平台订单之后锁订单行，
+unpaid 时再 池行 FOR SHARE → 余额行 → pool_allocations 行
+→ 这个池全部 platform 入口的 channel_allocations 行（按 sku_id、再按 channel_id）
+→ 这个入口在这些 SKU 上的平台商品 FOR SHARE；held 时只锁这个入口的配额行。
+每行加 cancelled_qty，有 SKU 的行从 pending 减取消的件数；unpaid 时按 SKU
+汇总可加回的件数（add_back），restore_allowed 判过就整份加到 Q、各行
+quota_returned 随之增加，不过就整份不加（进 F）；held 时一件也不加回。
+各行剩余件数都为 0 时阶段改为 cancelled（attention 不清）。
+
+待处理（本任务与之后的平台事件任务都照此）：收件箱行的 result_code 写
+这个事件的 Core 错误码，没有错误码时写原因。让订单进 held 的原因总是覆盖
+订单上的 attention 与 attention_code（后台照它重试）；其余原因在订单已有
+attention 时不覆盖、没有时写上。
+
+乱序（§5.10 第 4 步）：missing_prior 时，这一轮还没处理的事件里有缺的
+那个动作就回滚当前事件，先处理排序最前的那一个（不看平台时间），再回到
+当前事件；同一轮里每个事件最多被提前一次。没有就回滚，在一笔短事务里把
+平台订单的 next_pull_at 设为数据库当前时间（已非空不动，pull_attempts 不动；
+补拉、退避与计数由补拉作业做），这一轮停下（MISSING_PRIOR）；平台订单还不存在时
+什么也不写，只停下。blocked 时回滚，这一轮停下，不标补拉（BLOCKED）。
 """
 
 import hashlib
@@ -56,16 +87,35 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import Connection, Engine, Transaction, and_, func, insert, select, text, update
+from sqlalchemy import (
+    Connection,
+    Engine,
+    Transaction,
+    and_,
+    func,
+    insert,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.sql.expression import Executable
 
-from app.domain.allocations import MANUAL, take_quota
+from app.domain.allocations import (
+    MANUAL,
+    add_back,
+    manual_check_overdue,
+    restore_allowed,
+    take_quota,
+    unallocated,
+)
 from app.domain.catalog import ACTIVE
 from app.domain.channels import PLATFORM
 from app.domain.ids import new_id
 from app.domain.platform_events import (
+    CANCELLED,
     CREATED,
     HASH_HEX_LENGTH,
     HELD,
@@ -75,6 +125,7 @@ from app.domain.platform_events import (
     RETURN_ID,
     RETURN_RECEIVED,
     UNPAID,
+    CancelledPayload,
     CreatedLine,
     CreatedPayload,
     Outcome,
@@ -87,7 +138,7 @@ from app.domain.platform_events import (
 )
 from app.domain.service_auth import SYSTEM
 from app.models.catalog import NOW
-from app.models.inventory import SalesChannel, StockBalance
+from app.models.inventory import SalesChannel, StockBalance, StockPool
 from app.models.platform import (
     ChannelAllocation,
     PlatformEvent,
@@ -96,9 +147,10 @@ from app.models.platform import (
     PoolAllocation,
     SkuListing,
 )
-from app.models.platform_ops import PlatformConnection
+from app.models.platform_ops import ManualCheck, PlatformConnection
 from app.models.service_auth import Credential
 from app.services.reservations import close_due_before_reserving
+from app.services.stock import lock_balance_rows
 
 # 自动来源（§5.10 存放）；manual 由后台登记，不经这里。
 WEBHOOK = "webhook"
@@ -108,7 +160,13 @@ AUTO_SOURCES = (WEBHOOK, PULL)
 # 收件箱的 result 与待处理原因。
 APPLIED = "applied"
 IGNORED = "ignored"
+ATTENTION = "attention"
 UNMAPPED = "unmapped"
+UNKNOWN_LINE = "unknown_line"
+CANCEL_EXCEEDS_REMAINING = "cancel_exceeds_remaining"
+STAGE_CONFLICT = "stage_conflict"
+# stage_conflict 的 Core 错误码。
+STATE_CONFLICT = "STATE_CONFLICT"
 
 EVENT_ID_PREFIX = "pev"
 ORDER_ID_PREFIX = "pfo"
@@ -125,6 +183,8 @@ RESOLVE_ATTEMPTS = 2
 LOCK_BUSY = "lock_busy"
 LISTING_CHANGED = "listing_changed"
 NOT_HANDLED = "not_handled"
+MISSING_PRIOR = "missing_prior"  # 缺前序动作、收件箱里也没有：标了补拉（平台订单存在时）
+BLOCKED = "blocked"  # 不标补拉
 FAILED = "failed"
 
 _NO_REFERENCED_ROW = 1452  # MySQL ER_NO_REFERENCED_ROW_2：外键指向的行不存在
@@ -345,14 +405,54 @@ class _Prepared:
 
 @dataclass
 class _Allocation:
-    """锁住的 channel_allocations 行，扣配额时就地改。"""
+    """锁住的 channel_allocations 行，扣配额、取消时就地改。"""
 
     quota: int
     pending: int
     manual_confirmed_quota: int | None
+    review_hold: bool
 
 
-# 第 4 步的结果（不向外）。
+@dataclass(frozen=True)
+class _Line:
+    """锁住的平台订单行。"""
+
+    platform_line_id: str
+    sku_id: str | None
+    quantity: int
+    cancelled_qty: int
+    quota_taken: int
+    quota_returned: int
+
+
+@dataclass(frozen=True)
+class _RestoreRows:
+    """unpaid 时取消加回要用的锁住的行（按 sku_id）。"""
+
+    available: Mapping[str, int]
+    safety_stock: Mapping[str, int]
+    # (channel_id, sku_id) → 这个池全部 platform 入口的配额行
+    allocations: Mapping[tuple[str, str], _Allocation]
+    listed: frozenset[str]  # 这个入口上有 active 平台商品的 SKU
+
+
+@dataclass(frozen=True)
+class _Receiving:
+    """恢复条件第 1 项要用的：这个入口的连接与人工核对。"""
+
+    mode: str
+    status: str
+    manual_overdue: bool
+
+
+@dataclass(frozen=True)
+class _Missing:
+    """第 4 步越过了阶段，缺 action 这个前序动作（已回滚）。"""
+
+    action: str
+
+
+# 第 4 步的结果（不向外）；另有 _Missing 与这一轮停下的原因。
 _DONE = "done"  # 写了 applied_at
 _ALREADY_APPLIED = "already_applied"  # 收件箱行已处理过，提交了空事务
 _RESOLVE_AGAIN = "resolve_again"  # 重新解析的 SKU 与第 3 步不同
@@ -467,13 +567,95 @@ def _run_round(connection: Connection, order: _Order) -> RoundResult:
         return RoundResult(0, None, FAILED)
 
     processed = 0
-    for event in events:
+    queue = list(events)
+    promoted: set[str] = set()
+    while queue:
+        event = queue[0]
         outcome = _process_event(connection, order, channel, event)
+        if isinstance(outcome, _Missing):
+            prior = next(
+                (
+                    other
+                    for other in queue[1:]
+                    if other.action == outcome.action and other.event_row_id not in promoted
+                ),
+                None,
+            )
+            if prior is not None:
+                # 先处理缺的那个动作（不看平台时间），再回到这个事件。
+                promoted.add(prior.event_row_id)
+                queue.remove(prior)
+                queue.insert(0, prior)
+                continue
+            reason = _request_pull(connection, order, event, outcome.action)
+            return RoundResult(processed, event.event_row_id, reason)
         if outcome == _DONE:
             processed += 1
         elif outcome != _ALREADY_APPLIED:
             return RoundResult(processed, event.event_row_id, outcome)
+        queue.pop(0)
+    try:
+        _clear_pull(connection, order)
+    except Exception as error:
+        _rollback_quietly(connection)
+        _log_failure(order, None, error)
+        return RoundResult(processed, None, FAILED)
     return RoundResult(processed)
+
+
+def _request_pull(connection: Connection, order: _Order, event: _Event, missing: str) -> str:
+    """缺的前序动作不在收件箱里：短事务把 next_pull_at 设为数据库当前时间
+    （已非空就不动，pull_attempts 不动）；平台订单还不存在（缺 created）时什么也不写。
+    返回 MISSING_PRIOR，出错为 FAILED。
+    """
+    if missing == CREATED:
+        return MISSING_PRIOR
+    try:
+        with connection.begin():
+            connection.execute(
+                update(PlatformOrder)
+                .where(*_order_where(order), PlatformOrder.next_pull_at.is_(None))
+                .values(next_pull_at=NOW, updated_at=NOW)
+            )
+    except Exception as error:
+        _rollback_quietly(connection)
+        _log_failure(order, event.event_row_id, error)
+        return FAILED
+    return MISSING_PRIOR
+
+
+def _clear_pull(connection: Connection, order: _Order) -> None:
+    """这个订单没有未处理的事件了，而 next_pull_at 非空或 pull_attempts 大于 0：
+    短事务清为空与 0（缺的动作补齐、全部处理完）。
+    """
+    unprocessed = (
+        select(PlatformEvent.event_row_id)
+        .where(
+            PlatformEvent.tenant_id == order.tenant_id,
+            PlatformEvent.channel_id == order.channel_id,
+            PlatformEvent.platform_order_id == order.platform_order_id,
+            PlatformEvent.applied_at.is_(None),
+        )
+        .exists()
+    )
+    with connection.begin():
+        connection.execute(
+            update(PlatformOrder)
+            .where(
+                *_order_where(order),
+                or_(PlatformOrder.next_pull_at.is_not(None), PlatformOrder.pull_attempts > 0),
+                ~unprocessed,
+            )
+            .values(next_pull_at=None, pull_attempts=0, updated_at=NOW)
+        )
+
+
+def _order_where(order: _Order) -> tuple:
+    return (
+        PlatformOrder.tenant_id == order.tenant_id,
+        PlatformOrder.channel_id == order.channel_id,
+        PlatformOrder.platform_order_id == order.platform_order_id,
+    )
 
 
 def _read_channel(connection: Connection, order: _Order) -> _Channel:
@@ -519,8 +701,10 @@ def _pending_events(connection: Connection, order: _Order) -> list[_Event]:
     )
 
 
-def _process_event(connection: Connection, order: _Order, channel: _Channel, event: _Event) -> str:
-    """第 3、4、7、8 步；返回 _DONE、_ALREADY_APPLIED 或这一轮停下的原因。"""
+def _process_event(
+    connection: Connection, order: _Order, channel: _Channel, event: _Event
+) -> str | _Missing:
+    """第 3、4、7、8 步；返回 _DONE、_ALREADY_APPLIED、_Missing 或这一轮停下的原因。"""
     for _attempt in range(RESOLVE_ATTEMPTS):
         try:
             prepared = _prepare(connection, order, channel, event)
@@ -575,7 +759,7 @@ def _resolve_listings(
 def _settled_skus(connection: Connection, order: _Order) -> list[str]:
     """已有平台订单行上已定下的 SKU（升序）。
 
-    created 以外的动作还没有处理办法，取这个订单的全部订单行（多建配额行无害）。
+    取这个订单的全部订单行，不按事件挑（多建配额行无害）。
     """
     statement = (
         select(PlatformOrderLine.sku_id)
@@ -684,9 +868,10 @@ def _prepare(connection: Connection, order: _Order, channel: _Channel, event: _E
 
 def _locked(
     connection: Connection, order: _Order, channel: _Channel, event: _Event, prepared: _Prepared
-) -> str:
-    """开事务加锁、判定、改量并写收件箱行；返回 _DONE、_ALREADY_APPLIED、_RESOLVE_AGAIN 或
-    NOT_HANDLED。只有 _DONE 与 _ALREADY_APPLIED 提交，其余回滚；异常时回滚再抛出。
+) -> str | _Missing:
+    """开事务加锁、判定、改量并写收件箱行；返回 _DONE、_ALREADY_APPLIED、_RESOLVE_AGAIN、
+    _Missing、BLOCKED 或 NOT_HANDLED。只有 _DONE 与 _ALREADY_APPLIED 提交，其余回滚；
+    异常时回滚再抛出。
     """
     transaction = connection.begin()
     try:
@@ -712,7 +897,7 @@ def _rollback_transaction(transaction: Transaction) -> None:
 
 def _decide(
     connection: Connection, order: _Order, channel: _Channel, event: _Event, prepared: _Prepared
-) -> str:
+) -> str | _Missing:
     applied_at = connection.execute(
         select(PlatformEvent.applied_at)
         .where(
@@ -726,12 +911,13 @@ def _decide(
         return _ALREADY_APPLIED
 
     platform_order = connection.execute(
-        select(PlatformOrder.stage, PlatformOrder.ready_at)
-        .where(
-            PlatformOrder.tenant_id == order.tenant_id,
-            PlatformOrder.channel_id == order.channel_id,
-            PlatformOrder.platform_order_id == order.platform_order_id,
+        select(
+            PlatformOrder.platform_order_row_id,
+            PlatformOrder.stage,
+            PlatformOrder.ready_at,
+            PlatformOrder.attention,
         )
+        .where(*_order_where(order))
         .with_for_update()
     ).first()
     stage = None if platform_order is None else platform_order.stage
@@ -748,41 +934,97 @@ def _decide(
     if classification.outcome is Outcome.IGNORED:
         _mark_applied(connection, order, event, IGNORED, None)
         return _DONE
-    if classification.outcome is Outcome.APPLY and event.action == CREATED:
+    if classification.outcome is Outcome.MISSING_PRIOR:
+        return _Missing(classification.missing)
+    if classification.outcome is Outcome.BLOCKED:
+        return BLOCKED
+    if classification.outcome is Outcome.ATTENTION:
+        # 与阶段矛盾：阶段不变。
+        current = platform_order.attention
+        _write_attention(connection, order, current, STAGE_CONFLICT, STATE_CONFLICT, holds=False)
+        _mark_applied(connection, order, event, ATTENTION, STATE_CONFLICT)
+        return _DONE
+    if event.action == CREATED:
         result, result_code = _apply_created(
             connection, order, channel, event.payload, prepared.skus, allocations
+        )
+        _mark_applied(connection, order, event, result, result_code)
+        return _DONE
+    if event.action == CANCELLED and stage in (UNPAID, HELD):
+        result, result_code = _apply_cancelled(
+            connection, order, channel, event.payload, platform_order
         )
         _mark_applied(connection, order, event, result, result_code)
         return _DONE
     return NOT_HANDLED
 
 
-def _lock_allocations(
-    connection: Connection, order: _Order, sku_ids: Iterable[str]
-) -> dict[str, _Allocation]:
-    """按 sku_id 升序 FOR UPDATE 锁这个入口在这些 SKU 上的 channel_allocations 行。
+def _write_attention(
+    connection: Connection,
+    order: _Order,
+    current: str | None,
+    reason: str,
+    code: str | None,
+    *,
+    holds: bool,
+) -> None:
+    """写订单的 attention 与 attention_code。
+
+    holds 为真（让订单进 held 的原因：后台要照它重试）时总是覆盖；
+    否则订单已有 attention 时不覆盖，原因只留在这个事件的 result_code 里。
+    """
+    if not holds and current is not None:
+        return
+    connection.execute(
+        update(PlatformOrder)
+        .where(*_order_where(order))
+        .values(attention=reason, attention_code=code, updated_at=NOW)
+    )
+
+
+def _lock_channel_allocations(
+    connection: Connection, tenant_id: str, channel_ids: Iterable[str], sku_ids: Iterable[str]
+) -> dict[tuple[str, str], _Allocation]:
+    """按 sku_id、再按 channel_id 升序 FOR UPDATE 锁 channel_allocations 行，
+    返回 (channel_id, sku_id) → 行。
 
     行在第 3 步预建过；读不到是程序错误。
     """
-    allocations: dict[str, _Allocation] = {}
+    allocations: dict[tuple[str, str], _Allocation] = {}
+    channel_ids = sorted(set(channel_ids))
     for sku_id in sorted(set(sku_ids)):
-        row = connection.execute(
-            select(
-                ChannelAllocation.quota,
-                ChannelAllocation.pending,
-                ChannelAllocation.manual_confirmed_quota,
+        for channel_id in channel_ids:
+            row = connection.execute(
+                select(
+                    ChannelAllocation.quota,
+                    ChannelAllocation.pending,
+                    ChannelAllocation.manual_confirmed_quota,
+                    ChannelAllocation.review_hold,
+                )
+                .where(
+                    ChannelAllocation.tenant_id == tenant_id,
+                    ChannelAllocation.channel_id == channel_id,
+                    ChannelAllocation.sku_id == sku_id,
+                )
+                .with_for_update()
+            ).first()
+            if row is None:
+                raise RuntimeError(
+                    f"channel allocation for channel {channel_id} and sku {sku_id}"
+                    " was not pre-created"
+                )
+            allocations[(channel_id, sku_id)] = _Allocation(
+                row.quota, row.pending, row.manual_confirmed_quota, bool(row.review_hold)
             )
-            .where(
-                ChannelAllocation.tenant_id == order.tenant_id,
-                ChannelAllocation.channel_id == order.channel_id,
-                ChannelAllocation.sku_id == sku_id,
-            )
-            .with_for_update()
-        ).first()
-        if row is None:
-            raise RuntimeError(f"channel allocation for sku {sku_id} was not pre-created")
-        allocations[sku_id] = _Allocation(row.quota, row.pending, row.manual_confirmed_quota)
     return allocations
+
+
+def _lock_allocations(
+    connection: Connection, order: _Order, sku_ids: Iterable[str]
+) -> dict[str, _Allocation]:
+    """按 sku_id 升序 FOR UPDATE 锁这个入口在这些 SKU 上的 channel_allocations 行。"""
+    locked = _lock_channel_allocations(connection, order.tenant_id, (order.channel_id,), sku_ids)
+    return {sku_id: allocation for (_channel_id, sku_id), allocation in locked.items()}
 
 
 def _insert_order(
@@ -878,6 +1120,271 @@ def _apply_created(
     if unmapped:
         return HELD, UNMAPPED
     return APPLIED, None
+
+
+def _lock_order_lines(
+    connection: Connection, tenant_id: str, platform_order_row_id: str
+) -> dict[str, _Line]:
+    """FOR UPDATE 锁这个平台订单的全部订单行，按 platform_line_id 升序。"""
+    statement = (
+        select(
+            PlatformOrderLine.platform_line_id,
+            PlatformOrderLine.sku_id,
+            PlatformOrderLine.quantity,
+            PlatformOrderLine.cancelled_qty,
+            PlatformOrderLine.quota_taken,
+            PlatformOrderLine.quota_returned,
+        )
+        .where(
+            PlatformOrderLine.tenant_id == tenant_id,
+            PlatformOrderLine.platform_order_row_id == platform_order_row_id,
+        )
+        .order_by(PlatformOrderLine.platform_line_id)
+        .with_for_update()
+    )
+    return {row.platform_line_id: _Line(*row) for row in connection.execute(statement)}
+
+
+def _cancel_problem(payload: CancelledPayload, lines: Mapping[str, _Line]) -> str | None:
+    """行级取消里有这个订单没有的行（unknown_line，优先）或累计取消超过下单件数
+    （cancel_exceeds_remaining）时返回原因，否则 None。
+    """
+    if payload.lines is None:
+        return None
+    if any(line.platform_line_id not in lines for line in payload.lines):
+        return UNKNOWN_LINE
+    if any(line.cancelled_total > lines[line.platform_line_id].quantity for line in payload.lines):
+        return CANCEL_EXCEEDS_REMAINING
+    return None
+
+
+def _new_cancellations(payload: CancelledPayload, lines: Mapping[str, _Line]) -> dict[str, int]:
+    """各行这次新取消的件数（大于 0 的才列），按 platform_line_id 升序。
+
+    不带 lines 时取消各行全部剩余件数；带 lines 时为 cancelled_total − cancelled_qty。
+    """
+    wanted: dict[str, int] = {}
+    if payload.lines is None:
+        wanted = {line_id: line.quantity - line.cancelled_qty for line_id, line in lines.items()}
+    else:
+        for line in payload.lines:
+            already = lines[line.platform_line_id].cancelled_qty
+            wanted[line.platform_line_id] = line.cancelled_total - already
+    return {line_id: wanted[line_id] for line_id in sorted(wanted) if wanted[line_id] > 0}
+
+
+def _apply_cancelled(
+    connection: Connection,
+    order: _Order,
+    channel: _Channel,
+    payload: CancelledPayload,
+    platform_order,
+) -> tuple[str, str | None]:
+    """扣数之前的取消（§3.1，订单 unpaid 或 held）；返回收件箱行的 result 与 result_code。"""
+    lines = _lock_order_lines(connection, order.tenant_id, platform_order.platform_order_row_id)
+    problem = _cancel_problem(payload, lines)
+    if problem is not None:
+        _write_attention(connection, order, platform_order.attention, problem, None, holds=False)
+        return ATTENTION, problem
+    cancelled = _new_cancellations(payload, lines)
+    if not cancelled:
+        # 同一次取消从另一个来源又到一次。
+        return IGNORED, None
+
+    sku_ids = sorted({lines[line_id].sku_id for line_id in cancelled} - {None})
+    restore: _RestoreRows | None = None
+    allocations: dict[str, _Allocation] = {}
+    if sku_ids and platform_order.stage == UNPAID:
+        restore = _lock_restore_rows(connection, order, channel, sku_ids)
+        allocations = {
+            sku_id: restore.allocations[(order.channel_id, sku_id)] for sku_id in sku_ids
+        }
+    elif sku_ids:
+        # 待处理中的订单（Core 从未扣数）被取消一件也不加回，不用锁判恢复条件的行。
+        allocations = _lock_allocations(connection, order, sku_ids)
+    for line_id, quantity in cancelled.items():
+        sku_id = lines[line_id].sku_id
+        if sku_id is not None:
+            allocations[sku_id].pending -= quantity
+    returned: dict[str, int] = {}
+    if restore is not None:
+        returned = _quota_returns(connection, order, lines, cancelled, restore)
+
+    for line_id, quantity in cancelled.items():
+        line = lines[line_id]
+        connection.execute(
+            update(PlatformOrderLine)
+            .where(
+                PlatformOrderLine.tenant_id == order.tenant_id,
+                PlatformOrderLine.platform_order_row_id == platform_order.platform_order_row_id,
+                PlatformOrderLine.platform_line_id == line_id,
+            )
+            .values(
+                cancelled_qty=line.cancelled_qty + quantity,
+                quota_returned=line.quota_returned + returned.get(line_id, 0),
+            )
+        )
+    for sku_id in sku_ids:
+        allocation = allocations[sku_id]
+        connection.execute(
+            update(ChannelAllocation)
+            .where(
+                ChannelAllocation.tenant_id == order.tenant_id,
+                ChannelAllocation.channel_id == order.channel_id,
+                ChannelAllocation.sku_id == sku_id,
+            )
+            .values(quota=allocation.quota, pending=allocation.pending, updated_at=NOW)
+        )
+    remaining = sum(
+        line.quantity - line.cancelled_qty - cancelled.get(line_id, 0)
+        for line_id, line in lines.items()
+    )
+    if remaining == 0:
+        # attention 不清：后台照它看得出这单曾卡在哪里。
+        statement = update(PlatformOrder).where(*_order_where(order))
+        connection.execute(statement.values(stage=CANCELLED, updated_at=NOW))
+    return APPLIED, None
+
+
+def _lock_restore_rows(
+    connection: Connection, order: _Order, channel: _Channel, sku_ids: list[str]
+) -> _RestoreRows:
+    """取消加回的锁序（§3.1、§5.10 第 4 步）：池行 FOR SHARE → 余额行 FOR UPDATE
+    → pool_allocations 行 FOR UPDATE → 这个池全部 platform 入口的 channel_allocations 行
+    FOR UPDATE → 这个入口在这些 SKU 上的平台商品 FOR SHARE；SKU 都按升序。
+    """
+    pool = connection.execute(
+        select(StockPool.pool_id)
+        .where(StockPool.tenant_id == order.tenant_id, StockPool.pool_id == channel.pool_id)
+        .with_for_update(read=True)
+    ).scalar_one_or_none()
+    if pool is None:
+        raise RuntimeError(f"pool {channel.pool_id} is not in the tenant")
+    balances = lock_balance_rows(connection, order.tenant_id, channel.pool_id, sku_ids)
+    safety_stock: dict[str, int] = {}
+    for sku_id in sku_ids:
+        value = connection.execute(
+            select(PoolAllocation.safety_stock)
+            .where(
+                PoolAllocation.tenant_id == order.tenant_id,
+                PoolAllocation.pool_id == channel.pool_id,
+                PoolAllocation.sku_id == sku_id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if value is None:
+            raise RuntimeError(f"pool allocation for sku {sku_id} was not pre-created")
+        safety_stock[sku_id] = value
+    channel_ids = _platform_channels(connection, order.tenant_id, channel.pool_id)
+    allocations = _lock_channel_allocations(connection, order.tenant_id, channel_ids, sku_ids)
+    listed = set()
+    for sku_id in sku_ids:
+        statuses = connection.execute(
+            select(SkuListing.status)
+            .where(
+                SkuListing.tenant_id == order.tenant_id,
+                SkuListing.channel_id == order.channel_id,
+                SkuListing.sku_id == sku_id,
+            )
+            .order_by(SkuListing.listing_id)
+            .with_for_update(read=True)
+        ).scalars()
+        if ACTIVE in set(statuses):
+            listed.add(sku_id)
+    return _RestoreRows(
+        available={sku_id: balances[sku_id].quantities.available for sku_id in sku_ids},
+        safety_stock=safety_stock,
+        allocations=allocations,
+        listed=frozenset(listed),
+    )
+
+
+def _receiving(connection: Connection, order: _Order) -> _Receiving | None:
+    """这个入口的连接行与人工核对逾期（now 为数据库时间）；没有连接行为 None。"""
+    row = connection.execute(
+        select(
+            PlatformConnection.mode,
+            PlatformConnection.status,
+            PlatformConnection.mode_changed_at,
+        ).where(
+            PlatformConnection.tenant_id == order.tenant_id,
+            PlatformConnection.channel_id == order.channel_id,
+        )
+    ).first()
+    if row is None:
+        return None
+    last_checked_until = connection.execute(
+        select(func.max(ManualCheck.checked_until)).where(
+            ManualCheck.tenant_id == order.tenant_id,
+            ManualCheck.channel_id == order.channel_id,
+        )
+    ).scalar()
+    now = connection.execute(text("SELECT CURRENT_TIMESTAMP(6)")).scalar_one()
+    overdue = manual_check_overdue(row.mode, last_checked_until, row.mode_changed_at, now)
+    return _Receiving(row.mode, row.status, overdue)
+
+
+def _quota_returns(
+    connection: Connection,
+    order: _Order,
+    lines: Mapping[str, _Line],
+    cancelled: Mapping[str, int],
+    restore: _RestoreRows,
+) -> dict[str, int]:
+    """unpaid 的取消按 SKU 判恢复条件、把能加回的就地加到这个入口的 Q；
+    返回各行这次加回的件数（platform_line_id → 件数，0 不列）。
+
+    调用前这个入口的 pending 已减去取消的件数。一个 SKU 判不过就整份不加（进 F）。
+    """
+    per_line: dict[str, int] = {}
+    by_sku: dict[str, int] = {}
+    for line_id, quantity in cancelled.items():
+        line = lines[line_id]
+        if line.sku_id is None:
+            continue
+        amount = add_back(quantity, line.quota_taken, line.quota_returned, True)
+        if amount:
+            per_line[line_id] = amount
+            by_sku[line.sku_id] = by_sku.get(line.sku_id, 0) + amount
+
+    receiving: _Receiving | None = None
+    returned: dict[str, int] = {}
+    for sku_id in sorted(by_sku):
+        total = by_sku[sku_id]
+        if receiving is None:
+            receiving = _receiving(connection, order)
+            if receiving is None:
+                # 连接行缺了（开通的缺陷）：判不了第 1 项，不加回。
+                return {}
+        rows = [
+            allocation
+            for (_channel_id, row_sku_id), allocation in restore.allocations.items()
+            if row_sku_id == sku_id
+        ]
+        before = unallocated(
+            restore.available[sku_id],
+            restore.safety_stock[sku_id],
+            [allocation.quota for allocation in rows],
+            [allocation.pending for allocation in rows],
+        )
+        # 按加回之后算：这个入口的 Q 加上 total。
+        unallocated_after = before - total
+        own = restore.allocations[(order.channel_id, sku_id)]
+        allowed = restore_allowed(
+            receiving.mode,
+            receiving.status,
+            receiving.manual_overdue,
+            sku_id in restore.listed,
+            own.review_hold,
+            unallocated_after,
+        )
+        if not allowed:
+            continue
+        own.quota += total
+        for line_id, amount in per_line.items():
+            if lines[line_id].sku_id == sku_id:
+                returned[line_id] = amount
+    return returned
 
 
 def _mark_applied(
