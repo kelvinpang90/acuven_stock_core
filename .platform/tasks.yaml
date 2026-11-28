@@ -3855,7 +3855,7 @@ tasks:
       退出码照 Core 命令行（app/cli/__init__.py）：0 成功（含两种“已是……状态”）；2 参数或校验错误（参数不对、AccountError、两次输入不一致、实例或开关不对、输入时 EOF 或 Ctrl+C 输出“已取消”）；1 其他失败（SQLAlchemyError 只输出异常类名，不输出连接串）。成功结果写标准输出、错误写标准错误；输出只有规范用户名、账号 ID 与结果，不打印密码或哈希。
       审计：成功（“已是……状态”除外）后在提交之后照 Core 命令行的做法记一条安全事件，类型 admin_account_created、admin_password_reset、admin_account_disabled、admin_account_enabled，tenant_id 为账号的租户、credential_id 为目标账号的主体（同 credential issue 的事件记被签发的凭据），actor_ref 为 --actor，details 写 reason、目标账号 ID、它的主体 credential_id 与规范用户名；事件写入失败时操作照样生效、标准错误多一行警告。服务函数已提交之后的步骤（为输出与事件再读 get_account 等）遇到数据库错误时，退出码 1，标准错误说明操作已生效、安全事件没有记（不用 run_command 的“什么也没写”措辞）。
       明确不做：接口（CORE-TASK-098）；登录尝试的查看与清理。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-096
       - CORE-TASK-073
