@@ -3887,7 +3887,7 @@ tasks:
       二，app/main.py 的 create_app 只在后台开关为真时 include_router（CORE-TASK-073 记在 app.state 上的开关）。
       三，app/api/requests.py 的请求中间件按路径前缀 /api/ 与 /admin/ 判断（与路由挂没挂上无关）：X-Request-ID 一律不用调用方给的值、总是生成，也不因它不合格回 400；路由 404、405 与 128 KiB 的 413 照用、格式同 /v1；这两个前缀下的每个响应都加 Content-Security-Policy 为 frame-ancestors 'none' 与 X-Frame-Options 为 DENY（契约 8.6 第 2 条）；/api/v1/admin/ 下的每个响应另加 Cache-Control 为 no-store（已带的不重复加；后台响应含库存与账号数据，补的）。/v1、/healthz、/readyz 的行为不变。
       明确不做：后台执行器与业务接口（CORE-TASK-099 起）；登录页前端；登录尝试的查看与清理。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-096
       - CORE-TASK-073
