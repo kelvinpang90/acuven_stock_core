@@ -197,7 +197,18 @@ def run_admin(
         return EXIT_FAILURE
     try:
         # 启动核对（契约 6.1）：不过就不执行命令，也不写安全事件。
-        mismatch = instance_check_error(engine, settings.env)
+        # instance_check_error 自己把读库失败折成一行原因；这里再兜一层，异常不带出连接串。
+        try:
+            mismatch = instance_check_error(engine, settings.env)
+        except OperationalError:
+            fail(stderr, "database unavailable (OperationalError)")
+            return EXIT_FAILURE
+        except SQLAlchemyError as error:
+            fail(stderr, f"database error ({type(error).__name__}); nothing was written")
+            return EXIT_FAILURE
+        except Exception as error:
+            fail(stderr, f"unexpected failure ({type(error).__name__}); nothing was written")
+            return EXIT_FAILURE
         if mismatch is not None:
             fail(stderr, mismatch)
             return EXIT_FAILURE
