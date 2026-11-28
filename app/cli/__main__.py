@@ -14,6 +14,7 @@ from app.cli import (
     EXIT_OK,
     EXIT_USAGE,
     CliError,
+    admin,
     fail,
     inspect,
     provisioning,
@@ -22,6 +23,7 @@ from app.cli import (
     service_auth,
 )
 from app.config import Settings
+from app.domain.environment import PRODUCTION
 
 
 class _HelpRequested(Exception):
@@ -50,7 +52,19 @@ def build_parser() -> argparse.ArgumentParser:
     provisioning.register(subparsers)
     service_auth.register(subparsers)
     inspect.register(subparsers)
+    admin.register(subparsers)
     return parser
+
+
+def admin_unavailable_error(settings: Settings) -> str | None:
+    """账号命令只在生产实例且开了后台时可用（docs/ADMIN_AUTH.md 4.6）；在连库之前判定。"""
+    if settings.env == PRODUCTION and settings.admin_enabled:
+        return None
+    enabled = "true" if settings.admin_enabled else "false"
+    return (
+        f"admin commands need CORE_ENV={PRODUCTION} and CORE_ADMIN_ENABLED=true;"
+        f" CORE_ENV is {settings.env}, CORE_ADMIN_ENABLED is {enabled}"
+    )
 
 
 def main(argv: Sequence[str], settings: Settings, stdout: TextIO, stderr: TextIO) -> int:
@@ -64,6 +78,13 @@ def main(argv: Sequence[str], settings: Settings, stdout: TextIO, stderr: TextIO
         except CliError as error:
             fail(stderr, error.message)
             return EXIT_USAGE
+        if args.command == admin.COMMAND:
+            # 不经 run_command：账号的服务函数自己提交；实例与开关不对是退出码 2、不碰库。
+            unavailable = admin_unavailable_error(settings)
+            if unavailable is not None:
+                fail(stderr, unavailable)
+                return EXIT_USAGE
+            return admin.run_admin(settings, args.handler, args, stdout, stderr)
         return run_command(settings, args.handler, args, stdout, stderr)
 
 
