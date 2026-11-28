@@ -3819,7 +3819,7 @@ tasks:
       create_account 在同一事务里先在 credentials 建一个 kind 为 admin 的主体（name 为规范用户名、scopes 为空数组、channel_id 为空、status active，ID 用 new_id 的 cred 前缀，时间列取传入的 now，同账号行），再建账号行（new_id 的 adm 前缀）指向它（契约 10 第 4 条，CORE-TASK-077 的约束）；撞唯一约束回滚并转成 already_exists。disable_account 不吊销账号的主体。所有收 now 的函数对带时区或带小数秒的 now 报 ValueError。
       密码、哈希、会话令牌、CSRF 令牌、throttle_key 与 source_key 不进日志与异常消息。
       明确不做：账号命令（CORE-TASK-097）、接口与 cookie（098）、登录尝试的清理作业与查看（设计第 6 节，以后另登记）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-095
     acceptance_criteria:
