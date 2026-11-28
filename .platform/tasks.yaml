@@ -3681,7 +3681,7 @@ tasks:
       二，SAVEPOINT → create_document（发货、退款回库、退货验收三种单据，照 app/services/fulfilment.py 现有的入口）→ RELEASE SAVEPOINT。命令成功且 execution.answered_by_reference 为假（新生效）：shipped 与 return_received 不再改别的（退货增量进 F），result applied；cancelled 在命令之后锁 pool_allocations 与这个池全部 platform 入口在这些 SKU 上的 channel_allocations 行、再 FOR SHARE 读平台商品（跳过池行与余额行：命令体已锁过余额行，available 从它读；平台行的 SKU 已被合并时它不会有生效平台商品（CORE-TASK-084、094），恢复条件第 2 项必不满足、不加回，不必另读规范 SKU 以外的余额行；在命令体之后再锁池行会颠倒池行在余额行之前的先后；契约的锁序里预留行与订单行在余额行之前，所以配额行只能在命令体之后锁；前提是发货、退款回库、退货验收的命令体只锁预留、订单行与余额行，不锁 SKU 与商品行，现有 app/services/fulfilment.py 如此，实现时核对，不成立就在 PR 里写明并停下）、平台商品 FOR SHARE，照 087 的加回规则（按平台行 quota_taken 减 quota_returned 封顶、按 SKU 判恢复条件、整份加或不加）加回 quota 与 quota_returned，result applied。命令成功而 answered_by_reference 为真：result ignored，不改 Q 与 pending。
       三，命令以业务拒绝结束：ROLLBACK TO SAVEPOINT，阶段不变、pending 不动，写 attention 为 core_rejected（错误码属于 088 第三条那三种时为 defect）与 attention_code，result attention。BusinessRefTaken 与 RedoCommand 照 088 第四条：rejudge 成功时，收件箱 result 记 applied、result_code 记 defect（与 CORE-TASK-093 的约束相容：ignored 才要求 result_code 为空），订单 attention 写 defect；app/services/fulfilment.py 的 rejudge 一律走按引用返回原结果，标记总是为真，所以这条路上不改 Q 与 pending、不加回配额。rejudge 以业务拒绝结束照第三条，attention 写 defect。
       明确不做：后台的退货验收登记与改正事件（第 3 组）；没有稳定 ID 时的同一动作判断（第 4 组）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-088
     acceptance_criteria:
