@@ -3783,7 +3783,7 @@ tasks:
       三，迁移 alembic/versions/20261124_0018_admin_auth.py（revision 0018，down_revision 0017）：upgrade 建三张表、逐个写出上面的约束与索引名，并重建 security_events 的 event_type 检查约束（先删后建，同名）收这四个值；downgrade 先把这条约束恢复成原来的取值（库里有这四种事件时降级失败，降级只用于 CI 与开发库），再按依赖反序删三张表。
       四，app/db.py 的 make_engine 加 hide_parameters=True，保留 pool_pre_ping 与把会话时区固定为 UTC 的 connect_args（设计第 3 节）。
       明确不做：密码哈希、锁定规则、会话签发、账号命令与接口（CORE-TASK-096 到 098）；建 admin 主体（096 的建号服务做）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-077
       - CORE-TASK-081
