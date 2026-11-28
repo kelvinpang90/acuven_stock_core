@@ -32,7 +32,6 @@ from app.services.platform_events import (
     FAILED,
     LISTING_CHANGED,
     LOCK_BUSY,
-    NOT_HANDLED,
     PendingOrder,
     RoundResult,
     orders_with_pending_events,
@@ -580,11 +579,10 @@ def test_events_are_processed_by_platform_time(engine, world):
     assert amounts(engine, world, sku_id) == (8, 2, None)
 
 
-def test_an_unhandled_action_stops_the_round_there(engine, world):
+def test_every_action_of_an_order_is_handled_in_one_round(engine, world):
     sku_id, item_id, _ = mapped_sku(engine, world, quota=10, stock_balance=10)
     order_id = new_order_id()
     rts, rr = {"platform_time": T2}, {"platform_time": T3}
-    # 交运还没有处理办法（CORE-TASK-089）。
     ship = {
         "lines": [{"platform_line_id": "L-1", "quantity": 2}],
         "package_id": "PKG-1",
@@ -594,19 +592,24 @@ def test_an_unhandled_action_stops_the_round_there(engine, world):
     record(engine, world, order_id, rts, action="ready_to_ship", event_key="rts")
     record(engine, world, order_id, ship, action="shipped", event_key="ship")
     record(engine, world, order_id, rr, action="return_requested", event_key="rr")
-    stopped_at = event_by_key(engine, world, "ship|PKG-1")["event_row_id"]
 
-    assert process(engine, world, order_id) == RoundResult(2, stopped_at, NOT_HANDLED)
-    after = state(engine, world)
-    for key in ("ship|PKG-1", "rr"):
-        event = event_by_key(engine, world, key)
-        assert (event["applied_at"], event["result"]) == (None, None)
+    # 交运在已确认之后调发货（CORE-TASK-089），这一轮不再停在它这里。
+    assert process(engine, world, order_id) == RoundResult(4)
+    events = {event["event_key"]: event for event in events_of(engine, world, order_id)}
+    results = {key: (event["result"], event["result_code"]) for key, event in events.items()}
+    assert results == {
+        "evt-created": ("applied", None),
+        "rts": ("applied", None),
+        "ship|PKG-1": ("applied", None),
+        "rr": ("ignored", None),
+    }
     assert platform_order(engine, world, order_id)["stage"] == "committed"
-
-    # 下一轮仍停在它这里，什么也不改。
-    assert process(engine, world, order_id) == RoundResult(0, stopped_at, NOT_HANDLED)
-    assert state(engine, world) == after
     assert amounts(engine, world, sku_id) == (8, 0, None)
+
+    # 再处理一轮没有事件，什么也不改。
+    after = state(engine, world)
+    assert process(engine, world, order_id) == RoundResult(0)
+    assert state(engine, world) == after
 
 
 def test_a_database_error_rolls_the_event_back(engine, world, monkeypatch):

@@ -1,7 +1,8 @@
 """平台事件执行器（契约 §5.10，§3.1 下单扣配额、取消加回与恢复条件）。
 
 §5.10 的存放、处理顺序第 1–8 步（含第 4 步落后、越过阶段的三种情形）与
-“每个动作调哪个命令体”的 created、ready_to_ship、扣数之前的 cancelled、return_requested 四行。
+“每个动作调哪个命令体”的全部各行：created、ready_to_ship、扣数之前与已确认之后的 cancelled、
+shipped、return_requested、return_received。
 调 Core 命令体的动作（建 Execution、派生正文、保存点）在 app/services/platform_commands.py，
 由这里分派。只有函数，不挂作业、不挂接口（由以后的任务接）：
 - record_auto_event：webhook 与补拉把一个事件写进收件箱；
@@ -14,7 +15,9 @@ process_order 的先后：
 1. 在没有打开事务的连接上 GET_LOCK(订单锁名, 5)；
    取不到或出错什么也不做，返回 LOCK_BUSY。
 2. 取这个订单全部未处理的事件，按 sort_key 排序，
-   逐个处理，每个事件一笔事务。
+   逐个处理，每个事件一笔事务。轮到 return_received 时这一轮还没处理的事件里有 shipped，
+   先依次处理这些 shipped（同乱序的先处理前序，每个事件最多被提前一次），否则退货会因
+   尚未记发货被 Core 拒绝。
 3. 开事务之前：解析涉及的订单行的 SKU（已有平台订单行取
    已定下的、取这个订单的全部订单行，created 的各行按当前
    active 的平台商品，普通读）；
@@ -36,9 +39,9 @@ process_order 的先后：
    然后按阶段判定：ignored 记 ignored、不改任何量（return_requested 总是这样）；
    created 的 apply 建平台订单并扣配额；ready_to_ship 的 apply 见下面的进入待发货；
    unpaid、held 时 cancelled 的 apply 见下面的扣数之前的取消；
+   committed 时 shipped、cancelled、return_received 的 apply 见下面的已确认之后；
    attention 写 stage_conflict（见下面的待处理）；
-   missing_prior 与 blocked 见下面的乱序；其余的 apply（已确认之后的动作）
-   还没有处理办法：回滚、这一轮停下、不改任何东西（NOT_HANDLED）。
+   missing_prior 与 blocked 见下面的乱序。
 5、6. 命令体在一个保存点里（app/services/platform_commands.py）。命令抛 RedoCommand：
    回滚整笔事务，从第 3 步重做一次；再抛就回滚、这一轮停下（REDO_AGAIN）。
 7. 写收件箱行的 applied_at（数据库时间）与 result，
@@ -89,6 +92,32 @@ attention unmapped，不调 Core。否则用 assign_line_refs 按 SKU 合并、�
 - 带缺陷标记（见 platform_commands）的拒绝：同上，attention 为 defect；
   带缺陷标记的成功（rejudge 成功、按业务引用返回原结果）：照成功，result_code 记 defect，
   attention 写 defect（让人去查的原因，覆盖已有的）、attention_code 为空。
+
+已确认之后（§5.10、§3.1，订单 committed）：先 FOR UPDATE 锁订单行，按这个先后判，
+判出原因的不调 Core、result 记 attention：
+- cancelled 带 lines、各行 cancelled_total 都不大于这一行的 cancelled_qty（付款前那次取消
+  从另一个来源晚到）：ignored；不带 refund_id：refund_id_missing；带 refund_id 不带 lines
+  （订单级，件数里可能含已交运的）：cancel_lines_missing；
+- shipped 缺 package_id、return_received 缺 return_id：missing_platform_id（平台给不出稳定的
+  ID 时按订单、动作、平台行、件数、时间判断同一动作，V1 先一律进待处理）；
+- payload 里有平台行不属于这个订单或没有 line_ref：line_not_committed；
+- 引用由 document_ref 派生，正文由 dispatch_body、refund_restock_body、return_receipt_body
+  派生：整理后一行不剩记 ignored；校验不过 invalid_request、attention_code INVALID_REQUEST。
+然后一个保存点里调发货、退款回库或退货验收（执行身份：自动来源为 system 主体，manual 来源为
+收件箱行的 credential_id；操作者由调用方传入，process_order 为空）：
+- 新生效：shipped、return_received 不再改别的（退货增量进 F），result applied；cancelled
+  在命令之后锁 pool_allocations 行 → 这个池全部 platform 入口在这些 SKU 上的
+  channel_allocations 行 → 这个入口在这些 SKU 上的平台商品 FOR SHARE（池行与余额行跳过：
+  命令体已锁过余额行，available 从它读；配额行在命令体之后锁才不颠倒“预留行、订单行在
+  余额行之前”的锁序），照扣数之前的加回规则把这次退款的件数按平台行 quota_taken −
+  quota_returned 封顶、按 SKU 判恢复条件、整份加或不加；已确认之后的取消不记 cancelled_qty、
+  不改 pending 与阶段。平台行的 SKU 已被合并时它没有生效平台商品，恢复条件第 2 项不满足，
+  不加回，也不读它的余额行；
+- 按业务引用返回原结果：ignored，不改 Q 与 pending；
+- 业务拒绝：阶段不变、pending 不动，attention core_rejected（带缺陷标记的为 defect）、
+  attention_code 为错误码，result attention；
+- rejudge 成功：result applied、result_code defect，attention 写 defect；rejudge 按引用
+  返回原结果，不改 Q 与 pending、不加回配额。
 
 待处理（本任务与之后的平台事件任务都照此）：收件箱行的 result_code 写
 这个事件的 Core 错误码，没有错误码时写原因。让订单进 held 的原因与缺陷总是覆盖
@@ -149,6 +178,7 @@ from app.domain.platform_events import (
     REFUND_ID,
     RETURN_ID,
     RETURN_RECEIVED,
+    SHIPPED,
     UNPAID,
     CancelledPayload,
     CreatedLine,
@@ -163,6 +193,7 @@ from app.domain.platform_events import (
     parse_payload,
     sort_key,
 )
+from app.domain.requests import Actor
 from app.domain.service_auth import SYSTEM
 from app.models.catalog import NOW
 from app.models.inventory import SalesChannel, StockBalance, StockPool
@@ -178,19 +209,25 @@ from app.models.platform_ops import ManualCheck, PlatformConnection
 from app.models.service_auth import Credential
 from app.services.idempotency import RedoCommand
 from app.services.platform_commands import (
+    DocumentCommand,
     InvalidDerivedBody,
     command_context,
+    create_order_document,
+    dispatch_command,
     ready_commands,
+    refund_restock_command,
     reserve_and_commit,
+    return_receipt_command,
 )
 from app.services.reservations import close_due_before_reserving
 from app.services.sale_commits import CommitSkus
 from app.services.security_events import SecurityEventRecord, record_security_event
 from app.services.stock import lock_balance_rows
 
-# 自动来源（§5.10 存放）；manual 由后台登记，不经这里。
+# 自动来源（§5.10 存放）；manual 由后台登记，不经 record_auto_event。
 WEBHOOK = "webhook"
 PULL = "pull"
+MANUAL_SOURCE = "manual"
 AUTO_SOURCES = (WEBHOOK, PULL)
 
 # 收件箱的 result 与待处理原因。
@@ -203,6 +240,11 @@ CANCEL_EXCEEDS_REMAINING = "cancel_exceeds_remaining"
 STAGE_CONFLICT = "stage_conflict"
 CORE_REJECTED = "core_rejected"
 INVALID_REQUEST_REASON = "invalid_request"
+# 已确认之后的动作不调 Core 的原因。
+REFUND_ID_MISSING = "refund_id_missing"
+CANCEL_LINES_MISSING = "cancel_lines_missing"
+MISSING_PLATFORM_ID = "missing_platform_id"
+LINE_NOT_COMMITTED = "line_not_committed"
 # 引用派生或状态记录有缺陷（§5.10 第 6 步、命令体共用）；成功时也记在 result_code。
 DEFECT = "defect"
 # stage_conflict 的 Core 错误码。
@@ -224,7 +266,6 @@ REDO_ATTEMPTS = 2
 # 这一轮停下的原因。
 LOCK_BUSY = "lock_busy"
 LISTING_CHANGED = "listing_changed"
-NOT_HANDLED = "not_handled"
 MISSING_PRIOR = "missing_prior"  # 缺前序动作、收件箱里也没有：标了补拉（平台订单存在时）
 BLOCKED = "blocked"  # 不标补拉
 REDO_AGAIN = "redo_again"  # 命令两次要求整个重做
@@ -439,6 +480,8 @@ class _Event:
     action: str
     payload: Payload
     received_at: datetime
+    source: str
+    credential_id: str  # 自动来源为 system 主体，manual 为登记它的管理员
 
 
 @dataclass(frozen=True)
@@ -472,13 +515,14 @@ class _Line:
     cancelled_qty: int
     quota_taken: int
     quota_returned: int
+    line_ref: str | None
 
 
 @dataclass(frozen=True)
 class _RestoreRows:
-    """unpaid 时取消加回要用的锁住的行（按 sku_id）。"""
+    """取消加回要用的锁住的行（按 sku_id）。"""
 
-    available: Mapping[str, int]
+    available: Mapping[str, int]  # 至少有 listed 里的 SKU
     safety_stock: Mapping[str, int]
     # (channel_id, sku_id) → 这个池全部 platform 入口的配额行
     allocations: Mapping[tuple[str, str], _Allocation]
@@ -621,6 +665,19 @@ def _run_round(connection: Connection, order: _Order, ttl_seconds: int) -> Round
     promoted: set[str] = set()
     while queue:
         event = queue[0]
+        if event.action == RETURN_RECEIVED:
+            shipped = [
+                other
+                for other in queue[1:]
+                if other.action == SHIPPED and other.event_row_id not in promoted
+            ]
+            if shipped:
+                # 退货要先记发货：这一轮还没处理的 shipped 依次排到它前面。
+                for other in shipped:
+                    promoted.add(other.event_row_id)
+                    queue.remove(other)
+                queue[0:0] = shipped
+                continue
         outcome = _process_event(connection, order, channel, event, ttl_seconds)
         if isinstance(outcome, _Missing):
             prior = next(
@@ -728,6 +785,8 @@ def _pending_events(connection: Connection, order: _Order) -> list[_Event]:
         PlatformEvent.action,
         PlatformEvent.payload,
         PlatformEvent.received_at,
+        PlatformEvent.source,
+        PlatformEvent.credential_id,
     ).where(
         PlatformEvent.tenant_id == order.tenant_id,
         PlatformEvent.channel_id == order.channel_id,
@@ -740,6 +799,8 @@ def _pending_events(connection: Connection, order: _Order) -> list[_Event]:
             action=row.action,
             payload=parse_payload(row.action, row.payload),
             received_at=row.received_at,
+            source=row.source,
+            credential_id=row.credential_id,
         )
         for row in connection.execute(statement)
     ]
@@ -954,7 +1015,7 @@ def _locked(
     events: list[SecurityEventRecord],
 ) -> str | _Missing:
     """开事务加锁、判定、改量并写收件箱行；返回 _DONE、_ALREADY_APPLIED、_RESOLVE_AGAIN、
-    _REDO、_Missing、BLOCKED 或 NOT_HANDLED。只有 _DONE 与 _ALREADY_APPLIED 提交，其余回滚；
+    _REDO、_Missing 或 BLOCKED。只有 _DONE 与 _ALREADY_APPLIED 提交，其余回滚；
     异常时回滚再抛出。命令登记的安全事件放进 events，由调用方在提交之后写。
     """
     transaction = connection.begin()
@@ -1058,7 +1119,14 @@ def _decide(
         )
         _mark_applied(connection, order, event, result, result_code)
         return _DONE
-    return NOT_HANDLED
+    if stage == COMMITTED and event.action in (SHIPPED, CANCELLED, RETURN_RECEIVED):
+        # process_order 处理 manual 行时操作者为空（后台登记时由后台传入管理员）。
+        result, result_code = _apply_after_commit(
+            connection, order, channel, event, platform_order, ttl_seconds, None, events
+        )
+        _mark_applied(connection, order, event, result, result_code)
+        return _DONE
+    raise RuntimeError(f"{event.action} on a {stage} order was classified as apply")
 
 
 def _hold(connection: Connection, order: _Order, reason: str, code: str | None) -> None:
@@ -1245,6 +1313,7 @@ def _lock_order_lines(
             PlatformOrderLine.cancelled_qty,
             PlatformOrderLine.quota_taken,
             PlatformOrderLine.quota_returned,
+            PlatformOrderLine.line_ref,
         )
         .where(
             PlatformOrderLine.tenant_id == tenant_id,
@@ -1366,8 +1435,47 @@ def _lock_restore_rows(
     """
     _lock_pool(connection, order, channel)
     balances = lock_balance_rows(connection, order.tenant_id, channel.pool_id, sku_ids)
+    safety_stock = _lock_pool_allocations(connection, order, channel, sku_ids)
+    channel_ids = _platform_channels(connection, order.tenant_id, channel.pool_id)
+    allocations = _lock_channel_allocations(connection, order.tenant_id, channel_ids, sku_ids)
+    return _RestoreRows(
+        available={sku_id: balances[sku_id].quantities.available for sku_id in sku_ids},
+        safety_stock=safety_stock,
+        allocations=allocations,
+        listed=_lock_listings(connection, order, sku_ids),
+    )
+
+
+def _lock_restore_rows_after_commands(
+    connection: Connection, order: _Order, channel: _Channel, sku_ids: list[str]
+) -> _RestoreRows:
+    """已确认之后取消加回的锁序，在命令体之后：pool_allocations 行 FOR UPDATE → 这个池全部
+    platform 入口的 channel_allocations 行 FOR UPDATE → 这个入口在这些 SKU 上的平台商品
+    FOR SHARE；SKU 都按升序。
+
+    池行与余额行跳过：命令体已锁过余额行。available 只读有生效平台商品的 SKU 的余额行
+    （它们没被合并，正是命令体锁过的订单行 SKU，读的是已持有的行）；平台行的 SKU 已被合并时
+    它没有生效平台商品，恢复条件判不过，不读它的余额行。
+    """
+    safety_stock = _lock_pool_allocations(connection, order, channel, sku_ids)
+    channel_ids = _platform_channels(connection, order.tenant_id, channel.pool_id)
+    allocations = _lock_channel_allocations(connection, order.tenant_id, channel_ids, sku_ids)
+    listed = _lock_listings(connection, order, sku_ids)
+    balances = lock_balance_rows(connection, order.tenant_id, channel.pool_id, sorted(listed))
+    return _RestoreRows(
+        available={sku_id: balance.quantities.available for sku_id, balance in balances.items()},
+        safety_stock=safety_stock,
+        allocations=allocations,
+        listed=listed,
+    )
+
+
+def _lock_pool_allocations(
+    connection: Connection, order: _Order, channel: _Channel, sku_ids: list[str]
+) -> dict[str, int]:
+    """按 sku_id 升序 FOR UPDATE 锁 pool_allocations 行，返回各 SKU 的安全库存。"""
     safety_stock: dict[str, int] = {}
-    for sku_id in sku_ids:
+    for sku_id in sorted(set(sku_ids)):
         value = connection.execute(
             select(PoolAllocation.safety_stock)
             .where(
@@ -1380,14 +1488,7 @@ def _lock_restore_rows(
         if value is None:
             raise RuntimeError(f"pool allocation for sku {sku_id} was not pre-created")
         safety_stock[sku_id] = value
-    channel_ids = _platform_channels(connection, order.tenant_id, channel.pool_id)
-    allocations = _lock_channel_allocations(connection, order.tenant_id, channel_ids, sku_ids)
-    return _RestoreRows(
-        available={sku_id: balances[sku_id].quantities.available for sku_id in sku_ids},
-        safety_stock=safety_stock,
-        allocations=allocations,
-        listed=_lock_listings(connection, order, sku_ids),
-    )
+    return safety_stock
 
 
 def _lock_pool(connection: Connection, order: _Order, channel: _Channel) -> None:
@@ -1454,10 +1555,11 @@ def _quota_returns(
     cancelled: Mapping[str, int],
     restore: _RestoreRows,
 ) -> dict[str, int]:
-    """unpaid 的取消按 SKU 判恢复条件、把能加回的就地加到这个入口的 Q；
+    """取消（unpaid 的，或已确认之后的退款）按 SKU 判恢复条件、把能加回的就地加到这个入口的 Q；
     返回各行这次加回的件数（platform_line_id → 件数，0 不列）。
 
-    调用前这个入口的 pending 已减去取消的件数。一个 SKU 判不过就整份不加（进 F）。
+    调用前这个入口的 pending 已减去取消的件数（已确认之后的取消不改 pending）。
+    一个 SKU 判不过就整份不加（进 F）；没有生效平台商品的 SKU 先判掉（不读它的 available）。
     """
     per_line: dict[str, int] = {}
     by_sku: dict[str, int] = {}
@@ -1474,6 +1576,9 @@ def _quota_returns(
     returned: dict[str, int] = {}
     for sku_id in sorted(by_sku):
         total = by_sku[sku_id]
+        if sku_id not in restore.listed:
+            # 恢复条件第 2 项不满足。
+            continue
         if receiving is None:
             receiving = _receiving(connection, order)
             if receiving is None:
@@ -1497,7 +1602,7 @@ def _quota_returns(
             receiving.mode,
             receiving.status,
             receiving.manual_overdue,
-            sku_id in restore.listed,
+            True,  # 有生效平台商品，上面已判过
             own.review_hold,
             unallocated_after,
         )
@@ -1634,6 +1739,160 @@ def _commit_ready(
     connection.execute(
         update(PlatformOrder).where(*_order_where(order)).values(stage=COMMITTED, updated_at=NOW)
     )
+
+
+def _after_commit_problem(event: _Event, lines: Mapping[str, _Line]) -> str | None:
+    """已确认之后不调 Core 的原因（按 refund_id_missing、cancel_lines_missing、
+    missing_platform_id、line_not_committed 的先后），没有为 None。
+    """
+    payload = event.payload
+    if event.action == CANCELLED:
+        if payload.refund_id is None:
+            return REFUND_ID_MISSING
+        if payload.lines is None:
+            # 订单级：件数里可能含已交运的，契约要求取平台的件数。
+            return CANCEL_LINES_MISSING
+    elif event.action == SHIPPED and payload.package_id is None:
+        return MISSING_PLATFORM_ID
+    elif event.action == RETURN_RECEIVED and payload.return_id is None:
+        return MISSING_PLATFORM_ID
+    for line in payload.lines:
+        platform_line = lines.get(line.platform_line_id)
+        if platform_line is None or platform_line.line_ref is None:
+            return LINE_NOT_COMMITTED
+    return None
+
+
+def _document_command(
+    event: _Event, ref: str, line_refs: Mapping[str, str]
+) -> DocumentCommand | None:
+    if event.action == SHIPPED:
+        return dispatch_command(ref, event.payload, line_refs)
+    if event.action == CANCELLED:
+        return refund_restock_command(ref, event.payload, line_refs)
+    return return_receipt_command(ref, event.payload, line_refs)
+
+
+def _event_principal(connection: Connection, order: _Order, event: _Event) -> str:
+    """执行 Core 命令的身份：自动来源为 system 主体，manual 为收件箱行上的 credential_id。"""
+    if event.source == MANUAL_SOURCE:
+        return event.credential_id
+    return _system_principal(connection, order.tenant_id)
+
+
+def _apply_after_commit(
+    connection: Connection,
+    order: _Order,
+    channel: _Channel,
+    event: _Event,
+    platform_order,
+    ttl_seconds: int,
+    actor: Actor | None,
+    events: list[SecurityEventRecord],
+) -> tuple[str, str | None]:
+    """已确认之后的 shipped、cancelled 与 return_received（§5.10、§3.1，订单 committed）；
+    返回收件箱行的 result 与 result_code。actor 为执行命令的操作者（process_order 为空）。
+    """
+    lines = _lock_order_lines(connection, order.tenant_id, platform_order.platform_order_row_id)
+    current = platform_order.attention
+    payload = event.payload
+    if event.action == CANCELLED and payload.lines is not None:
+        known = all(line.platform_line_id in lines for line in payload.lines)
+        if known and all(
+            line.cancelled_total <= lines[line.platform_line_id].cancelled_qty
+            for line in payload.lines
+        ):
+            # 付款前那次取消从另一个来源晚到（已确认之后的取消不记 cancelled_qty）。
+            return IGNORED, None
+    problem = _after_commit_problem(event, lines)
+    if problem is not None:
+        _write_attention(connection, order, current, problem, None, holds=False)
+        return ATTENTION, problem
+
+    line_refs = {line_id: line.line_ref for line_id, line in lines.items() if line.line_ref}
+    try:
+        command = _document_command(event, platform_order.order_ref, line_refs)
+    except InvalidDerivedBody:
+        _write_attention(
+            connection, order, current, INVALID_REQUEST_REASON, INVALID_REQUEST, holds=False
+        )
+        return ATTENTION, INVALID_REQUEST
+    if command is None:
+        # 整理之后一行都不剩：不调 Core（§5.10 派生的命令正文）。
+        return IGNORED, None
+
+    context = command_context(
+        tenant_id=order.tenant_id,
+        channel_id=order.channel_id,
+        pool_id=channel.pool_id,
+        credential_id=_event_principal(connection, order, event),
+        event_row_id=event.event_row_id,
+        reservation_ttl_seconds=ttl_seconds,
+        actor=actor,
+    )
+    outcome = create_order_document(connection, context, command)
+    events.extend(outcome.events)
+    if outcome.rejection is not None:
+        # 已确认之后被拒（第 6 步）：阶段不变、pending 不动。
+        code = outcome.rejection.code
+        if outcome.defect:
+            _write_attention(connection, order, current, DEFECT, code, holds=True)
+        else:
+            _write_attention(connection, order, current, CORE_REJECTED, code, holds=False)
+        return ATTENTION, code
+    if outcome.defect:
+        # rejudge 按业务引用返回原结果：不改 Q 与 pending、不加回配额。
+        _write_attention(connection, order, current, DEFECT, None, holds=True)
+        return APPLIED, DEFECT
+    if outcome.answered_by_reference:
+        # 同一单据换了 event_key 再到：不改 Q 与 pending。
+        return IGNORED, None
+    if event.action == CANCELLED:
+        _restore_after_refund(connection, order, channel, platform_order, lines, payload)
+    return APPLIED, None
+
+
+def _restore_after_refund(
+    connection: Connection,
+    order: _Order,
+    channel: _Channel,
+    platform_order,
+    lines: Mapping[str, _Line],
+    payload: CancelledPayload,
+) -> None:
+    """退款回库新生效之后按恢复条件加回 quota 与 quota_returned（§3.1）。
+
+    件数取平台这次退款取消的件数；cancelled_qty、pending 与阶段不改。
+    """
+    refunded: dict[str, int] = {}
+    for line in sorted(payload.lines, key=lambda line: line.platform_line_id):
+        refunded[line.platform_line_id] = line.quantity
+    sku_ids = sorted({lines[line_id].sku_id for line_id in refunded} - {None})
+    if not sku_ids:
+        return
+    restore = _lock_restore_rows_after_commands(connection, order, channel, sku_ids)
+    returned = _quota_returns(connection, order, lines, refunded, restore)
+    for line_id, amount in sorted(returned.items()):
+        connection.execute(
+            update(PlatformOrderLine)
+            .where(
+                PlatformOrderLine.tenant_id == order.tenant_id,
+                PlatformOrderLine.platform_order_row_id == platform_order.platform_order_row_id,
+                PlatformOrderLine.platform_line_id == line_id,
+            )
+            .values(quota_returned=lines[line_id].quota_returned + amount)
+        )
+    for sku_id in sorted({lines[line_id].sku_id for line_id in returned}):
+        allocation = restore.allocations[(order.channel_id, sku_id)]
+        connection.execute(
+            update(ChannelAllocation)
+            .where(
+                ChannelAllocation.tenant_id == order.tenant_id,
+                ChannelAllocation.channel_id == order.channel_id,
+                ChannelAllocation.sku_id == sku_id,
+            )
+            .values(quota=allocation.quota, updated_at=NOW)
+        )
 
 
 def _mark_applied(
