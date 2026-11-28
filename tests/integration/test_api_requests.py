@@ -12,10 +12,13 @@ from typing import Annotated
 
 import pytest
 from fastapi import Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
+from sqlalchemy.exc import OperationalError
 
+from app.api import admin_session
+from app.api.admin_session import AdminPrincipal, require_admin
 from app.api.errors import ApiError, ok
 from app.api.requests import ParsedBody, RequestBody, json_body, no_body
 from app.config import Settings
@@ -68,10 +71,36 @@ def client(migrated_engine: Engine) -> Iterator[TestClient]:
         headers = {"Retry-After": "1"}
         raise ApiError(409, "REQUEST_IN_PROGRESS", "in progress", retryable=True, headers=headers)
 
+    # /api/ 与 /admin/ 前缀下的测试路由（§8.1 的 0.22 一条）。
+    @app.get("/api/test/echo")
+    def api_echo(request: Request) -> JSONResponse:
+        return ok(request, {"echo": True})
+
+    @app.post("/api/test/upload")
+    def api_upload(request: Request) -> JSONResponse:
+        return ok(request, {"uploaded": True})
+
+    @app.get("/admin/test/page")
+    def admin_page() -> PlainTextResponse:
+        return PlainTextResponse("page")
+
+    @app.get("/api/v1/admin/test/echo")
+    def admin_echo(request: Request) -> JSONResponse:
+        return ok(request, {"echo": True})
+
+    @app.get("/api/v1/admin/test/cached")
+    def admin_cached(request: Request) -> JSONResponse:
+        return ok(request, {"echo": True}, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/admin/test/whoami")
+    def whoami(principal: Annotated[AdminPrincipal, Depends(require_admin)]) -> JSONResponse:
+        return JSONResponse({"account_id": principal.account_id})
+
+    engine = app.state.engine
     try:
         yield TestClient(app)
     finally:
-        app.state.engine.dispose()
+        engine.dispose()
 
 
 def lines(count: int) -> list[dict]:
@@ -154,6 +183,129 @@ def test_routing_errors_echo_a_valid_request_id_and_generate_otherwise(
 def test_an_unknown_path_is_404_before_the_size_check(client):
     response = client.post("/nope", content=b"x" * OVER_LIMIT, headers=JSON)
     assert_error(response, 404, "NOT_FOUND")
+
+
+# --- /api/ 与 /admin/ 前缀（§8.1 的 0.22 一条、§8.6 第 2 条） ---
+
+FRAME_HEADERS = {"content-security-policy": "frame-ancestors 'none'", "x-frame-options": "DENY"}
+PUBLIC_PATHS = [
+    ("/api/test/echo", 200),
+    ("/admin/test/page", 200),
+    ("/api/v1/admin/test/echo", 200),
+    ("/api/nope", 404),
+    ("/admin/nope", 404),
+    ("/api/v1/admin/nope", 404),
+]
+SESSION_COOKIE = {"Cookie": "__Host-core_admin_session=some-token"}
+
+
+def assert_frame_headers(response) -> None:
+    for name, value in FRAME_HEADERS.items():
+        assert response.headers.get_list(name) == [value]
+
+
+def assert_no_frame_headers(response) -> None:
+    for name in (*FRAME_HEADERS, "cache-control"):
+        assert name not in response.headers
+
+
+@pytest.mark.parametrize(("path", "status"), PUBLIC_PATHS)
+@pytest.mark.parametrize("supplied", ["caller-7", "has space", "", "a" * 129])
+def test_public_prefixes_always_generate_the_request_id(client, path, status, supplied):
+    response = client.get(path, headers={"X-Request-ID": supplied})
+    assert response.status_code == status
+    generated = response.headers["X-Request-ID"]
+    assert GENERATED_ID.fullmatch(generated)
+    assert generated != supplied
+    if status == 404:
+        assert_error(response, 404, "NOT_FOUND")
+    elif path != "/admin/test/page":
+        assert response.json()["request_id"] == generated
+
+
+@pytest.mark.parametrize(("path", "status"), PUBLIC_PATHS)
+def test_public_prefixes_carry_the_frame_headers(client, path, status):
+    response = client.get(path)
+    assert response.status_code == status
+    assert_frame_headers(response)
+    if path.startswith("/api/v1/admin/"):
+        assert response.headers.get_list("cache-control") == ["no-store"]
+    else:
+        assert "cache-control" not in response.headers
+
+
+def test_an_admin_response_that_sets_no_store_is_not_doubled(client):
+    response = client.get("/api/v1/admin/test/cached")
+    assert response.status_code == 200
+    assert response.headers.get_list("cache-control") == ["no-store"]
+
+
+def test_public_prefixes_keep_405_and_413_in_the_core_format(client):
+    wrong_method = client.post("/api/test/echo", headers={"X-Request-ID": "caller-7"})
+    assert_error(wrong_method, 405, "METHOD_NOT_ALLOWED")
+    assert GENERATED_ID.fullmatch(wrong_method.headers["X-Request-ID"])
+    assert_frame_headers(wrong_method)
+
+    too_large = client.post(
+        "/api/test/upload", content=b"x" * OVER_LIMIT, headers=JSON | {"X-Request-ID": "has space"}
+    )
+    assert_error(too_large, 413, "REQUEST_TOO_LARGE")
+    assert GENERATED_ID.fullmatch(too_large.headers["X-Request-ID"])
+    assert_frame_headers(too_large)
+
+
+@pytest.mark.parametrize("path", ["/test/echo", "/v1/nothing", "/healthz", "/readyz"])
+def test_v1_and_health_checks_echo_the_id_without_the_admin_headers(client, path):
+    response = client.get(path, headers={"X-Request-ID": "caller-7"})
+    assert response.headers["X-Request-ID"] == "caller-7"
+    assert_no_frame_headers(response)
+
+
+def test_a_path_that_only_starts_with_the_prefix_text_is_not_public(client):
+    response = client.get("/apix", headers={"X-Request-ID": "caller-7"})
+    assert_error(response, 404, "NOT_FOUND")
+    assert response.headers["X-Request-ID"] == "caller-7"
+    assert_no_frame_headers(response)
+
+
+# --- 会话依赖出错时的形状 ---
+
+
+def detail_of(response, status: int) -> str:
+    assert response.status_code == status, response.text
+    assert response.headers.get_list("cache-control") == ["no-store"]
+    body = response.json()
+    assert set(body) == {"detail"}
+    return body["detail"]
+
+
+def simulated_error(*args, **kwargs):
+    raise OperationalError("SELECT 1", {}, Exception(SECRET))
+
+
+def test_the_session_dependency_without_a_cookie_is_401(client):
+    response = client.get("/api/v1/admin/test/whoami")
+    assert detail_of(response, 401) == "not_authenticated"
+    assert_frame_headers(response)
+
+
+def test_a_database_error_in_the_session_dependency_is_503_detail(client, monkeypatch):
+    monkeypatch.setattr(admin_session, "resolve_session", simulated_error)
+    response = client.get("/api/v1/admin/test/whoami", headers=SESSION_COOKIE)
+    assert detail_of(response, 503) == "database_unreachable"
+    assert SECRET not in response.text
+
+
+class BrokenEngine:
+    def connect(self):
+        simulated_error()
+
+
+def test_a_failed_connection_in_the_session_dependency_is_503_detail(client, monkeypatch):
+    monkeypatch.setattr(client.app.state, "engine", BrokenEngine())
+    response = client.get("/api/v1/admin/test/whoami", headers=SESSION_COOKIE)
+    assert detail_of(response, 503) == "database_unreachable"
+    assert SECRET not in response.text
 
 
 # --- 错误封装 ---
