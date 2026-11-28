@@ -4,6 +4,7 @@ instance 是库里的实例标记（契约 6.1）。
 """
 
 from app.models import (
+    admin_auth,
     catalog,
     instance,
     inventory,
@@ -15,6 +16,7 @@ from app.models import (
 )
 
 __all__ = [
+    "admin_auth",
     "catalog",
     "instance",
     "inventory",

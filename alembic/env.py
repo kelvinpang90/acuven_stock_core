@@ -21,6 +21,7 @@ from alembic import context
 from app.db import Base
 from app.domain.environment import check_instance_marker, parse_core_env
 from app.models import (  # noqa: F401
+    admin_auth,
     catalog,
     instance,
     inventory,

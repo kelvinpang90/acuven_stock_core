@@ -23,7 +23,8 @@ from app.domain.service_auth import ADMIN, PRINCIPAL_KINDS, SERVICE, SYSTEM
 from app.models.catalog import EXACT_COLLATION, ID, NOW, STATUS, TABLE_OPTIONS, TIMESTAMP
 from app.models.inventory import CODE32, REF
 
-# 契约 7.2 的十种事件类型；轮换记为 token_issued，不另设类型。
+# 契约 7.2 的十四种事件类型；轮换记为 token_issued，不另设类型。
+# 末尾四种是后台账号命令记的（契约 7.2 的 0.22 一条，docs/ADMIN_AUTH.md 4.6）。
 EVENT_TYPES = (
     "invalid_credential",
     "forbidden",
@@ -35,6 +36,10 @@ EVENT_TYPES = (
     "token_issued",
     "token_revoked",
     "credential_revoked",
+    "admin_account_created",
+    "admin_password_reset",
+    "admin_account_disabled",
+    "admin_account_enabled",
 )
 
 
