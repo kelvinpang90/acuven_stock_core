@@ -3717,7 +3717,7 @@ tasks:
       新值与当前值全部相同时 200 返回当前表示、不加版本、不写记录（同目录“已是目标状态”）。否则写新的 safety_stock 与各入口的 quota，pool_allocations.version 加一，写一条 allocation_changes：changes 为 {"safety_stock": {"before", "after"}, "quotas": {入口 ID: {"before", "after"}}}，只列变了的（没变的键不写），reason 取正文，操作主体列取上下文；与幂等记录同一事务。返回 200 与表示：pool_id、sku_id、version、safety_stock、available、unallocated、channels（各 platform 入口的 channel_id、quota、pending，按 channel_id 升序）。
       新错误码 NO_ACTIVE_LISTING、ALLOCATION_EXCEEDS_UNALLOCATED、MANUAL_CHECK_OVERDUE、QUOTA_CHANGED 的常量放在本模块（判定本身在 CORE-TASK-082 的纯函数里）。
       明确不做：后台接口、角色断言与发布（第 3、4 组）；读接口（库存总览随后台）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-081
       - CORE-TASK-082
