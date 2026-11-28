@@ -17,8 +17,11 @@ class Base(DeclarativeBase):
 
 def make_engine(database_url: str) -> Engine:
     # 会话时区固定为 UTC：DATETIME 列的数据库默认值与 NOW() 都按 UTC 记（契约 2.2 数据库列约定）。
+    # hide_parameters：SQLAlchemy 的异常消息不带绑定参数（密码哈希、令牌摘要等，
+    # docs/ADMIN_AUTH.md 第 3 节）；数据库自己的错误文本仍可能含列值。
     return create_engine(
         database_url,
         pool_pre_ping=True,
+        hide_parameters=True,
         connect_args={"init_command": "SET time_zone = '+00:00'"},
     )
