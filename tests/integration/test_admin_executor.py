@@ -230,7 +230,13 @@ def command_body_of(pool_id: str, note: str = "first") -> dict:
     return {"pool_id": pool_id, "note": note}
 
 
-def post(client: TestClient, admin: SignedIn, body: object, key: str | bytes | None, path: str = COMMANDS):
+def post(
+    client: TestClient,
+    admin: SignedIn,
+    body: object,
+    key: str | bytes | None,
+    path: str = COMMANDS,
+):
     return client.post(path, json=body, headers=admin.headers(key))
 
 
