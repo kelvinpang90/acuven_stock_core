@@ -7,6 +7,7 @@
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from app.domain.platform_events import HELD, UNPAID
 from app.domain.reservations import ACTIVE, COMMITTED, EXPIRED, LATE_PAYMENT_REVIEW
 
 LEDGER_TOTALS = "ledger_totals"
@@ -14,6 +15,7 @@ RESERVED_VS_ORDERS = "reserved_vs_orders"
 PENDING_DISPATCH_VS_ORDERS = "pending_dispatch_vs_orders"
 ORDER_COMMIT_STATE = "order_commit_state"
 MERGED_SKU_LINES = "merged_sku_lines"
+CHANNEL_PENDING_VS_ORDERS = "channel_pending_vs_orders"
 # 按契约的编号顺序；违反项先按这个顺序排。
 CHECKS = (
     LEDGER_TOTALS,
@@ -21,10 +23,14 @@ CHECKS = (
     PENDING_DISPATCH_VS_ORDERS,
     ORDER_COMMIT_STATE,
     MERGED_SKU_LINES,
+    CHANNEL_PENDING_VS_ORDERS,
 )
 
 # 第 5 项查的预留状态：合并时订单行要改挂到规范 SKU 的那些（§2.4 第 1 步）。
 MERGE_FOLLOWING_STATUSES = (ACTIVE, EXPIRED, LATE_PAYMENT_REVIEW, COMMITTED)
+
+# 第 6 项计入的平台订单阶段：已售未扣的那些（§5.10）；committed 与 cancelled 不计。
+PENDING_PLATFORM_STAGES = (UNPAID, HELD)
 
 MAX_VIOLATIONS = 100
 
@@ -92,6 +98,16 @@ class ReservationLines:
     order_ref: str
     status: str
     lines: tuple[OrderLine, ...]
+
+
+@dataclass(frozen=True)
+class ChannelPendingRow:
+    """平台入口配额行上的已售未扣。"""
+
+    channel_id: str
+    pool_id: str
+    sku_id: str
+    pending: int
 
 
 def _quantities(source) -> dict:
@@ -190,10 +206,27 @@ def check_reservation(reservation: ReservationLines) -> list[dict]:
     return [violation for violation in results if violation is not None]
 
 
+def check_channel_pending_vs_orders(row: ChannelPendingRow, open_quantity: int) -> dict | None:
+    """第 6 项：pending 等于这个入口上这个 SKU 的 unpaid、held 平台订单行的剩余件数之和。"""
+    if open_quantity == row.pending:
+        return None
+    return {
+        "check": CHANNEL_PENDING_VS_ORDERS,
+        "pool_id": row.pool_id,
+        "sku_id": row.sku_id,
+        "expected": open_quantity,
+        "actual": row.pending,
+        "channel_id": row.channel_id,
+    }
+
+
 def _sort_key(violation: dict) -> tuple:
-    # 前三项没有 reservation_id，第 4、5 项没有 pool_id、sku_id；缺的按空串，同一项内不受影响。
+    # 只有第 6 项有 channel_id，前三项与第 6 项没有 reservation_id，第 4、5 项没有 pool_id、
+    # sku_id；缺的按空串，同一项内不受影响。一个入口只绑一个池，第 6 项按 channel_id 排之后
+    # pool_id 不再改变先后。
     return (
         _CHECK_ORDER[violation["check"]],
+        violation.get("channel_id", ""),
         violation.get("pool_id", ""),
         violation.get("sku_id", ""),
         violation.get("reservation_id", ""),
@@ -203,7 +236,8 @@ def _sort_key(violation: dict) -> tuple:
 def summarize_violations(violations: Iterable[dict]) -> tuple[int, list[dict]]:
     """违反项排序截断，返回总数与至多 100 项。
 
-    按 check 的编号，再按 pool_id、sku_id（前三项）或 reservation_id（第 4、5 项）升序。
+    按 check 的编号，再按 pool_id、sku_id（前三项）、reservation_id（第 4、5 项）
+    或 channel_id、sku_id（第 6 项）升序。
     """
     ordered = sorted(violations, key=_sort_key)
     return len(ordered), ordered[:MAX_VIOLATIONS]

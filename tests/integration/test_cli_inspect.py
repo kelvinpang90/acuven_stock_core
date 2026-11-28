@@ -3,24 +3,30 @@
 在真 MySQL 上跑：直接调用入口函数 main（同 test_cli_provisioning）。
 每个测试建自己的租户、池、销售入口与凭据，池先切到 live；预留、确认销售与发货经接口建立。
 三个子命令的输出与 TestClient 用该租户凭据以同样参数调对应读接口得到的 data 相比。
+platform-order 没有对应的读接口：用 platform_fixtures 建带 platform 入口的租户，平台订单、
+行与收件箱事件直接插入，输出与插入的值相比；结束时在 finally 里 purge_tenant 删掉它的全部行。
 """
 
 from collections.abc import Callable, Iterator
+from datetime import datetime
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, func, insert, select, update
 
 from app.config import Settings
 from app.domain.environment import DEMO, PRODUCTION
 from app.domain.service_auth import STOCK_READ
+from app.models.platform import ChannelAllocation, PlatformEvent, PlatformOrder, PlatformOrderLine
 from app.models.service_auth import SecurityEvent
+from tests.integration import platform_fixtures
 from tests.integration.conftest import TEST_DATABASE_URL, instance_marked, new_id, qline
+from tests.integration.platform_fixtures import PlatformWorld
 from tests.integration.test_api_auth import Caller
 from tests.integration.test_cli_provisioning import Result, run_cli
 from tests.integration.test_idempotency import add_skus
-from tests.integration.test_invariants_api import BUSINESS_TABLES
+from tests.integration.test_invariants_api import BUSINESS_TABLES, add_platform_order
 from tests.integration.test_order_stock_api import channel_of, committed, dispatch, order_stock
 from tests.integration.test_reservations_api import (
     data_of,
@@ -35,6 +41,43 @@ LEDGER = "/v1/ledger"
 FROM = "2000-01-01T00:00:00Z"
 TO = "2999-01-01T00:00:00Z"
 NOT_FOUND_CODE = 2
+PLATFORM_TABLES = (ChannelAllocation, PlatformOrder, PlatformOrderLine, PlatformEvent)
+ORDER_KEYS = [
+    "platform_order_row_id",
+    "channel_id",
+    "platform_order_id",
+    "order_ref",
+    "stage",
+    "attention",
+    "attention_code",
+    "ready_at",
+    "next_pull_at",
+    "pull_attempts",
+    "created_at",
+    "updated_at",
+    "lines",
+    "events",
+]
+LINE_KEYS = [
+    column.name
+    for column in PlatformOrderLine.__table__.columns
+    if column.name != "known_discrepancy_note"
+]
+EVENT_KEYS = [
+    "event_row_id",
+    "action",
+    "platform_line_id",
+    "source",
+    "event_key",
+    "received_at",
+    "applied_at",
+    "result",
+]
+RECEIVED_EARLY = datetime(2026, 11, 27, 8, 0, 0, 123456)
+RECEIVED_LATE = datetime(2026, 11, 27, 9, 30, 0)
+RECEIVED_LAST = datetime(2026, 11, 27, 10, 0, 0)
+APPLIED_AT = datetime(2026, 11, 27, 10, 0, 1, 500000)
+READY_AT = datetime(2026, 11, 27, 9, 0, 0)
 
 
 # --- 夹具 ---
@@ -140,8 +183,102 @@ def row_counts(engine: Engine) -> dict[str, int]:
     with engine.connect() as db:
         return {
             model.__tablename__: db.execute(select(func.count()).select_from(model)).scalar_one()
-            for model in (*BUSINESS_TABLES, SecurityEvent)
+            for model in (*BUSINESS_TABLES, *PLATFORM_TABLES, SecurityEvent)
         }
+
+
+@pytest.fixture
+def world(engine: Engine) -> Iterator[PlatformWorld]:
+    built = platform_fixtures.create_world(engine)
+    try:
+        yield built
+    finally:
+        platform_fixtures.purge_tenant(engine, built.tenant_id)
+
+
+def platform_order_argv(tenant_id: str, channel_id: str, platform_order_id: str) -> list[str]:
+    argv = ["inspect", "platform-order", "--tenant", tenant_id, "--channel", channel_id]
+    return argv + ["--platform-order-id", platform_order_id]
+
+
+def add_event(
+    engine: Engine, world: PlatformWorld, platform_order_id: str, **values: object
+) -> dict:
+    """收件箱里这个订单的一个 webhook 事件，提交；返回插入的值。"""
+    event = {
+        "event_row_id": new_id("pev"),
+        "tenant_id": world.tenant_id,
+        "channel_id": world.channel_id,
+        "platform_order_id": platform_order_id,
+        "platform_line_id": "",
+        "action": "created",
+        "event_key": f"evt-{uuid4().hex}",
+        "source": "webhook",
+        "payload": {"secret_marker": "payload-not-shown"},
+        "received_at": RECEIVED_EARLY,
+        "applied_at": None,
+        "result": None,
+        "credential_id": world.system_credential_id,
+    } | values
+    with engine.begin() as db:
+        db.execute(insert(PlatformEvent).values(event))
+    return event
+
+
+def timestamp(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat(timespec="microseconds") + "Z"
+
+
+def event_output(event: dict) -> dict:
+    return {
+        name: timestamp(event[name]) if name in ("received_at", "applied_at") else event[name]
+        for name in EVENT_KEYS
+    }
+
+
+@pytest.fixture
+def platform_order(engine: Engine, world: PlatformWorld) -> tuple[dict, list[dict]]:
+    """一个 held 的平台订单：三行（一行没映射到 SKU、一行带已知差异）与四个事件。
+
+    返回订单插入的值与按输出顺序（received_at、event_row_id）排好的事件。
+    """
+    sku = platform_fixtures.add_sku(engine, world.tenant_id)
+    order = add_platform_order(
+        engine, world, "held", [("b", sku, 3, 1), ("a", None, 2, 0), ("c", sku, 1, 0)]
+    )
+    with engine.begin() as db:
+        db.execute(
+            update(PlatformOrder)
+            .where(PlatformOrder.platform_order_row_id == order["platform_order_row_id"])
+            .values(attention_code="sku_unmapped", ready_at=READY_AT, pull_attempts=2)
+        )
+        db.execute(
+            update(PlatformOrderLine)
+            .where(
+                PlatformOrderLine.platform_order_row_id == order["platform_order_row_id"],
+                PlatformOrderLine.platform_line_id == "c",
+            )
+            .values(known_discrepancy=True, known_discrepancy_note="note-not-shown")
+        )
+    platform_order_id = order["platform_order_id"]
+    # 同一时刻收到的两个按 event_row_id 排；最晚收到的那个已处理。
+    tied = [
+        add_event(engine, world, platform_order_id, action="ready_to_ship", received_at=moment)
+        for moment in (RECEIVED_LATE, RECEIVED_LATE)
+    ]
+    applied = add_event(
+        engine,
+        world,
+        platform_order_id,
+        action="cancelled",
+        platform_line_id="b",
+        received_at=RECEIVED_LAST,
+        applied_at=APPLIED_AT,
+        result="applied",
+    )
+    first = add_event(engine, world, platform_order_id)
+    events = [first, *sorted(tied, key=lambda event: event["event_row_id"]), applied]
+    return order, events
 
 
 # --- ledger ---
@@ -325,6 +462,134 @@ def test_order_stock_rejects_a_malformed_order_ref_and_a_foreign_cursor(
     rejected(cli(*argv), foreign, mine["order_ref"])
 
 
+# --- platform-order ---
+
+
+def stored_rows(engine: Engine, model, *criteria, order_by) -> list[dict]:
+    statement = select(*model.__table__.columns).where(*criteria).order_by(order_by)
+    with engine.connect() as db:
+        return [dict(row) for row in db.execute(statement).mappings()]
+
+
+def plain(value: object) -> object:
+    return timestamp(value) if isinstance(value, datetime) else value
+
+
+def test_platform_order_shows_the_order_its_lines_and_events(cli, engine, world, platform_order):
+    order, events = platform_order
+    platform_order_id = order["platform_order_id"]
+    # 同一入口的另一单、另一入口上同一平台订单 ID 的订单与事件都不混进来。
+    other_order = add_platform_order(engine, world, "unpaid", [("a", None, 1, 0)])
+    add_event(engine, world, other_order["platform_order_id"])
+    second = platform_fixtures.add_platform_channel(engine, world)
+    with engine.begin() as db:
+        db.execute(
+            insert(PlatformOrder).values(
+                platform_order_row_id=new_id("por"),
+                tenant_id=world.tenant_id,
+                channel_id=second,
+                platform_order_id=platform_order_id,
+                order_ref=platform_order_id,
+            )
+        )
+    add_event(engine, world, platform_order_id, channel_id=second)
+
+    result = cli(*platform_order_argv(world.tenant_id, world.channel_id, platform_order_id))
+    output = result.json()
+    assert list(output) == ORDER_KEYS
+
+    [stored] = stored_rows(
+        engine,
+        PlatformOrder,
+        PlatformOrder.platform_order_row_id == order["platform_order_row_id"],
+        order_by=PlatformOrder.platform_order_row_id,
+    )
+    assert {name: output[name] for name in ORDER_KEYS[:-2]} == {
+        name: plain(stored[name]) for name in ORDER_KEYS[:-2]
+    }
+    assert (output["platform_order_row_id"], output["channel_id"]) == (
+        order["platform_order_row_id"],
+        world.channel_id,
+    )
+    assert (output["stage"], output["attention"], output["attention_code"]) == (
+        "held",
+        "unmapped",
+        "sku_unmapped",
+    )
+    assert (output["ready_at"], output["next_pull_at"], output["pull_attempts"]) == (
+        timestamp(READY_AT),
+        None,
+        2,
+    )
+
+    # 各行按 platform_line_id 升序，不含已知差异的说明文字。
+    lines = stored_rows(
+        engine,
+        PlatformOrderLine,
+        PlatformOrderLine.platform_order_row_id == order["platform_order_row_id"],
+        order_by=PlatformOrderLine.platform_line_id,
+    )
+    assert [line["platform_line_id"] for line in output["lines"]] == ["a", "b", "c"]
+    assert all(list(line) == LINE_KEYS for line in output["lines"])
+    assert output["lines"] == [{name: plain(row[name]) for name in LINE_KEYS} for row in lines]
+    assert [line["sku_id"] is None for line in output["lines"]] == [True, False, False]
+    assert [line["cancelled_qty"] for line in output["lines"]] == [0, 1, 0]
+    assert [bool(line["known_discrepancy"]) for line in output["lines"]] == [False, False, True]
+
+    # 事件按 received_at、event_row_id 升序，不含 payload。
+    assert all(list(event) == EVENT_KEYS for event in output["events"])
+    assert output["events"] == [event_output(event) for event in events]
+    assert output["events"][-1]["applied_at"] == timestamp(APPLIED_AT)
+    assert "payload-not-shown" not in result.out
+    assert "note-not-shown" not in result.out
+
+
+def test_a_platform_order_without_lines_or_events_has_empty_lists(cli, engine, world):
+    order = add_platform_order(engine, world, "unpaid", [])
+    argv = platform_order_argv(world.tenant_id, world.channel_id, order["platform_order_id"])
+    output = cli(*argv).json()
+    assert (output["stage"], output["attention"], output["lines"], output["events"]) == (
+        "unpaid",
+        None,
+        [],
+        [],
+    )
+
+
+def test_a_missing_or_foreign_platform_order_is_not_found(cli, engine, world, platform_order):
+    order, _ = platform_order
+    mine = order["platform_order_id"]
+    other = platform_fixtures.create_world(engine)
+    try:
+        theirs = add_platform_order(engine, other, "unpaid", [])["platform_order_id"]
+        cases = [
+            (world.tenant_id, world.channel_id, f"po-{uuid4().hex[:12]}"),
+            # 别的租户的订单：用本租户查不到，用它的入口也不行。
+            (world.tenant_id, world.channel_id, theirs),
+            (world.tenant_id, other.channel_id, theirs),
+            # 本租户的订单换成别的租户、别的入口或不存在的入口。
+            (other.tenant_id, other.channel_id, mine),
+            (other.tenant_id, world.channel_id, mine),
+            (world.tenant_id, world.backoffice_channel_id, mine),
+            (world.tenant_id, new_id("chan"), mine),
+            (new_id("ten"), world.channel_id, mine),
+        ]
+        for tenant_id, channel_id, platform_order_id in cases:
+            result = cli(*platform_order_argv(tenant_id, channel_id, platform_order_id))
+            line = not_found(result, tenant_id, channel_id, platform_order_id)
+            assert "platform order" in line
+    finally:
+        platform_fixtures.purge_tenant(engine, other.tenant_id)
+
+
+def test_inspecting_a_platform_order_writes_nothing(cli, engine, world, platform_order):
+    order, _ = platform_order
+    before = row_counts(engine)
+    cli(*platform_order_argv(world.tenant_id, world.channel_id, order["platform_order_id"])).json()
+    not_found(cli(*platform_order_argv(world.tenant_id, world.channel_id, "po-missing")))
+    assert row_counts(engine) == before
+
+
 # --- 只读、生产实例与帮助 ---
 
 
@@ -359,7 +624,7 @@ def test_inspecting_works_on_a_production_instance(
     not_found(production_cli(*missing))
 
 
-@pytest.mark.parametrize("action", ["ledger", "reservation", "order-stock"])
+@pytest.mark.parametrize("action", ["ledger", "reservation", "order-stock", "platform-order"])
 def test_help_does_not_touch_the_database(action):
     # 没有连接串：碰了数据库就以 1 结束。
     result = run_cli(Settings(env=DEMO, database_url=""), "inspect", action, "--help")

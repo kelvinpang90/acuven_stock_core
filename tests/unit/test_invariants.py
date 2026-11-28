@@ -2,19 +2,23 @@ import dataclasses
 import unittest
 
 from app.domain.invariants import (
+    CHANNEL_PENDING_VS_ORDERS,
     CHECKS,
     LEDGER_TOTALS,
     MAX_VIOLATIONS,
     MERGED_SKU_LINES,
     ORDER_COMMIT_STATE,
     PENDING_DISPATCH_VS_ORDERS,
+    PENDING_PLATFORM_STAGES,
     RESERVED_VS_ORDERS,
     BalanceRow,
+    ChannelPendingRow,
     LedgerTotals,
     OrderLine,
     OrderTotals,
     ReservationLines,
     check_balance_row,
+    check_channel_pending_vs_orders,
     check_ledger_totals,
     check_merged_sku_lines,
     check_order_commit_state,
@@ -59,6 +63,10 @@ def reservation(status, *lines, reservation_id="rsv_A", order_ref="order-1"):
     return ReservationLines(reservation_id, order_ref, status, order_lines)
 
 
+def channel_row(channel_id="chan_A", sku_id="sku_A", pending=3, pool_id="pool_A"):
+    return ChannelPendingRow(channel_id, pool_id, sku_id, pending)
+
+
 class ConstantsTest(unittest.TestCase):
     def test_check_names_in_contract_order(self):
         self.assertEqual(
@@ -69,6 +77,7 @@ class ConstantsTest(unittest.TestCase):
                 "pending_dispatch_vs_orders",
                 "order_commit_state",
                 "merged_sku_lines",
+                "channel_pending_vs_orders",
             ),
         )
         self.assertEqual(
@@ -78,10 +87,14 @@ class ConstantsTest(unittest.TestCase):
                 PENDING_DISPATCH_VS_ORDERS,
                 ORDER_COMMIT_STATE,
                 MERGED_SKU_LINES,
+                CHANNEL_PENDING_VS_ORDERS,
             ),
             CHECKS,
         )
         self.assertEqual(MAX_VIOLATIONS, 100)
+
+    def test_pending_platform_stages(self):
+        self.assertEqual(PENDING_PLATFORM_STAGES, ("unpaid", "held"))
 
     def test_inputs_are_immutable(self):
         for value in (
@@ -90,6 +103,7 @@ class ConstantsTest(unittest.TestCase):
             OrderTotals(),
             OrderLine("1", 1, 0),
             reservation("active", ("1", 1, 0)),
+            channel_row(),
         ):
             with self.subTest(value=value):
                 field = dataclasses.fields(value)[0].name
@@ -329,6 +343,39 @@ class MergedSkuLinesTest(unittest.TestCase):
         )
 
 
+class ChannelPendingTest(unittest.TestCase):
+    def test_equal_pending_passes(self):
+        self.assertIsNone(check_channel_pending_vs_orders(channel_row(pending=3), 3))
+
+    def test_zero_row_without_orders_passes(self):
+        self.assertIsNone(check_channel_pending_vs_orders(channel_row(pending=0), 0))
+
+    def test_violation_shape(self):
+        violation = check_channel_pending_vs_orders(channel_row(pending=3), 5)
+        self.assertEqual(
+            violation,
+            {
+                "check": "channel_pending_vs_orders",
+                "pool_id": "pool_A",
+                "sku_id": "sku_A",
+                "expected": 5,
+                "actual": 3,
+                "channel_id": "chan_A",
+            },
+        )
+        self.assertEqual(
+            list(violation), ["check", "pool_id", "sku_id", "expected", "actual", "channel_id"]
+        )
+
+    def test_pending_without_orders_is_reported(self):
+        violation = check_channel_pending_vs_orders(channel_row(pending=2), 0)
+        self.assertEqual((violation["expected"], violation["actual"]), (0, 2))
+
+    def test_orders_without_pending_are_reported(self):
+        violation = check_channel_pending_vs_orders(channel_row(pending=0), 4)
+        self.assertEqual((violation["expected"], violation["actual"]), (4, 0))
+
+
 class SummarizeTest(unittest.TestCase):
     def test_no_violations(self):
         self.assertEqual(summarize_violations([]), (0, []))
@@ -368,6 +415,38 @@ class SummarizeTest(unittest.TestCase):
         )
         self.assertEqual(count, 6)
         self.assertEqual(violations, [pending, commit_a, commit_z, merged_a, merged_b, merged_c])
+
+    def test_channel_pending_after_the_first_five_by_channel_then_sku(self):
+        def channel(channel_id, sku_id, pool_id="pool_A"):
+            created = channel_row(channel_id, sku_id, pending=1, pool_id=pool_id)
+            return check_channel_pending_vs_orders(created, 0)
+
+        # 池的先后与入口相反：第 6 项按 channel_id 排，不按 pool_id。
+        b_a = channel("chan_B", "sku_A", pool_id="pool_A")
+        a_b = channel("chan_A", "sku_B", pool_id="pool_Z")
+        a_a = channel("chan_A", "sku_A", pool_id="pool_Z")
+        merged = check_merged_sku_lines(
+            reservation("active", ("1", 1, 0, True), reservation_id="rsv_Z")
+        )
+        commit = check_order_commit_state(reservation("active", ("1", 1, 1)))
+        ledger_z = check_ledger_totals(row("pool_Z", "sku_Z"), LedgerTotals())
+        reserved = check_reserved_vs_orders(row("pool_Z", "sku_Z"), OrderTotals())
+        pending = check_pending_dispatch_vs_orders(row("pool_Z", "sku_Z"), OrderTotals())
+        count, violations = summarize_violations(
+            [b_a, merged, a_b, ledger_z, commit, a_a, pending, reserved]
+        )
+        self.assertEqual(count, 8)
+        self.assertEqual(violations, [ledger_z, reserved, pending, commit, merged, a_a, a_b, b_a])
+
+    def test_channel_pending_counts_toward_the_total_and_is_truncated_last(self):
+        ledgers = [
+            check_ledger_totals(row("pool_A", f"sku_{index:03d}"), LedgerTotals())
+            for index in range(100)
+        ]
+        channel = check_channel_pending_vs_orders(channel_row(pending=1), 0)
+        count, kept = summarize_violations([channel, *ledgers])
+        self.assertEqual((count, len(kept)), (101, 100))
+        self.assertEqual(kept, ledgers)
 
     def test_merged_sku_lines_count_toward_the_total_and_truncate(self):
         ledgers = [

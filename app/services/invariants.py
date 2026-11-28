@@ -10,8 +10,12 @@ checked_at 是这个事务里的数据库时间。
 - 按 (pool_id, sku_id) 聚合的订单行：所属预留为 active 的 quantity 之和，
   与全部订单行的 committed_qty − dispatched_qty − refund_restocked_qty 之和；
 - 全部预留的状态与它们订单行的 quantity、committed_qty，及订单行所指的 SKU 是否已合并
-  （只看 skus 表的 merged_into_sku_id 非空，不读合并单）。
+  （只看 skus 表的 merged_into_sku_id 非空，不读合并单）；
+- 平台入口的配额行，与按 (所属平台订单的 channel_id, sku_id) 聚合的平台订单行：
+  所属平台订单为 unpaid 或 held、sku_id 非空的 quantity − cancelled_qty 之和。
 流水与订单行都有外键指向余额行，所以从余额行出发不会漏；没有流水或订单行的余额行按全 0 比对。
+第 6 项从配额行出发：没有平台订单行的配额行按 0 比对；落在没有配额行的入口与 SKU 上的
+平台订单行不报（契约 §4.4 只比对每个配额行）。
 比对、排序与截断用 app/domain/invariants.py。
 """
 
@@ -22,12 +26,15 @@ from datetime import datetime
 from sqlalchemy import Connection, and_, case, func, select, text
 
 from app.domain.invariants import (
+    PENDING_PLATFORM_STAGES,
     QUANTITY_NAMES,
     BalanceRow,
+    ChannelPendingRow,
     LedgerTotals,
     OrderTotals,
     ReservationLines,
     check_balance_row,
+    check_channel_pending_vs_orders,
     check_reservation,
     summarize_violations,
 )
@@ -36,6 +43,7 @@ from app.domain.reservations import ACTIVE
 from app.models.catalog import Sku
 from app.models.inventory import LedgerEntry, StockBalance
 from app.models.orders import OrderLine, Reservation
+from app.models.platform import ChannelAllocation, PlatformOrder, PlatformOrderLine
 from app.services.reservations import database_now
 
 # 只对下一个事务生效；START TRANSACTION 开启时即取读快照，不等第一次读表。
@@ -45,9 +53,14 @@ _START_SNAPSHOT = "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"
 _BALANCE_COLUMNS = tuple(getattr(StockBalance, field.name) for field in fields(BalanceRow))
 _LEDGER_NAMES = tuple(field.name for field in fields(LedgerTotals))
 _ORDER_NAMES = tuple(field.name for field in fields(OrderTotals))
+_CHANNEL_COLUMNS = tuple(
+    getattr(ChannelAllocation, field.name) for field in fields(ChannelPendingRow)
+)
 
 # (pool_id, sku_id)：一个余额行。
 BalanceKey = tuple[str, str]
+# (channel_id, sku_id)：一个平台入口的配额行。
+ChannelKey = tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -150,6 +163,39 @@ def _read_reservations(connection: Connection, tenant_id: str) -> list[Reservati
     ]
 
 
+def _read_channel_pending(connection: Connection, tenant_id: str) -> list[ChannelPendingRow]:
+    statement = select(*_CHANNEL_COLUMNS).where(ChannelAllocation.tenant_id == tenant_id)
+    return [ChannelPendingRow(**row) for row in connection.execute(statement).mappings()]
+
+
+def _read_platform_open_quantities(connection: Connection, tenant_id: str) -> dict[ChannelKey, int]:
+    remaining = PlatformOrderLine.quantity - PlatformOrderLine.cancelled_qty
+    statement = (
+        select(
+            PlatformOrder.channel_id,
+            PlatformOrderLine.sku_id,
+            func.sum(remaining).label("open_quantity"),
+        )
+        .join(
+            PlatformOrder,
+            and_(
+                PlatformOrder.tenant_id == PlatformOrderLine.tenant_id,
+                PlatformOrder.platform_order_row_id == PlatformOrderLine.platform_order_row_id,
+            ),
+        )
+        .where(
+            PlatformOrderLine.tenant_id == tenant_id,
+            PlatformOrderLine.sku_id.is_not(None),
+            PlatformOrder.stage.in_(PENDING_PLATFORM_STAGES),
+        )
+        .group_by(PlatformOrder.channel_id, PlatformOrderLine.sku_id)
+    )
+    return {
+        (row["channel_id"], row["sku_id"]): int(row["open_quantity"])
+        for row in connection.execute(statement).mappings()
+    }
+
+
 def check_invariants(connection: Connection, tenant_id: str) -> InvariantReport:
     """开读快照、读本租户的数据，逐项比对后排序截断。"""
     checked_at = _begin_snapshot(connection)
@@ -162,5 +208,11 @@ def check_invariants(connection: Connection, tenant_id: str) -> InvariantReport:
         violations.extend(check_balance_row(row, ledger, orders.get(key, OrderTotals())))
     for reservation in _read_reservations(connection, tenant_id):
         violations.extend(check_reservation(reservation))
+    open_quantities = _read_platform_open_quantities(connection, tenant_id)
+    for channel_row in _read_channel_pending(connection, tenant_id):
+        open_quantity = open_quantities.get((channel_row.channel_id, channel_row.sku_id), 0)
+        violation = check_channel_pending_vs_orders(channel_row, open_quantity)
+        if violation is not None:
+            violations.append(violation)
     violation_count, shown = summarize_violations(violations)
     return InvariantReport(checked_at, violation_count, shown)
