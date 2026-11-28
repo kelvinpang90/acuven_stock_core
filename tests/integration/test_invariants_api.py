@@ -1,8 +1,10 @@
-"""不变量自查：正常的账、五项检查、汇总、鉴权与参数（契约 §4.4，§10 第 4 条）。
+"""不变量自查：正常的账、六项检查、汇总、鉴权与参数（契约 §4.4，§10 第 4 条）。
 
 在真 MySQL 上跑；每个测试建自己的租户、池、销售入口与凭据，期初、收货与订单命令经接口建立，
 账才对得上；违反由测试直接改库造出（自己提交的连接）。自查用同租户另一个只有 ops.read、
 不带销售入口的凭据。
+第 6 项的测试用 platform_fixtures 建带 platform 入口的租户，平台订单与配额行直接插入，
+结束时在 finally 里 purge_tenant 删掉它的全部行。
 """
 
 import logging
@@ -11,22 +13,26 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, update
+from sqlalchemy import Engine, insert, update
 
 from app.domain.requests import STOCK_OPERATOR
 from app.domain.service_auth import OPS_READ
 from app.models.catalog import Sku
 from app.models.inventory import IdempotencyRecord, LedgerEntry, StockBalance, StockDocument
 from app.models.orders import OrderDocument, OrderLine, Reservation
+from app.models.platform import ChannelAllocation, PlatformOrder, PlatformOrderLine
 from app.services.reservations import sweep_expired_reservations
+from tests.integration import platform_fixtures
 from tests.integration.conftest import (
     REFUND_RESTOCKS,
     add_sku,
     balance_insert,
     body_of,
+    new_id,
     post,
     qline,
 )
+from tests.integration.platform_fixtures import PlatformWorld
 from tests.integration.test_api_auth import Caller, add_other_pool, error_of, events, issue
 from tests.integration.test_catalog_updates_api import db_now
 from tests.integration.test_idempotency import add_skus, rid_of
@@ -201,6 +207,77 @@ def balance_violation(name: str, caller: Caller, sku_id: str, expected, actual) 
 
 def tables_of(engine: Engine, caller: Caller) -> dict:
     return {model.__tablename__: rows_of(engine, model, caller) for model in BUSINESS_TABLES}
+
+
+def world_ops(engine: Engine, world: PlatformWorld) -> Caller:
+    """platform_fixtures 建的租户的运维凭据：只有 ops.read，不带销售入口。"""
+    owner = Caller(world.tenant_id, world.pool_id, world.system_credential_id, "")
+    return ops_of(engine, owner)
+
+
+def add_platform_order(
+    engine: Engine,
+    world: PlatformWorld,
+    stage: str,
+    lines: list[tuple[str, str | None, int, int]],
+    *,
+    channel_id: str | None = None,
+) -> dict:
+    """一个平台订单连同它的行，提交；各行为 (platform_line_id, sku_id, quantity, cancelled_qty)。
+
+    held 的订单带 attention（库约束）。返回订单行插入的值（platform_order_row_id 等）。
+    """
+    platform_order_id = f"po-{uuid4().hex[:12]}"
+    order = {
+        "platform_order_row_id": new_id("por"),
+        "tenant_id": world.tenant_id,
+        "channel_id": channel_id or world.channel_id,
+        "platform_order_id": platform_order_id,
+        "order_ref": platform_order_id,
+        "stage": stage,
+        "attention": "unmapped" if stage == "held" else None,
+    }
+    with engine.begin() as db:
+        db.execute(insert(PlatformOrder).values(order))
+        for platform_line_id, sku_id, quantity, cancelled_qty in lines:
+            db.execute(
+                insert(PlatformOrderLine).values(
+                    tenant_id=world.tenant_id,
+                    platform_order_row_id=order["platform_order_row_id"],
+                    platform_line_id=platform_line_id,
+                    platform_item_id=f"item-{platform_line_id}",
+                    platform_model_id="-",
+                    sku_id=sku_id,
+                    quantity=quantity,
+                    cancelled_qty=cancelled_qty,
+                )
+            )
+    return order
+
+
+def set_pending(
+    engine: Engine, world: PlatformWorld, channel_id: str, sku_id: str, pending: int
+) -> None:
+    statement = update(ChannelAllocation).where(
+        ChannelAllocation.tenant_id == world.tenant_id,
+        ChannelAllocation.channel_id == channel_id,
+        ChannelAllocation.sku_id == sku_id,
+    )
+    with engine.begin() as db:
+        db.execute(statement.values(pending=pending))
+
+
+def channel_violation(
+    world: PlatformWorld, channel_id: str, sku_id: str, expected: int, actual: int
+) -> dict:
+    return {
+        "check": "channel_pending_vs_orders",
+        "pool_id": world.pool_id,
+        "sku_id": sku_id,
+        "expected": expected,
+        "actual": actual,
+        "channel_id": channel_id,
+    }
 
 
 # --- 正常的账 ---
@@ -411,6 +488,98 @@ def test_an_open_reservation_line_on_a_merged_sku_is_reported(client, engine):
             "line_refs": ["l1"],
         }
     ]
+
+
+# --- channel_pending_vs_orders ---
+
+
+def test_channel_pending_is_checked_against_unpaid_and_held_platform_orders(client, engine):
+    world = platform_fixtures.create_world(engine)
+    try:
+        channel = world.channel_id
+        second = platform_fixtures.add_platform_channel(engine, world)
+        first_sku = platform_fixtures.add_sku(engine, world.tenant_id)
+        second_sku = platform_fixtures.add_sku(engine, world.tenant_id)
+        # 计入的：unpaid 两件剩余（3 − 1）与一件，held 两件；sku_id 为空的行不计。
+        add_platform_order(
+            engine,
+            world,
+            "unpaid",
+            [("1", first_sku, 3, 1), ("2", second_sku, 1, 0), ("3", None, 4, 0)],
+        )
+        add_platform_order(engine, world, "held", [("1", first_sku, 2, 0), ("2", None, 1, 0)])
+        # 不计的：committed 与 cancelled 阶段的订单，不论剩余件数。
+        add_platform_order(engine, world, "committed", [("1", first_sku, 5, 0)])
+        add_platform_order(engine, world, "cancelled", [("1", first_sku, 4, 1)])
+        # 另一个入口上的订单只计入那个入口。
+        add_platform_order(engine, world, "unpaid", [("1", first_sku, 1, 0)], channel_id=second)
+        platform_fixtures.set_allocation(engine, world, first_sku, quota=5, pending=4)
+        platform_fixtures.set_allocation(engine, world, second_sku, quota=5, pending=1)
+        platform_fixtures.set_allocation(
+            engine, world, first_sku, quota=5, pending=1, channel_id=second
+        )
+        # 没有平台订单的配额行按 0 比对。
+        platform_fixtures.set_allocation(engine, world, second_sku, channel_id=second)
+
+        ops = world_ops(engine, world)
+        data = report_of(client, ops)
+        assert (data["ok"], data["violation_count"], data["violations"]) == (True, 0, [])
+
+        set_pending(engine, world, channel, first_sku, 6)
+        set_pending(engine, world, channel, second_sku, 0)
+        set_pending(engine, world, second, first_sku, 0)
+        set_pending(engine, world, second, second_sku, 2)
+        data = report_of(client, ops)
+        assert data["ok"] is False
+        assert data["violation_count"] == 4
+        expected = [
+            channel_violation(world, channel, first_sku, 4, 6),
+            channel_violation(world, channel, second_sku, 1, 0),
+            channel_violation(world, second, first_sku, 1, 0),
+            channel_violation(world, second, second_sku, 0, 2),
+        ]
+        # 按 channel_id、sku_id 升序；余额行与预留都没动，前五项不报。
+        assert data["violations"] == sorted(
+            expected, key=lambda violation: (violation["channel_id"], violation["sku_id"])
+        )
+    finally:
+        platform_fixtures.purge_tenant(engine, world.tenant_id)
+
+
+def test_channel_pending_violations_come_after_the_first_five(client, engine):
+    world = platform_fixtures.create_world(engine)
+    try:
+        sku = platform_fixtures.add_sku(engine, world.tenant_id)
+        add_platform_order(engine, world, "unpaid", [("1", sku, 2, 0)])
+        platform_fixtures.set_allocation(engine, world, sku, quota=5, pending=2)
+        ops = world_ops(engine, world)
+        assert report_of(client, ops)["ok"] is True
+
+        # 余额行有量却没有流水（第 1 项），pending 与平台订单对不上（第 6 项）。
+        platform_fixtures.set_allocation(engine, world, sku, quota=5, pending=3, stock_balance=7)
+        data = report_of(client, ops)
+        assert data["violation_count"] == 2
+        assert data["violations"] == [
+            {
+                "check": "ledger_totals",
+                "pool_id": world.pool_id,
+                "sku_id": sku,
+                "expected": ledger_expected(),
+                "actual": balance_actual(stock_balance=7),
+            },
+            channel_violation(world, world.channel_id, sku, 2, 3),
+        ]
+    finally:
+        platform_fixtures.purge_tenant(engine, world.tenant_id)
+
+
+def test_demo_books_have_no_channel_allocations_to_check(client, engine):
+    caller, (sku,) = opened(client, engine, 1)
+    paid(client, caller, [sku], [2])
+    placed(client, caller, [sku], [1])
+    assert rows_of(engine, ChannelAllocation, caller) == []
+    data = report_of(client, ops_of(engine, caller))
+    assert (data["ok"], data["violation_count"], data["violations"]) == (True, 0, [])
 
 
 # --- 汇总 ---
