@@ -5663,3 +5663,25 @@ tasks:
     - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-157
+    title: 后台加按池列出未完成盘点单的接口
+    purpose: 按 docs/ADMIN_FRONTEND.md 第 9 节 G8：盘点页丢了 count_id 后找不回未完成的盘点单。在 CORE-TASK-104 的后台盘点模块上补 GET /api/v1/admin/counts?pool_id=&status=，pool_id 必填、按 backoffice 入口判本租户（别的租户的池 404，同 CORE-TASK-104），status 可选；只读、只要求登录，分页、游标与排序照 CORE-TASK-100 定的后台列表规则；每项的表示同 /v1 盘点单的查看接口。 明确不做：前端；改 /v1 的盘点接口；改 CORE-TASK-104 已定的行为。
+    status: ready
+    depends_on:
+    - CORE-TASK-104
+    acceptance_criteria:
+    - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_count_list_api.py，用后台开关为真的生产应用、真实登录，数据用 platform_fixtures 建、finally 里 purge_tenant
+    - 按池列出盘点单，status 过滤正确，缺 pool_id 或 status 不合格 422；limit 为 2 时翻页正确，恰好 limit 条时 next_cursor 为 null
+    - 别的租户的池 404 且与不存在的池只差 request_id；后台开关为假的生产应用上该路径是 404
+    - CORE-TASK-104 与 /v1 盘点的集成测试一字不改、照常通过
+    - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+    - app/api/admin_counts.py
+    - app/services/admin_queries.py
+    - tests/integration/test_admin_count_list_api.py
+    allowed_commands:
+    - tests.unit
+    - lint.check
+    - format.check
+    creates_branch: true
+    creates_pull_request: true
