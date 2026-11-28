@@ -5642,3 +5642,24 @@ tasks:
       - format.check
     creates_branch: true
     creates_pull_request: true
+  - id: CORE-TASK-156
+    title: 后台加 SKU 分页列表接口，按 sku_id 升序
+    purpose: 按 docs/ADMIN_FRONTEND.md 第 9 节 G4：目录页要列出全部 SKU，包括还没有余额行的。在 CORE-TASK-101 的后台目录模块上补 GET /api/v1/admin/skus?after=&limit=&status=，按 sku_id 升序，分页、游标与 limit 的规则照 CORE-TASK-100 定的后台列表规则，只读、只要求登录、只列管理员租户的 SKU；status 可选，取值同 SKU 状态，不合格 422；每项的表示同 /v1 的 SKU 读接口。 明确不做：前端；改 /v1 的接口；改已登记任务的行为。
+    status: ready
+    depends_on:
+    - CORE-TASK-101
+    acceptance_criteria:
+    - 只改 allowed_change_paths；接口测试写在 tests/integration/test_admin_sku_list_api.py，用后台开关为真的生产应用、真实登录，数据在 finally 里清理
+    - 列表按 sku_id 升序，包含没有余额行的 SKU；limit 为 2 时翻页正确，恰好 limit 条时 next_cursor 为 null；after 或 status 不合格 422
+    - 只列管理员租户的 SKU，别的租户的 SKU 不出现；后台开关为假的生产应用上该路径是 404
+    - 已有的 /v1 目录接口与后台目录接口的集成测试一字不改、照常通过
+    - 改动只落在 allowed_change_paths；已有的单元与集成测试照常通过；不改 .platform/、CI、部署配置；不装依赖；allowed_commands 里的检查全部零退出，skipped 如实报告且不算 passed；以 Draft PR 交付，不合并、不直推；集成测试由 PR 的必需 CI 检查 integration 执行并通过
+    allowed_change_paths:
+    - app/api/admin_catalog.py
+    - tests/integration/test_admin_sku_list_api.py
+    allowed_commands:
+    - tests.unit
+    - lint.check
+    - format.check
+    creates_branch: true
+    creates_pull_request: true
