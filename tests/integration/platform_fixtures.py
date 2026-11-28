@@ -176,6 +176,24 @@ def add_platform_channel(
         )
 
 
+def add_admin(engine: Engine, world: PlatformWorld) -> str:
+    """这个租户的一个 admin 主体（后台登记的收件箱行记它），提交；返回 credential_id。"""
+    credential_id = new_id("cred")
+    with engine.begin() as db:
+        db.execute(
+            insert(Credential).values(
+                credential_id=credential_id,
+                tenant_id=world.tenant_id,
+                channel_id=None,
+                name="backoffice admin",
+                scopes=[],
+                kind="admin",
+                status=ACTIVE,
+            )
+        )
+    return credential_id
+
+
 def add_sku(engine: Engine, tenant_id: str) -> str:
     """一个 active 的商品连同它唯一的 SKU，提交；返回 sku_id。"""
     product_id, sku_id = new_id("prd"), new_id("sku")
