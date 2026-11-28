@@ -158,7 +158,7 @@ class SignedIn:
     token: str
     csrf: str
 
-    def headers(self, key: str | None = None, **extra: str) -> dict[str, str]:
+    def headers(self, key: str | bytes | None = None, **extra: str) -> dict[str, str | bytes]:
         sent = with_cookie(self.token, **{"X-CSRF-Token": self.csrf, "User-Agent": USER_AGENT})
         if key is not None:
             sent["Idempotency-Key"] = key
@@ -230,7 +230,7 @@ def command_body_of(pool_id: str, note: str = "first") -> dict:
     return {"pool_id": pool_id, "note": note}
 
 
-def post(client: TestClient, admin: SignedIn, body: object, key: str | None, path: str = COMMANDS):
+def post(client: TestClient, admin: SignedIn, body: object, key: str | bytes | None, path: str = COMMANDS):
     return client.post(path, json=body, headers=admin.headers(key))
 
 
@@ -318,7 +318,7 @@ def test_a_wrong_csrf_token_is_403_before_the_key_and_body(client, engine, setup
     assert_nothing_saved(engine, setup)
 
 
-@pytest.mark.parametrize("key", [None, "", "has space", "x" * 129, "é"])
+@pytest.mark.parametrize("key", [None, "", "has space", "x" * 129, "é".encode()])
 def test_a_missing_or_malformed_key_is_400_before_the_body(client, engine, setup, admin, key):
     response = post(client, admin, {"bad": "body"}, key)
     error = error_of(response, 400)
