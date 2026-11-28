@@ -3747,7 +3747,7 @@ tasks:
       一，app/domain/invariants.py：CHECKS 末尾加 channel_pending_vs_orders；违反项的形状同前三项（check、pool_id、sku_id、expected、actual，都是整数）另带 channel_id；排序排在前五项之后，按 channel_id、sku_id 升序。app/services/invariants.py：在同一个只读快照里，对每个 channel_allocations 行，算这个入口上 sku_id 等于它、所属平台订单的 stage 为 unpaid 或 held 的平台订单行的 quantity − cancelled_qty 之和作 expected，actual 为行上的 pending，不等即违反。committed 与 cancelled 阶段的订单不计。Demo 没有这些行，这一项总是空的；/v1 的响应形状不变。
       二，app/cli/inspect.py（CORE-TASK-071 建的）加子命令 platform-order：--tenant、--channel、--platform-order-id 必填；输出一份 JSON：平台订单的各列（platform_order_row_id、channel_id、platform_order_id、order_ref、stage、attention、attention_code、ready_at、next_pull_at、pull_attempts、created_at、updated_at）、lines（各行除 known_discrepancy_note 外的列，按 platform_line_id 升序）、events（各事件的 event_row_id、action、platform_line_id、source、event_key、received_at、applied_at、result，按 received_at、event_row_id 升序，不输出 payload）。找不到（不存在或属于别的租户）以退出码 2、标准错误一行原因结束，同 071 的其余子命令。只读。
       明确不做：定时跑自查与告警（契约 8.5 不变）；后台显示（第 3 组）。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-093
       - CORE-TASK-071
