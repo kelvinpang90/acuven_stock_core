@@ -18,6 +18,11 @@
 连接上可能还留着会话状态（如释放失败的命名锁）时用 invalidate_connection 作废，不放回池里。
 
 每个请求结束时在 app.api.access 写一行 JSON 日志；不记 Authorization 头、令牌与请求体。
+
+/api/ 与 /admin/ 前缀（契约 §8.1 的 0.22 一条、§8.6 第 2 条）按路径前缀判断，
+与路由挂没挂上无关：X-Request-ID 一律不用调用方给的值、总是生成，不回 400；
+第 1 步与第 3 步照用、格式同 /v1；每个响应都带防嵌入的两个头，
+/api/v1/admin/ 下的另带 Cache-Control: no-store（已带的不重复加）。
 """
 
 import json
@@ -56,6 +61,10 @@ MAX_BATCH_ITEMS = 100
 _CONNECTION = "db_connection"
 # 不校验 X-Request-ID 的路径：不合格时改用生成的 ID（§8.1）。
 UNCHECKED_REQUEST_ID_PATHS = frozenset({"/healthz", "/readyz"})
+# 来自公网的后台页面与接口（§8.1 的 0.22 一条）。
+PUBLIC_PREFIXES = ("/api/", "/admin/")
+ADMIN_API_PREFIX = "/api/v1/admin/"
+FRAME_HEADERS = {"Content-Security-Policy": "frame-ancestors 'none'", "X-Frame-Options": "DENY"}
 
 _log = logging.getLogger("app.api")
 access_log = logging.getLogger("app.api.access")
@@ -197,7 +206,11 @@ class RequestMiddleware:
 
         started = time.perf_counter()
         headers = Headers(scope=scope)
-        supplied = headers.get(REQUEST_ID)
+        path = scope["path"]
+        public = path.startswith(PUBLIC_PREFIXES)
+        admin_api = path.startswith(ADMIN_API_PREFIX)
+        # 这两个前缀不读调用方的 ID：当作没带，总是生成。
+        supplied = None if public else headers.get(REQUEST_ID)
         supplied_ok = _valid_request_id(supplied)
         request_id = supplied if supplied_ok and supplied is not None else new_id("req")
         scope.setdefault("state", {})["request_id"] = request_id
@@ -207,7 +220,13 @@ class RequestMiddleware:
             nonlocal status
             if message["type"] == "http.response.start":
                 status = message["status"]
-                MutableHeaders(scope=message)[REQUEST_ID] = request_id
+                response_headers = MutableHeaders(scope=message)
+                response_headers[REQUEST_ID] = request_id
+                if public:
+                    for name, value in FRAME_HEADERS.items():
+                        response_headers[name] = value
+                if admin_api and "cache-control" not in response_headers:
+                    response_headers["Cache-Control"] = "no-store"
             await send(message)
 
         async def reply(error: ApiError) -> None:

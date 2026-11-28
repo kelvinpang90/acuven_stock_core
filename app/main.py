@@ -11,6 +11,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api import (
+    admin_session,
     catalog,
     catalog_changes,
     catalog_imports,
@@ -184,6 +185,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Demo 重置只在 Demo 实例上存在；生产实例不挂，该路径同不存在的路径 404（契约 6.1）。
     if settings.env == DEMO:
         app.include_router(demo_resets.router)
+    # 后台登录、会话与退出只在后台开关为真时挂上；为假时同不存在的路径 404（契约 6.1）。
+    if app.state.admin_enabled:
+        app.include_router(admin_session.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
