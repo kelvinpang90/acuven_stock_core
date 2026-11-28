@@ -3925,7 +3925,7 @@ tasks:
       五，admin_context(request, principal, *, role, idempotency_key, channel_id, pool_id)：组 CORE-TASK-074 的命令上下文：租户取 principal.tenant_id，入口与池取参数（目录、平台商品类命令两者都为空），操作主体取 principal.credential_id，操作者为 (principal.account_id, 断言的角色)，request_id 取中间件生成的，预留有效期为空，HTTP 三项取请求。
       六，run_admin(request, context, operation, command, **执行器选项)：入口是 backoffice、而 operation 是契约 5 的七个订单命令之一（预留、释放、确认销售、发货、退款回库、退货验收、待审结案；取 app/api 下 reservations、sale_commits、fulfilment 三个模块里这七个命令的操作类型常量，只 import、不改那三个模块）时 403 FORBIDDEN，在调执行器之前判出、不取锁、不保存，记一条 forbidden 安全事件（details 为 {"category": "entry_kind", "operation": operation}）（契约 5.10）；否则调 CORE-TASK-074 的执行器核心，幂等作用域、重放与冲突、安全事件全照执行器。
       明确不做：任何业务路由（CORE-TASK-100 起）；平台订单的人工操作（不走幂等记录，CORE-TASK-105 起）；后台前端。
-    status: ready
+    status: done
     depends_on:
       - CORE-TASK-098
       - CORE-TASK-079
